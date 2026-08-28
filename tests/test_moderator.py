@@ -477,6 +477,28 @@ async def test_chunked_list_stays_under_telegram_limit(
     assert all("拦截词（100）" in call.args[0] for call in message.answer.await_args_list)
 
 
+async def test_inline_list_displays_words_horizontally(
+    tmp_path: Path, storage: Storage
+) -> None:
+    controller = ModerationController(FakeBot(), settings(tmp_path), storage)  # type: ignore[arg-type]
+    message = SimpleNamespace(answer=AsyncMock())
+
+    await controller._send_chunked_list(  # type: ignore[arg-type]
+        message,
+        title="拦截词",
+        items=["号池", "供应", "合作", "长期"],
+        inline=True,
+    )
+
+    output = message.answer.await_args.args[0]
+    assert output == (
+        "<b>拦截词（4）</b>\n"
+        "<code>号池</code> · <code>供应</code> · "
+        "<code>合作</code> · <code>长期</code>"
+    )
+    assert "•" not in output
+
+
 async def test_reporter_log_message_contains_no_reason(
     tmp_path: Path, storage: Storage, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -426,24 +426,32 @@ class ModerationController:
             logger.debug("临时提示删除失败 chat_id=%s message_id=%s", chat_id, message_id)
 
     async def _send_chunked_list(
-        self, message: Message, *, title: str, items: list[str], max_length: int = 3500
+        self,
+        message: Message,
+        *,
+        title: str,
+        items: list[str],
+        inline: bool = False,
+        max_length: int = 3500,
     ) -> None:
         if not items:
             await message.answer(f"<b>{html.escape(title)}（0）</b>\n（空）")
             return
+        separator = " · " if inline else "\n"
         bodies: list[str] = []
-        current: list[str] = []
-        current_length = 0
+        current = ""
         for item in items:
-            line = f"• <code>{html.escape(item)}</code>"
-            if current and current_length + len(line) + 1 > max_length:
-                bodies.append("\n".join(current))
-                current = []
-                current_length = 0
-            current.append(line)
-            current_length += len(line) + 1
+            entry = f"<code>{html.escape(item)}</code>"
+            if not inline:
+                entry = f"• {entry}"
+            addition = entry if not current else f"{separator}{entry}"
+            if current and len(current) + len(addition) > max_length:
+                bodies.append(current)
+                current = entry
+                continue
+            current += addition
         if current:
-            bodies.append("\n".join(current))
+            bodies.append(current)
         for index, body in enumerate(bodies, start=1):
             page = f" {index}/{len(bodies)}" if len(bodies) > 1 else ""
             await message.answer(
@@ -962,7 +970,12 @@ class ModerationController:
         if actor is None:
             return
         words = set(self.settings.blocked_words) | await self.storage.blocked_words(actor[2])
-        await self._send_chunked_list(message, title="拦截词", items=sorted(words))
+        await self._send_chunked_list(
+            message,
+            title="拦截词",
+            items=sorted(words),
+            inline=True,
+        )
 
     async def moderate_message(self, message: Message) -> None:
         if message.chat.type not in GROUP_TYPES or not self.is_allowed_chat(message.chat.id):
