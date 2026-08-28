@@ -154,8 +154,8 @@ uv run ruff format --check src tests
 /addomain example.com        添加域名白名单
 /deldomain example.com       移除域名白名单
 /domains                     查看域名白名单
-/addword 词1，词2             批量添加拦截词
-/delword 词1，词2             批量移除拦截词
+/addword 词1 词2             批量添加拦截词
+/delword 词1 词2             批量移除拦截词
 /words                       查看拦截词
 
 /settings /stats /status /chatid /help
@@ -164,7 +164,7 @@ uv run ruff format --check src tests
 
 管理动作不接收、显示或记录原因；旧版命令尾部附带的文字会被兼容忽略。`/stats` 按北京时间展示今天、近 7 天和累计数据。`/recent` 默认返回 10 条、最多 30 条，为避免在群里公开用户 ID，只能由授权管理员私聊使用。
 
-批量拦截词使用英文逗号、中文逗号或换行分隔，每次最多 20 条；空格属于短语内容。词库和域名列表过长时会自动分段发送。
+批量拦截词使用空格、英文逗号、中文逗号或换行分隔，每次最多 20 条；需要保留空格的短语使用英文或中文引号，例如 `/addword "guaranteed profit" “长期 合作”`。词库和域名列表过长时会自动分段发送。
 
 私聊 `/del` 无法引用群消息，需填写群消息 ID：`/del 群消息ID`。机器人不会仅凭私聊身份放行：每次仍会同时核验授权名单、目标群管理员身份和所需权限。若配置零个或多个目标群，私聊管理会拒绝执行，避免误操作到错误群。
 

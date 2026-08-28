@@ -440,7 +440,7 @@ async def test_batch_word_commands_are_atomic(tmp_path: Path, storage: Storage) 
         chat=SimpleNamespace(id=admin_id, type=ChatType.PRIVATE),
         from_user=SimpleNamespace(id=admin_id),
         sender_chat=None,
-        text="/addword 词语一，guaranteed profit\n词语二",
+        text='/addword 词语一，"guaranteed profit"\n词语二',
         answer=AsyncMock(),
     )
     invalid = SimpleNamespace(
