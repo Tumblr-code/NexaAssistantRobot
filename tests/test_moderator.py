@@ -139,7 +139,7 @@ async def test_external_link_is_deleted_and_warned(tmp_path: Path, storage: Stor
     assert warning[0]["last_reason"] == ""
 
 
-async def test_warn_limit_triggers_automatic_mute(tmp_path: Path, storage: Storage) -> None:
+async def test_warn_limit_triggers_automatic_ban(tmp_path: Path, storage: Storage) -> None:
     bot = FakeBot()
     controller = ModerationController(
         bot,
@@ -150,10 +150,47 @@ async def test_warn_limit_triggers_automatic_mute(tmp_path: Path, storage: Stora
 
     await controller.moderate_message(group_message(42, "https://evil.example"))
 
-    assert bot.restricted == [(-100, 42)]
+    assert bot.banned == [(-100, 42, True)]
+    assert bot.restricted == []
     assert await storage.warning_count(-100, 42) == 0
     stats = await storage.chat_stats(-100)
-    assert stats.muted == 1
+    assert stats.banned == 1
+    notice = controller._notice.await_args.args[1]
+    assert "并封禁" in notice
+    assert "禁言" not in notice
+
+
+async def test_manual_third_warning_bans_and_clears_warning(
+    tmp_path: Path, storage: Storage
+) -> None:
+    admin_id = 7873158072
+    bot = FakeBot(admin_ids={admin_id})
+    controller = ModerationController(
+        bot,
+        settings(
+            tmp_path,
+            authorized_admin_ids=frozenset({admin_id}),
+            warn_limit=1,
+        ),  # type: ignore[arg-type]
+        storage,
+    )
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=admin_id, type=ChatType.PRIVATE),
+        from_user=SimpleNamespace(id=admin_id),
+        sender_chat=None,
+        text="/warn 42",
+        reply_to_message=None,
+        answer=AsyncMock(),
+    )
+
+    await controller.warn(message)  # type: ignore[arg-type]
+
+    assert bot.banned == [(-100, 42, True)]
+    assert await storage.warning_count(-100, 42) == 0
+    message.answer.assert_awaited_once_with("已警告 <code>42</code>；达到阈值，已封禁。")
+    stats = await storage.chat_stats(-100)
+    assert stats.warned == 1
+    assert stats.banned == 1
 
 
 async def test_admin_and_dry_run_are_not_mutated(tmp_path: Path, storage: Storage) -> None:

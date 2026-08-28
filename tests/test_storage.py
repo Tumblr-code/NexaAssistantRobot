@@ -55,13 +55,14 @@ async def test_action_stats(storage: Storage) -> None:
     await storage.record_action(chat_id=-100, action="mute")
     await storage.record_action(chat_id=-100, action="auto_mute")
     await storage.record_action(chat_id=-100, action="ban")
+    await storage.record_action(chat_id=-100, action="auto_ban")
     await storage.record_action(chat_id=-200, action="delete")
     stats = await storage.chat_stats(-100)
     assert stats.deleted == 1
     assert stats.warned == 1
     assert stats.muted == 2
-    assert stats.banned == 1
-    assert stats.total_actions == 5
+    assert stats.banned == 2
+    assert stats.total_actions == 6
     row = await storage.db.execute_fetchall(
         "SELECT reason FROM moderation_log WHERE chat_id = ?",
         (-100,),

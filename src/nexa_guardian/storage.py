@@ -276,7 +276,7 @@ class Storage:
                 SUM(CASE WHEN action = 'delete' THEN 1 ELSE 0 END) AS deleted,
                 SUM(CASE WHEN action = 'warn' THEN 1 ELSE 0 END) AS warned,
                 SUM(CASE WHEN action IN ('mute', 'auto_mute') THEN 1 ELSE 0 END) AS muted,
-                SUM(CASE WHEN action = 'ban' THEN 1 ELSE 0 END) AS banned,
+                SUM(CASE WHEN action IN ('ban', 'auto_ban') THEN 1 ELSE 0 END) AS banned,
                 COUNT(*) AS total_actions
             FROM moderation_log
             WHERE chat_id = ?
