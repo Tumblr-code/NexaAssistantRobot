@@ -47,6 +47,7 @@ ACTION_LABELS = {
     "warn": "警告",
     "mute": "禁言",
     "auto_mute": "自动禁言",
+    "auto_ban": "警告达限自动封禁",
     "unmute": "解除禁言",
     "ban": "封禁",
     "unban": "解除封禁",
@@ -65,7 +66,7 @@ ACTION_LABELS = {
 
 HELP_TEXT = """<b>Nexa Guardian 群管命令</b>
 
-自动功能：外链/关键词广告删除、刷屏检测、累计警告自动禁言。
+自动功能：外链/关键词广告删除、刷屏检测、累计 3 次警告自动封禁。
 
 群内可回复成员消息；私聊机器人时，把数字用户 ID 放在命令后：
 <code>/warn</code>　警告
@@ -539,7 +540,8 @@ class ModerationController:
             f"转发过滤：{'开' if self.settings.block_forwards else '关'}\n"
             f"@账号过滤：{'开' if self.settings.block_channel_mentions else '关'}\n"
             f"警告阈值：{self.settings.warn_limit}\n"
-            f"自动禁言：{human_duration(self.settings.default_mute_seconds)}\n"
+            "达到阈值：自动封禁\n"
+            f"手动禁言默认：{human_duration(self.settings.default_mute_seconds)}\n"
             f"域名白名单：{len(domains)} 条\n"
             f"拦截词：{len(words)} 条\n"
             f"授权管理员：{len(self.settings.authorized_admin_ids) or '全部群管理员'}\n"
@@ -606,31 +608,27 @@ class ModerationController:
         chat_id = actor[2]
         user_id, user, _ = target
         count = await self.storage.add_warning(chat_id, user_id)
-        muted = False
+        banned = False
         if count >= self.settings.warn_limit:
             try:
-                await self._mute_member(chat_id, user_id, self.settings.default_mute_seconds)
+                await self.bot.ban_chat_member(chat_id, user_id, revoke_messages=True)
                 await self.storage.clear_warnings(chat_id, user_id)
                 await self.reporter.record(
                     chat_id=chat_id,
-                    action="auto_mute",
+                    action="auto_ban",
                     actor_id=actor_id,
                     target_id=user_id,
                 )
-                muted = True
+                banned = True
             except TelegramAPIError as exc:
-                await message.answer(f"警告已记录，但自动禁言失败：{html.escape(str(exc))}")
+                await message.answer(f"警告已记录，但自动封禁失败：{html.escape(str(exc))}")
         await self.reporter.record(
             chat_id=chat_id,
             action="warn",
             actor_id=actor_id,
             target_id=user_id,
         )
-        suffix = (
-            f"；达到阈值，已禁言 {human_duration(self.settings.default_mute_seconds)}"
-            if muted
-            else f"（{count}/{self.settings.warn_limit}）"
-        )
+        suffix = "；达到阈值，已封禁" if banned else f"（{count}/{self.settings.warn_limit}）"
         await message.answer(f"已警告 {display_user(user, user_id)}{suffix}。")
 
     async def mute(self, message: Message) -> None:
@@ -1054,29 +1052,27 @@ class ModerationController:
             return
 
         count = await self.storage.add_warning(message.chat.id, user_id)
-        muted = False
+        banned = False
         if count >= self.settings.warn_limit:
             try:
-                await self._mute_member(
-                    message.chat.id, user_id, self.settings.default_mute_seconds
+                await self.bot.ban_chat_member(
+                    message.chat.id,
+                    user_id,
+                    revoke_messages=True,
                 )
             except TelegramAPIError:
-                logger.exception("自动禁言失败 chat_id=%s user_id=%s", message.chat.id, user_id)
+                logger.exception("自动封禁失败 chat_id=%s user_id=%s", message.chat.id, user_id)
             else:
                 await self.storage.clear_warnings(message.chat.id, user_id)
                 await self.reporter.record(
                     chat_id=message.chat.id,
-                    action="auto_mute",
+                    action="auto_ban",
                     target_id=user_id,
                 )
-                muted = True
+                banned = True
 
         user_label = display_user(message.from_user, user_id)
-        suffix = (
-            f"，并禁言 {human_duration(self.settings.default_mute_seconds)}"
-            if muted
-            else f"，警告 {count}/{self.settings.warn_limit}"
-        )
+        suffix = "，并封禁" if banned else f"，警告 {count}/{self.settings.warn_limit}"
         await self._notice(
             message,
             f"已删除 {user_label} 的违规消息{suffix}。",
