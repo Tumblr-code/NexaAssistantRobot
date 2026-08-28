@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import re
+import shlex
 from dataclasses import dataclass
 
 from aiogram.types import Message, User
@@ -27,12 +27,18 @@ def command_payload(message: Message) -> str:
 
 
 def batch_items(message: Message, *, limit: int = 20) -> tuple[str, ...]:
-    payload = command_payload(message)
-    items = tuple(
-        dict.fromkeys(
-            item.strip() for item in re.split(r"[,，\n]+", payload) if item.strip()
-        )
+    payload = command_payload(message).translate(
+        str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
     )
+    lexer = shlex.shlex(payload, posix=True)
+    lexer.commenters = ""
+    lexer.whitespace += ",，"
+    lexer.whitespace_split = True
+    try:
+        parsed = tuple(lexer)
+    except ValueError as exc:
+        raise ValueError("拦截词引号未闭合，请补全后重试") from exc
+    items = tuple(dict.fromkeys(item.strip() for item in parsed if item.strip()))
     if len(items) > limit:
         raise ValueError(f"每次最多处理 {limit} 条")
     return items

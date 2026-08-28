@@ -81,7 +81,8 @@ HELP_TEXT = """<b>Nexa Guardian 群管命令</b>
 <code>/trust</code> / <code>/untrust</code>　可信用户
 <code>/addomain example.com</code> / <code>/deldomain example.com</code>
 <code>/domains</code>　查看域名白名单
-<code>/addword 词1，词2</code> / <code>/delword 词1，词2</code>
+<code>/addword 词1 词2</code> / <code>/delword 词1 词2</code>
+空格、逗号或换行可批量分隔；含空格短语请加引号。
 <code>/words</code>　查看拦截词
 
 检查：<code>/status</code> <code>/settings</code> <code>/stats</code>
@@ -267,8 +268,8 @@ class ModerationController:
                 BotCommand(command="clearwarns", description="清除用户警告"),
                 BotCommand(command="trust", description="添加可信用户"),
                 BotCommand(command="untrust", description="移除可信用户"),
-                BotCommand(command="addword", description="添加拦截词，可逗号分隔"),
-                BotCommand(command="delword", description="移除拦截词，可逗号分隔"),
+                BotCommand(command="addword", description="批量添加拦截词，空格/逗号分隔"),
+                BotCommand(command="delword", description="批量移除拦截词，空格/逗号分隔"),
                 BotCommand(command="domains", description="查看域名白名单"),
                 BotCommand(command="addomain", description="添加域名白名单"),
                 BotCommand(command="deldomain", description="移除域名白名单"),
@@ -910,7 +911,9 @@ class ModerationController:
             await message.answer(html.escape(str(exc)))
             return
         if not words:
-            await message.answer("用法：<code>/addword 词语1，词语2</code>")
+            await message.answer(
+                "用法：<code>/addword 词语1 词语2</code>；含空格短语请加引号。"
+            )
             return
         invalid = [word for word in words if len(word) < 2 or len(word) > 64]
         if invalid:
@@ -936,7 +939,9 @@ class ModerationController:
             await message.answer(html.escape(str(exc)))
             return
         if not words:
-            await message.answer("用法：<code>/delword 词语1，词语2</code>")
+            await message.answer(
+                "用法：<code>/delword 词语1 词语2</code>；含空格短语请加引号。"
+            )
             return
         global_words = set(self.settings.blocked_words)
         protected = [word for word in words if word in global_words]

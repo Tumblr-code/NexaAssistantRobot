@@ -14,9 +14,31 @@ def message(text: str, *, reply_user_id: int | None = None):
     return SimpleNamespace(text=text, reply_to_message=reply)
 
 
-def test_batch_items_support_commas_newlines_and_preserve_spaces() -> None:
-    value = message("/addword 词语一，guaranteed profit,词语二\n词语三")
-    assert batch_items(value) == ("词语一", "guaranteed profit", "词语二", "词语三")
+def test_batch_items_support_spaces_commas_newlines_and_quoted_phrases() -> None:
+    value = message('/addword 词语一，"guaranteed profit",词语二\n词语三 词语四')
+    assert batch_items(value) == (
+        "词语一",
+        "guaranteed profit",
+        "词语二",
+        "词语三",
+        "词语四",
+    )
+    assert batch_items(message("/addword 号池 供应 合作 长期")) == (
+        "号池",
+        "供应",
+        "合作",
+        "长期",
+    )
+
+
+def test_batch_items_support_chinese_quotes_and_reject_unclosed_quotes() -> None:
+    assert batch_items(message("/addword 号池 供应 “长期 合作”")) == (
+        "号池",
+        "供应",
+        "长期 合作",
+    )
+    with pytest.raises(ValueError, match="引号未闭合"):
+        batch_items(message('/addword 号池 "长期 合作'))
 
 
 def test_batch_items_deduplicate_and_limit() -> None:
