@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Nexa Guardian database backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Asia/Shanghai
+RandomizedDelaySec=10m
+Persistent=true
+Unit=nexa-guardian-backup.service
+
+[Install]
+WantedBy=timers.target

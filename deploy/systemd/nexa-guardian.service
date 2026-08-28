@@ -1,0 +1,38 @@
+[Unit]
+Description=Nexa Guardian Telegram group moderation bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nexa-guardian
+Group=nexa-guardian
+WorkingDirectory=/opt/nexa-guardian/current
+EnvironmentFile=/etc/nexa-guardian/guardian.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env DATABASE_PATH=/var/lib/nexa-guardian/guardian.db /opt/nexa-guardian/current/.venv/bin/python -m nexa_guardian
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/nexa-guardian
+
+[Install]
+WantedBy=multi-user.target
