@@ -7,6 +7,7 @@ import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 
@@ -47,16 +48,20 @@ async def run() -> None:
 
     storage = Storage(settings.database_path)
     await storage.open()
-    bot = Bot(
+    bot_defaults = DefaultBotProperties(
+        parse_mode=ParseMode.HTML,
+        link_preview_is_disabled=True,
+    )
+    bot = Bot(settings.bot_token, default=bot_defaults)
+    delete_bot = Bot(
         settings.bot_token,
-        default=DefaultBotProperties(
-            parse_mode=ParseMode.HTML,
-            link_preview_is_disabled=True,
-        ),
+        session=AiohttpSession(),
+        default=bot_defaults,
     )
     ephemeral = EphemeralMessenger(
         bot,
         storage,
+        delete_bot=delete_bot,
         ttl_seconds=settings.notice_ttl_seconds,
     )
     bot.session.middleware(EphemeralRequestMiddleware(ephemeral))
@@ -108,7 +113,10 @@ async def run() -> None:
                 await retention_task
         await ephemeral.shutdown()
         await storage.close()
-        await bot.session.close()
+        try:
+            await bot.session.close()
+        finally:
+            await delete_bot.session.close()
 
 
 def main() -> None:

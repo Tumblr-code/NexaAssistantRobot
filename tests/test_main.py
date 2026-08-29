@@ -39,8 +39,8 @@ class FakeSession:
 
 
 class FakeBot:
-    def __init__(self, webhook_url: str = "") -> None:
-        self.session = FakeSession()
+    def __init__(self, webhook_url: str = "", session: FakeSession | None = None) -> None:
+        self.session = session or FakeSession()
         self.webhook_url = webhook_url
 
     async def get_me(self) -> SimpleNamespace:
@@ -116,6 +116,8 @@ async def test_run_starts_and_closes_every_component(
     settings = _settings()
     storage = FakeStorage()
     bot = FakeBot()
+    delete_session = FakeSession()
+    delete_bot = FakeBot(session=delete_session)
     ephemeral = FakeEphemeral()
     controller = FakeController()
     dispatcher = FakeDispatcher()
@@ -124,8 +126,19 @@ async def test_run_starts_and_closes_every_component(
     monkeypatch.setattr(main_module, "Settings", SimpleNamespace(from_env=lambda: settings))
     monkeypatch.setattr(main_module, "configure_logging", configure)
     monkeypatch.setattr(main_module, "Storage", lambda path: storage)
-    monkeypatch.setattr(main_module, "Bot", lambda *args, **kwargs: bot)
-    monkeypatch.setattr(main_module, "EphemeralMessenger", lambda *args, **kwargs: ephemeral)
+
+    def make_bot(*args: object, **kwargs: object) -> FakeBot:
+        if kwargs.get("session") is delete_session:
+            return delete_bot
+        return bot
+
+    def make_ephemeral(*args: object, **kwargs: object) -> FakeEphemeral:
+        assert kwargs["delete_bot"] is delete_bot
+        return ephemeral
+
+    monkeypatch.setattr(main_module, "AiohttpSession", lambda: delete_session)
+    monkeypatch.setattr(main_module, "Bot", make_bot)
+    monkeypatch.setattr(main_module, "EphemeralMessenger", make_ephemeral)
     monkeypatch.setattr(main_module, "EphemeralRequestMiddleware", lambda value: value)
     monkeypatch.setattr(main_module, "Dispatcher", lambda: dispatcher)
     monkeypatch.setattr(main_module, "ModerationController", lambda *args: controller)
@@ -141,6 +154,8 @@ async def test_run_starts_and_closes_every_component(
     assert dispatcher.polled
     assert bot.session.registered == [ephemeral]
     assert bot.session.closed
+    assert delete_bot.session.registered == []
+    assert delete_bot.session.closed
 
 
 async def test_run_rejects_existing_webhook_and_still_closes(
@@ -149,13 +164,22 @@ async def test_run_rejects_existing_webhook_and_still_closes(
     settings = _settings()
     storage = FakeStorage()
     bot = FakeBot("https://example.invalid/hook")
+    delete_session = FakeSession()
+    delete_bot = FakeBot(session=delete_session)
     ephemeral = FakeEphemeral()
     controller = FakeController()
 
     monkeypatch.setattr(main_module, "Settings", SimpleNamespace(from_env=lambda: settings))
     monkeypatch.setattr(main_module, "configure_logging", Mock())
     monkeypatch.setattr(main_module, "Storage", lambda path: storage)
-    monkeypatch.setattr(main_module, "Bot", lambda *args, **kwargs: bot)
+
+    def make_bot(*args: object, **kwargs: object) -> FakeBot:
+        if kwargs.get("session") is delete_session:
+            return delete_bot
+        return bot
+
+    monkeypatch.setattr(main_module, "AiohttpSession", lambda: delete_session)
+    monkeypatch.setattr(main_module, "Bot", make_bot)
     monkeypatch.setattr(main_module, "EphemeralMessenger", lambda *args, **kwargs: ephemeral)
     monkeypatch.setattr(main_module, "EphemeralRequestMiddleware", lambda value: value)
     monkeypatch.setattr(main_module, "Dispatcher", FakeDispatcher)
@@ -168,6 +192,7 @@ async def test_run_rejects_existing_webhook_and_still_closes(
     assert ephemeral.stopped
     assert controller.stopped
     assert bot.session.closed
+    assert delete_bot.session.closed
 
 
 async def test_ai_decision_retention_runs_periodically(

@@ -179,6 +179,52 @@ async def test_process_due_deletes_and_acknowledges_without_waiting() -> None:
     assert storage.records == {}
 
 
+async def test_process_due_uses_dedicated_delete_bot() -> None:
+    clock = MutableClock(at(30))
+    record = EphemeralRecord(-100, 9, "2026-08-29T00:00:29.000000+00:00")
+    storage = FakeStorage([record])
+    polling_bot = FakeBot()
+    delete_bot = FakeBot()
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        polling_bot,
+        storage,
+        delete_bot=delete_bot,  # type: ignore[arg-type]
+        clock=clock,
+    )
+
+    assert await messenger.process_due() == 1
+
+    assert polling_bot.deleted == []
+    assert delete_bot.deleted == [(-100, 9)]
+    assert storage.acked == [(-100, 9)]
+
+
+async def test_delete_timeout_reschedules_due_message() -> None:
+    class BlockingDeleteBot(FakeBot):
+        async def delete_message(self, chat_id: int, message_id: int) -> bool:
+            self.deleted.append((chat_id, message_id))
+            await asyncio.Event().wait()
+            return True
+
+    record = EphemeralRecord(-100, 10, "2026-08-29T00:00:29.000000+00:00")
+    storage = FakeStorage([record])
+    delete_bot = BlockingDeleteBot()
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        FakeBot(),
+        storage,
+        delete_bot=delete_bot,  # type: ignore[arg-type]
+        delete_timeout_seconds=0.01,
+        retry_delay_seconds=2,
+        clock=MutableClock(at(30)),
+    )
+
+    assert await messenger.process_due() == 0
+
+    assert delete_bot.deleted == [(-100, 10)]
+    assert storage.acked == []
+    assert storage.rescheduled == [EphemeralRecord(-100, 10, "2026-08-29T00:00:32.000000+00:00")]
+
+
 async def test_missing_or_forbidden_message_is_acknowledged() -> None:
     records = [
         EphemeralRecord(-100, 1, "2026-08-29T00:00:00.000000+00:00"),
