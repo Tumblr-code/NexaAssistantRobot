@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, TypeVar
 
 from aiogram import Bot
+from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import Message
 
@@ -62,11 +63,12 @@ def _utc_iso(value: datetime) -> str:
 
 
 class EphemeralMessenger:
-    """Send and remove bot messages without retaining their contents.
+    """Send and remove non-private bot messages without retaining their contents.
 
     The storage only receives Telegram identifiers and deletion timestamps. Retry
     counters remain in memory. Editing an already tracked message deliberately leaves
-    its original deletion deadline unchanged.
+    its original deletion deadline unchanged. Private-chat responses are deliberately
+    left persistent and never enter the deletion queue.
     """
 
     def __init__(
@@ -132,6 +134,8 @@ class EphemeralMessenger:
         message_id = getattr(message, "message_id", None)
         if not isinstance(chat_id, int) or not isinstance(message_id, int):
             raise TypeError("tracked message must expose integer chat.id and message_id")
+        if getattr(chat, "type", None) == ChatType.PRIVATE:
+            return message
 
         key = (chat_id, message_id)
         delete_at = self._fallback_deadlines.get(key)
@@ -266,11 +270,11 @@ class EphemeralMessenger:
 
 
 class EphemeralRequestMiddleware:
-    """Track every Telegram API call that returns sent or edited messages.
+    """Track non-private Telegram API calls that return sent or edited messages.
 
     The database uses ``ON CONFLICT DO NOTHING``, so editing an already tracked
     message never extends its original deadline. Media groups return a list and
-    each message in that list receives its own deadline.
+    each non-private message in that list receives its own deadline.
     """
 
     def __init__(self, messenger: EphemeralMessenger) -> None:

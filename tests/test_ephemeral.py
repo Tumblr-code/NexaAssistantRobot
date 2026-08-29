@@ -370,6 +370,51 @@ async def test_request_middleware_tracks_every_message_result() -> None:
     messenger.track_sent.assert_awaited_once_with(sent)
 
 
+async def test_private_message_is_not_queued_for_deletion() -> None:
+    storage = FakeStorage()
+    bot = FakeBot()
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        bot,
+        storage,
+        clock=MutableClock(at(0)),
+    )
+    sent = Message(
+        message_id=78,
+        date=datetime.now(UTC),
+        chat=Chat(id=42, type=ChatType.PRIVATE, first_name="Admin"),
+        text="persistent private reply",
+    )
+    middleware = EphemeralRequestMiddleware(messenger)
+
+    result = await middleware(AsyncMock(return_value=sent), bot, object())  # type: ignore[arg-type]
+
+    assert result is sent
+    assert storage.records == {}
+    assert storage.enqueued == []
+
+
+async def test_group_message_is_still_queued_for_deletion() -> None:
+    storage = FakeStorage()
+    bot = FakeBot()
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        bot,
+        storage,
+        clock=MutableClock(at(0)),
+    )
+    sent = Message(
+        message_id=79,
+        date=datetime.now(UTC),
+        chat=Chat(id=-100, type=ChatType.SUPERGROUP, title="Test"),
+        text="temporary group reply",
+    )
+    middleware = EphemeralRequestMiddleware(messenger)
+
+    result = await middleware(AsyncMock(return_value=sent), bot, object())  # type: ignore[arg-type]
+
+    assert result is sent
+    assert storage.records[(-100, 79)].delete_at == "2026-08-29T00:00:30.000000+00:00"
+
+
 async def test_request_middleware_tracks_each_media_group_message() -> None:
     messages = [
         Message(
@@ -404,16 +449,16 @@ async def test_request_middleware_edit_does_not_extend_existing_deadline() -> No
     sent = Message(
         message_id=77,
         date=datetime.now(UTC),
-        chat=Chat(id=42, type=ChatType.PRIVATE, first_name="Admin"),
+        chat=Chat(id=-100, type=ChatType.SUPERGROUP, title="Test"),
         text="reviewing",
     )
     await messenger.track_sent(sent)
-    original_deadline = storage.records[(42, 77)].delete_at
+    original_deadline = storage.records[(-100, 77)].delete_at
     clock.advance(20)
     middleware = EphemeralRequestMiddleware(messenger)
 
     result = await middleware(AsyncMock(return_value=sent), FakeBot(), object())  # type: ignore[arg-type]
 
     assert result is sent
-    assert storage.records[(42, 77)].delete_at == original_deadline
+    assert storage.records[(-100, 77)].delete_at == original_deadline
     assert len(storage.enqueued) == 1

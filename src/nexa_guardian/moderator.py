@@ -125,7 +125,7 @@ HELP_TEXT = """<b>Nexa Guardian 群管命令</b>
 <code>/recent</code> <code>/aistats</code> <code>/airecent</code> <code>/chatid</code>
 
 私聊示例：<code>/mute 123456789 2h</code>
-私聊仅授权管理员可用；当前只有一个授权群时会自动选择该群。"""
+私聊仅唯一授权管理员可用，机器人私聊回复永久保留；群内回复约 30 秒后清理。"""
 
 
 def display_user(user: User | None, user_id: int) -> str:
@@ -283,6 +283,12 @@ class ModerationController:
         self._register_handlers()
 
     def _register_handlers(self) -> None:
+        # Private updates from anyone except the single configured administrator
+        # are silently consumed before any command handler can respond.
+        self.router.message.register(
+            self._ignore_unauthorized_private,
+            self._unauthorized_private_message,
+        )
         # Member-authored command-looking messages are still untrusted content.
         # Register this guard before Telegram command handlers so only verified
         # admins (and other moderation exemptions) can reach the command path.
@@ -322,6 +328,18 @@ class ModerationController:
         self.router.message.register(self.moderate_message)
         self.router.edited_message.register(self.moderate_message)
         self.router.chat_member.register(self.chat_member_changed)
+
+    async def _unauthorized_private_message(self, message: Message) -> bool:
+        if message.chat.type != ChatType.PRIVATE:
+            return False
+        if message.from_user is None or len(self.settings.authorized_admin_ids) != 1:
+            return True
+        authorized_admin_id = next(iter(self.settings.authorized_admin_ids))
+        return message.from_user.id != authorized_admin_id
+
+    async def _ignore_unauthorized_private(self, message: Message) -> None:
+        """Silently consume unauthorized private updates."""
+        return None
 
     async def _ordinary_member_command(self, message: Message) -> bool:
         """Route untrusted group command-shaped text through moderation first."""
@@ -396,10 +414,11 @@ class ModerationController:
             await message.answer("无法识别命令发起者。")
             return None
         if message.chat.type == ChatType.PRIVATE:
-            if (
-                not self.settings.authorized_admin_ids
-                or message.from_user.id not in self.settings.authorized_admin_ids
-            ):
+            if len(self.settings.authorized_admin_ids) != 1:
+                await message.answer("私聊管理要求恰好配置一位授权管理员。")
+                return None
+            authorized_admin_id = next(iter(self.settings.authorized_admin_ids))
+            if message.from_user.id != authorized_admin_id:
                 await message.answer("你不在本机器人的授权管理员名单中。")
                 return None
             if len(self.settings.allowed_chat_ids) != 1:

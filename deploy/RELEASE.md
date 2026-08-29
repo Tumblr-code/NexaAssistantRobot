@@ -100,5 +100,5 @@ systemctl status nexa-guardian-backup.timer --no-pager
 ```
 
 脚本只验证服务和 SQLite 的基础健康状态。Telegram 权限、管理员私聊、Nexa Guardian 官方
-群管理审核员身份、三个一方站点的精确域名行为、AI 网关 Sol/high/default 响应契约、30 秒
-消息清理及真实群组审核行为仍需按照发布验收清单逐项检查。
+群管理审核员身份、三个一方站点的精确域名行为、AI 网关 Sol/high/default 响应契约、群内
+30 秒消息清理、授权管理员私聊保留及真实群组审核行为仍需按照发布验收清单逐项检查。
