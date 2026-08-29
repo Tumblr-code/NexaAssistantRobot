@@ -46,8 +46,8 @@ sudo /path/to/repository/deploy/release.sh \
   --schema-version 5
 ```
 
-当前版本的 `--schema-version` 必须明确传入 `4`，脚本会在启动后核对数据库的
-`PRAGMA user_version=4`。wheel 模式必须显式提供
+当前版本的 `--schema-version` 必须明确传入 `5`，脚本会在启动后核对数据库的
+`PRAGMA user_version=5`。wheel 模式必须显式提供
 完整 Git SHA；源码模式只接受无未提交或未跟踪文件的干净 Git worktree，默认读取 `HEAD`，
 也可通过 `--git-sha` 固定指定且必须与 `HEAD` 完全一致。
 
