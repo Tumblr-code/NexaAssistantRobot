@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, call
 
+import pytest
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.methods import DeleteMessage
@@ -223,6 +225,103 @@ async def test_delete_timeout_reschedules_due_message() -> None:
     assert delete_bot.deleted == [(-100, 10)]
     assert storage.acked == []
     assert storage.rescheduled == [EphemeralRecord(-100, 10, "2026-08-29T00:00:32.000000+00:00")]
+
+
+async def test_child_delete_cancellation_is_logged_and_rescheduled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class SelfCancellingDeleteBot(FakeBot):
+        async def delete_message(self, chat_id: int, message_id: int) -> bool:
+            self.deleted.append((chat_id, message_id))
+            raise asyncio.CancelledError
+
+    record = EphemeralRecord(-100, 11, "2026-08-29T00:00:29.000000+00:00")
+    storage = FakeStorage([record])
+    delete_bot = SelfCancellingDeleteBot()
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        FakeBot(),
+        storage,
+        delete_bot=delete_bot,  # type: ignore[arg-type]
+        retry_delay_seconds=2,
+        clock=MutableClock(at(30)),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert await messenger.process_due() == 0
+
+    assert delete_bot.deleted == [(-100, 11)]
+    assert storage.acked == []
+    assert storage.rescheduled == [EphemeralRecord(-100, 11, "2026-08-29T00:00:32.000000+00:00")]
+    assert "ephemeral deletion failed; retry scheduled" in caplog.text
+    assert "error=_DeleteRequestCancelledError" in caplog.text
+
+
+async def test_shutdown_cancels_worker_during_delete_request() -> None:
+    clock = MutableClock(at(0))
+    record = EphemeralRecord(-100, 12, "2026-08-29T00:00:01.000000+00:00")
+    storage = FakeStorage([record])
+    delete_started = asyncio.Event()
+
+    class BlockingDeleteBot(FakeBot):
+        async def delete_message(self, chat_id: int, message_id: int) -> bool:
+            self.deleted.append((chat_id, message_id))
+            delete_started.set()
+            await asyncio.Event().wait()
+            return True
+
+    async def advance_to_due(_: float) -> None:
+        clock.advance(2)
+
+    delete_bot = BlockingDeleteBot()
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        FakeBot(),
+        storage,
+        delete_bot=delete_bot,  # type: ignore[arg-type]
+        clock=clock,
+        sleep=advance_to_due,
+    )
+
+    await messenger.start()
+    await asyncio.wait_for(delete_started.wait(), timeout=0.2)
+    await asyncio.wait_for(messenger.shutdown(), timeout=0.2)
+
+    assert messenger._worker_task is None
+    assert delete_bot.deleted == [(-100, 12)]
+    assert storage.acked == []
+    assert storage.rescheduled == []
+    assert (-100, 12) in storage.records
+
+
+async def test_worker_logs_unexpected_cancellation_and_keeps_running(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sleep_calls = 0
+    worker_continued = asyncio.Event()
+
+    async def cancel_once_then_block(_: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            raise asyncio.CancelledError
+        worker_continued.set()
+        await asyncio.Event().wait()
+
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        FakeBot(),
+        FakeStorage(),
+        clock=MutableClock(at(0)),
+        sleep=cancel_once_then_block,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await messenger.start()
+        await asyncio.wait_for(worker_continued.wait(), timeout=0.2)
+
+    assert messenger._worker_task is not None
+    assert not messenger._worker_task.done()
+    assert "worker received an unexpected cancellation; continuing" in caplog.text
+
+    await asyncio.wait_for(messenger.shutdown(), timeout=0.2)
 
 
 async def test_missing_or_forbidden_message_is_acknowledged() -> None:

@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 MessageResult = TypeVar("MessageResult")
 
 
+class _DeleteRequestCancelledError(RuntimeError):
+    """A child Telegram request was cancelled without cancelling its worker."""
+
+
 @dataclass(frozen=True, slots=True)
 class EphemeralRecord:
     chat_id: int
@@ -111,6 +115,7 @@ class EphemeralMessenger:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep
         self._worker_task: asyncio.Task[None] | None = None
+        self._stopping = False
         self._retry_attempts: dict[tuple[int, int], int] = {}
         self._fallback_deadlines: dict[tuple[int, int], str] = {}
 
@@ -118,13 +123,16 @@ class EphemeralMessenger:
         """Recover already-due messages before starting the polling worker."""
         if self._worker_task is not None and not self._worker_task.done():
             return
+        self._stopping = False
         await self.process_due()
         self._worker_task = asyncio.create_task(
             self._run_worker(),
             name="nexa-ephemeral-message-worker",
         )
+        self._worker_task.add_done_callback(self._worker_done)
 
     async def shutdown(self) -> None:
+        self._stopping = True
         task = self._worker_task
         self._worker_task = None
         if task is not None:
@@ -266,18 +274,65 @@ class EphemeralMessenger:
 
     async def _delete_message(self, chat_id: int, message_id: int) -> bool:
         """Delete through the isolated client without letting one request stall the worker."""
-        return await asyncio.wait_for(
+        delete_task = asyncio.create_task(
             self.delete_bot.delete_message(chat_id, message_id),
-            timeout=self.delete_timeout_seconds,
+            name="nexa-ephemeral-delete-request",
+        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(delete_task),
+                timeout=self.delete_timeout_seconds,
+            )
+        except asyncio.CancelledError as exc:
+            if delete_task.cancelled():
+                raise _DeleteRequestCancelledError(
+                    "Telegram delete request cancelled independently"
+                ) from exc
+            self._cancel_delete_task(delete_task)
+            raise
+        except asyncio.TimeoutError:
+            self._cancel_delete_task(delete_task)
+            raise
+
+    @staticmethod
+    def _cancel_delete_task(task: asyncio.Task[bool]) -> None:
+        """Request child cancellation without letting cleanup delay the worker."""
+        task.cancel()
+
+        def consume_result(completed: asyncio.Task[bool]) -> None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                completed.result()
+
+        task.add_done_callback(consume_result)
+
+    def _worker_done(self, task: asyncio.Task[None]) -> None:
+        if self._worker_task is task:
+            self._worker_task = None
+        if self._stopping:
+            return
+        if task.cancelled():
+            logger.error("ephemeral message worker stopped unexpectedly after cancellation")
+            return
+        exception = task.exception()
+        if exception is None:
+            logger.error("ephemeral message worker stopped unexpectedly without an error")
+            return
+        logger.critical(
+            "ephemeral message worker stopped unexpectedly",
+            exc_info=(type(exception), exception, exception.__traceback__),
         )
 
     async def _run_worker(self) -> None:
         while True:
-            await self._sleep(self.poll_interval)
             try:
+                await self._sleep(self.poll_interval)
                 await self.process_due()
             except asyncio.CancelledError:
-                raise
+                if self._stopping:
+                    raise
+                logger.error(
+                    "ephemeral message worker received an unexpected cancellation; continuing"
+                )
             except Exception:
                 logger.exception("ephemeral message worker iteration failed")
 
