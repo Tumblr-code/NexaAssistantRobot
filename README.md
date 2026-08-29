@@ -1,20 +1,21 @@
 # Nexa Guardian
 
-一个独立、自托管的 Telegram 群管理机器人，面向广告删除、刷屏控制、警告和禁言。它不会改动现有客服机器人，也不会自动接管未明确列入白名单的群。
+一个独立、自托管的 Telegram 群管理机器人，使用 GPT-5.6 识别广告，并提供删除、警告、封禁和管理员私聊管理。它不会改动现有客服机器人，也不会自动接管未明确列入白名单的群。
 
-当前状态：已于 2026-08-27 部署到 VM `SERVER-IP`，由 `nexa-guardian.service` 持久运行；目标为 `@ExampleGroup`，正式管理模式已启用。部署后的 Telegram 身份、群权限、轮询、SQLite 完整性和在线备份均已验证。
+生产服务位于 VM `SERVER-IP`，由 `nexa-guardian.service` 持久运行，目标为 `@ExampleGroup`。仓库中的 v0.2 AI 模式只有在兼容网关探测通过并配置 `AI_ENABLED=true` 后才会启用；未启用时继续运行旧规则兼容模式。
 
 ## 已实现
 
-- 自动删除非白名单外链，包括藏在文字中的 `text_link`。
-- 可配置广告词；会归一化全角字符、零宽字符、空格和标点，识别简单规避写法。
-- 可选删除转发内容和 `@账号` 推广；默认关闭，避免误伤正常讨论。
-- 限速和重复消息检测。
+- GPT-5.6 结构化审核文字、媒体标题、图片和视频封面。
+- 外链、转发、联系方式、混淆字符、刷屏及已学习特征仅作为可疑预检；正常聊天静默审核。
+- 只有可疑消息会显示“正在审核…”；结果原地更新，机器人输出统一在 30 秒后删除。
+- 高置信广告特征自动学习，后续可在不调用 API 的情况下快速拦截。
 - 违规累计警告，达到阈值后自动封禁并清零。
 - 管理员命令：警告、禁言、解禁、封禁、解封、移出、删消息。
-- 每群独立的可信用户、域名白名单、拦截词和 SQLite 状态。
+- 每群独立的可信用户、域名白名单、AI 特征和 SQLite 状态。
 - 可选独立日志群；日志不保存完整消息正文或 Token。
-- `DRY_RUN` 观察模式、群 ID 白名单、在线 SQLite 备份、systemd/Docker 非 root 运行。
+- AI 判断不保存消息正文、图片、处罚原因或模型推理。
+- `DRY_RUN` 观察模式、群 ID 白名单、在线 SQLite 备份、持久化临时消息删除队列、systemd/Docker 非 root 运行。
 
 ## GitHub 调研取舍
 
@@ -59,18 +60,26 @@ ALLOWED_CHAT_IDS=-1001234567890,-1009876543210
 
 | 变量 | 默认值 | 作用 |
 |---|---:|---|
-| `BLOCK_EXTERNAL_LINKS` | `true` | 删除非白名单外链 |
+| `AI_ENABLED` | `false` | 启用 GPT-5.6 AI 审核；启用前必须完成网关探测 |
+| `OPENAI_BASE_URL` | 空 | 兼容网关基础地址，支持 `/v1/responses` |
+| `OPENAI_API_KEY` | 空 | 兼容网关密钥，仅保存于服务器 `0600` 环境文件 |
+| `AI_MODEL` | `gpt-5.6` | 固定审核模型，不自动降级 |
+| `AI_AD_THRESHOLD` | `0.92` | 删除并警告的最低广告置信度 |
+| `AI_LEARN_THRESHOLD` | `0.97` | 自动启用学习特征的最低置信度 |
+| `AI_FAILURE_DELETE` | `true` | AI 故障时删除原消息，但不警告、不学习 |
+| `NOTICE_TTL_SECONDS` | `30` | 所有机器人群聊及私聊输出的保留秒数 |
+| `BLOCK_EXTERNAL_LINKS` | `true` | AI 模式仅用于可疑预检；旧模式直接过滤 |
 | `AUTHORIZED_ADMIN_IDS` | 空 | 可执行手动命令的数字用户 ID；仍需具备相应群权限 |
 | `ALLOWED_DOMAINS` | 空 | 全局允许的域名及其子域名 |
-| `BLOCKED_WORDS` | 空 | 全局广告词，英文逗号分隔 |
-| `BLOCK_FORWARDS` | `false` | 是否删除普通成员的转发内容 |
-| `BLOCK_CHANNEL_MENTIONS` | `false` | 是否拦截推广语境中的 `@账号` 引流 |
+| `BLOCKED_WORDS` | 空 | 仅供 AI 关闭时旧模式回滚使用 |
+| `BLOCK_FORWARDS` | `false` | AI 模式仅用于转发可疑预检 |
+| `BLOCK_CHANNEL_MENTIONS` | `false` | AI 模式仅用于推广账号可疑预检 |
 | `WARN_LIMIT` | `3` | 自动封禁前的累计警告次数 |
 | `DEFAULT_MUTE_SECONDS` | `3600` | 手动 `/mute` 的默认禁言秒数 |
 | `DRY_RUN` | `false` | 只记录自动命中，不删除/警告/禁言；手动管理员命令仍执行 |
 | `LOG_CHAT_ID` | 空 | 可选的集中管理日志群/频道 |
 
-`BLOCK_CHANNEL_MENTIONS=true` 使用推广语境判断：带“加我、进群、代理、兼职、投资群”等引流提示，或一条消息同时推广多个账号时才拦截；普通单个 `@成员` 提及会保留。拦截词会先进行 Unicode、全半角、空格和零宽字符归一化，可识别“加 微​信”等简单规避写法。
+兼容网关必须同时支持 Responses API、严格 JSON Schema 和图片输入。请求设置 `store=false`，只发送待判断文本或图片，不发送用户名、用户 ID、群名和聊天历史。普通文件和无预览贴纸不送入 AI。
 
 ## 3. 当前生产部署
 
@@ -83,7 +92,7 @@ VM `SERVER-IP` 使用原生 systemd，不依赖 Docker：
 | 发布目录 | `/opt/nexa-guardian/releases/` |
 | 密钥配置 | `/etc/nexa-guardian/guardian.env`，`root:root 0600` |
 | 数据库 | `/var/lib/nexa-guardian/guardian.db` |
-| 备份 | `/var/backups/nexa-guardian/`，每天北京时间 03:30 自动执行 |
+| 备份 | 每日备份写入 `/var/backups/nexa-guardian/`；发布前手工备份写入仅 root 可访问的 `manual/` |
 | 运行用户 | `nexa-guardian` |
 
 常用检查：
@@ -134,6 +143,8 @@ PYTHONPATH=src uv run python -m nexa_guardian
 PYTHONPATH=src uv run pytest -q
 uv run ruff check src tests
 uv run ruff format --check src tests
+uv run pyright src
+uv run pytest --cov=src/nexa_guardian --cov-fail-under=75
 ```
 
 ## 6. 管理命令
@@ -154,9 +165,12 @@ uv run ruff format --check src tests
 /addomain example.com        添加域名白名单
 /deldomain example.com       移除域名白名单
 /domains                     查看域名白名单
-/addword 词1 词2             批量添加拦截词
-/delword 词1 词2             批量移除拦截词
-/words                       查看拦截词
+/words                       横向查看 AI 已学习特征
+/delword 编号或完整特征      停用误学特征
+/aicandidates                私聊查看候选特征
+/aistats                     私聊查看 AI 审核统计
+/airecent [1-30]             私聊查看最近 AI 判断
+/aipause /airesume           私聊紧急暂停/恢复 AI
 
 /settings /stats /status /chatid /help
 /recent [1-30]               私聊查看最近管理操作
@@ -164,7 +178,9 @@ uv run ruff format --check src tests
 
 管理动作不接收、显示或记录原因；旧版命令尾部附带的文字会被兼容忽略。`/stats` 按北京时间展示今天、近 7 天和累计数据。`/recent` 默认返回 10 条、最多 30 条，为避免在群里公开用户 ID，只能由授权管理员私聊使用。
 
-批量拦截词使用空格、英文逗号、中文逗号或换行分隔，每次最多 20 条；需要保留空格的短语使用英文或中文引号，例如 `/addword "guaranteed profit" “长期 合作”`。`/words` 横向排列关键词，域名白名单保持逐行显示；列表过长时都会自动分段发送。
+`/addword` 已停用，AI 只学习通过长度、隐私及宽泛词校验的稳定广告短语。`/words` 横向排列特征并自动分段；管理员可用 `/delword` 立即停用误学项。
+
+机器人在群聊、日志群和管理员私聊发送的所有消息都会在首次发送成功 30 秒后删除；编辑“正在审核…”不会重置时间。删除队列只保存 Telegram 消息标识和到期时间，服务重启后会继续补删。
 
 私聊 `/del` 无法引用群消息，需填写群消息 ID：`/del 群消息ID`。机器人不会仅凭私聊身份放行：每次仍会同时核验授权名单、目标群管理员身份和所需权限。若配置零个或多个目标群，私聊管理会拒绝执行，避免误操作到错误群。
 
@@ -174,10 +190,23 @@ uv run ruff format --check src tests
 
 ## 7. 上线验证顺序
 
-1. 先设 `DRY_RUN=true`，用非管理员测试账号发送外链、允许域名和普通消息；确认只记录应拦截项。
-2. 执行 `/status`，确认机器人具有删除消息和限制成员权限。
-3. 设 `DRY_RUN=false` 后重启，只在测试群验证删除、三次警告禁言、`/unmute`、管理员跳过和可信用户跳过。
-4. 若配置 `LOG_CHAT_ID`，确认日志到达且不含完整原消息。
-5. 创建首份数据库备份，再加入正式群 ID。
+1. 执行完整 CI，并在受保护环境文件中配置网关密钥、`AI_ENABLED=true`、
+   `WARN_LIMIT=3`、`NOTICE_TTL_SECONDS=30` 和 `AI_FAILURE_DELETE=true`。
+2. 运行发布脚本；脚本先备份配置、构建候选版本，并用不含群消息的请求验证 Responses API、
+   结构化输出和图片输入；通过后才短暂停服，创建并校验最终一致的 SQLite 备份并原子切换。
+3. 上线后验证服务、管理员权限和临时消息补删队列。
+4. 用非管理员测试账号验证正常聊天静默、可疑提示、广告删除和第三次警告封禁。
+5. 验证 AI 超时时只删除消息、不增加警告，并确认连续失败告警与 `/aipause` 可用。
+
+网关凭据写入受保护环境文件后，可在候选 release 的虚拟环境中执行：
+
+```bash
+/path/to/candidate/.venv/bin/nexa-guardian-probe \
+  --env-file /etc/nexa-guardian/guardian.env \
+  --require-production-settings
+```
+
+探测只发送固定的无害文字和 1×1 测试图片，不读取或发送群消息；成功后才允许把
+切换生产 release。
 
 轮询启动时如果发现该 Token 已经配置 webhook，程序会拒绝启动，**不会自动删除现有 webhook**。这是为了避免误用现有客服机器人 Token 时切断原服务。

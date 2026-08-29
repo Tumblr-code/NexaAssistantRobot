@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sys
 
@@ -10,10 +11,27 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 
 from nexa_guardian.config import Settings
+from nexa_guardian.ephemeral import EphemeralMessenger, EphemeralRequestMiddleware
 from nexa_guardian.moderator import ModerationController
 from nexa_guardian.storage import Storage
 
 logger = logging.getLogger(__name__)
+
+
+async def prune_ai_decisions_periodically(
+    storage: Storage,
+    *,
+    retention_days: int,
+    interval_seconds: float = 24 * 60 * 60,
+) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await storage.prune_ai_decisions(retention_days=retention_days)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("清理过期 AI 判断记录失败")
 
 
 def configure_logging(level: str) -> None:
@@ -36,11 +54,27 @@ async def run() -> None:
             link_preview_is_disabled=True,
         ),
     )
+    ephemeral = EphemeralMessenger(
+        bot,
+        storage,
+        ttl_seconds=settings.notice_ttl_seconds,
+    )
+    bot.session.middleware(EphemeralRequestMiddleware(ephemeral))
     dispatcher = Dispatcher()
     controller = ModerationController(bot, settings, storage)
     dispatcher.include_router(controller.router)
+    retention_task: asyncio.Task[None] | None = None
 
     try:
+        await ephemeral.start()
+        await storage.prune_ai_decisions(retention_days=settings.ai_decision_retention_days)
+        retention_task = asyncio.create_task(
+            prune_ai_decisions_periodically(
+                storage,
+                retention_days=settings.ai_decision_retention_days,
+            ),
+            name="nexa-ai-decision-retention",
+        )
         identity = await bot.get_me()
         webhook = await bot.get_webhook_info()
         if webhook.url:
@@ -64,9 +98,15 @@ async def run() -> None:
         await dispatcher.start_polling(
             bot,
             allowed_updates=dispatcher.resolve_used_update_types(),
+            close_bot_session=False,
         )
     finally:
         await controller.shutdown()
+        if retention_task is not None:
+            retention_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await retention_task
+        await ephemeral.shutdown()
         await storage.close()
         await bot.session.close()
 

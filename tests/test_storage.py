@@ -1,8 +1,9 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
 
-from nexa_guardian.storage import Storage
+from nexa_guardian.storage import SCHEMA_VERSION, Storage
 
 
 @pytest.fixture
@@ -94,3 +95,184 @@ async def test_time_filtered_stats_warning_totals_and_recent_actions(storage: St
     assert actions[0].action == "warn"
     assert actions[0].actor_id == 7
     assert actions[0].target_id == 42
+
+
+async def test_ai_schema_decisions_and_signatures(storage: Storage) -> None:
+    version = await storage.db.execute_fetchall("PRAGMA user_version")
+    assert version[0][0] == SCHEMA_VERSION
+
+    await storage.record_ai_decision(
+        chat_id=-100,
+        message_id=10,
+        target_id=42,
+        is_ad=True,
+        confidence=0.98,
+        category="crypto_ad",
+        model="gpt-5.6",
+        latency_ms=321,
+        cached=False,
+        enforced=True,
+    )
+    stats = await storage.ai_stats(-100)
+    assert (stats.total, stats.ads, stats.enforced, stats.failed) == (1, 1, 1, 0)
+    assert stats.calls == 1
+    recent = await storage.recent_ai_decisions(-100, limit=1)
+    assert recent[0].is_ad is True
+    assert recent[0].category == "crypto_ad"
+
+    created = await storage.upsert_ai_signature(
+        chat_id=-100,
+        normalized_signature="免费领取usdt",
+        display_signature="免费领取 USDT",
+        category="crypto_ad",
+        status="active",
+        confidence=0.99,
+    )
+    assert created.status == "active"
+    assert await storage.active_ai_signatures(-100) == {"免费领取usdt"}
+    await storage.upsert_ai_signature(
+        chat_id=-100,
+        normalized_signature="免费领取usdt",
+        display_signature="免费领取 USDT",
+        category="crypto_ad",
+        status="candidate",
+        confidence=0.94,
+    )
+    assert (await storage.ai_signatures(-100))[0].status == "active"
+    assert await storage.record_ai_signature_hit(-100, "免费领取usdt")
+    assert (await storage.ai_signatures(-100))[0].hit_count == 3
+    assert await storage.disable_ai_signature(-100, str(created.id))
+    assert await storage.active_ai_signatures(-100) == set()
+
+
+async def test_ai_stats_distinguish_gateway_calls_cache_and_local_signatures(
+    storage: Storage,
+) -> None:
+    records = (
+        ("gpt-5.6", False, True, "", 120),
+        ("gpt-5.6", True, True, "", 0),
+        ("local-signature", True, True, "", 0),
+        ("gpt-5.6", False, None, "AIReviewTimeout", 0),
+        ("local-media", True, None, "MediaReviewError", 0),
+    )
+    for message_id, (model, cached, is_ad, error_type, latency_ms) in enumerate(records, 1):
+        await storage.record_ai_decision(
+            chat_id=-100,
+            message_id=message_id,
+            target_id=42,
+            is_ad=is_ad,
+            confidence=0.99 if is_ad is not None else None,
+            category="promotion" if is_ad else "",
+            model=model,
+            latency_ms=latency_ms,
+            cached=cached,
+            enforced=bool(is_ad),
+            error_type=error_type,
+        )
+
+    stats = await storage.ai_stats(-100)
+
+    assert stats.total == 5
+    assert stats.calls == 2
+    assert stats.ads == 3
+    assert stats.failed == 1
+    assert stats.cached == 1
+    assert stats.average_latency_ms == 120
+
+    await storage.db.execute("UPDATE ai_decisions SET created_at = '2000-01-01T00:00:00+00:00'")
+    await storage.db.commit()
+    assert await storage.prune_ai_decisions(retention_days=30) == 5
+    assert (await storage.ai_stats(-100)).total == 5
+    assert (await storage.ai_stats(-100, since="2026-01-01T00:00:00+00:00")).total == 0
+
+
+async def test_runtime_and_ephemeral_queue(storage: Storage) -> None:
+    await storage.set_runtime_setting(-100, "ai_paused", "1")
+    assert await storage.runtime_setting(-100, "ai_paused") == "1"
+
+    await storage.enqueue_ephemeral(-100, 20, "2026-08-29T00:00:00+00:00")
+    due = await storage.due_ephemeral("2026-08-29T00:00:01+00:00")
+    assert [(item.chat_id, item.message_id) for item in due] == [(-100, 20)]
+    await storage.reschedule_ephemeral(-100, 20, "2026-08-29T00:01:00+00:00")
+    assert await storage.due_ephemeral("2026-08-29T00:00:30+00:00") == ()
+    await storage.ack_ephemeral(-100, 20)
+    assert await storage.due_ephemeral("2026-08-29T01:00:00+00:00") == ()
+
+
+async def test_ephemeral_queue_migration_removes_persisted_attempts(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-v2.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE ephemeral_bot_messages (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                delete_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (chat_id, message_id)
+            );
+            INSERT INTO ephemeral_bot_messages VALUES (-100, 20, '2026-08-29T00:00:00+00:00', 2);
+            PRAGMA user_version=2;
+            """
+        )
+
+    migrated = Storage(database)
+    await migrated.open()
+    try:
+        columns = await migrated.db.execute_fetchall("PRAGMA table_info(ephemeral_bot_messages)")
+        due = await migrated.due_ephemeral("2026-08-29T00:00:01+00:00")
+        version = await migrated.db.execute_fetchall("PRAGMA user_version")
+    finally:
+        await migrated.close()
+
+    assert [row["name"] for row in columns] == ["chat_id", "message_id", "delete_at"]
+    assert [(item.chat_id, item.message_id) for item in due] == [(-100, 20)]
+    assert version[0][0] == SCHEMA_VERSION
+
+
+async def test_schema_v3_backfills_cumulative_ai_totals(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-v3.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE ai_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER,
+                target_id INTEGER,
+                is_ad INTEGER,
+                confidence REAL,
+                category TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                cached INTEGER NOT NULL DEFAULT 0,
+                enforced INTEGER NOT NULL DEFAULT 0,
+                error_type TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO ai_decisions (
+                chat_id, is_ad, confidence, category, model, latency_ms,
+                cached, enforced, error_type, created_at
+            ) VALUES
+                (-100, 1, 0.98, 'promotion', 'gpt-5.6', 80, 0, 1, '',
+                 '2026-08-01T00:00:00+00:00'),
+                (-100, NULL, NULL, '', 'gpt-5.6', 0, 0, 0, 'AIReviewTimeout',
+                 '2026-08-01T00:01:00+00:00');
+            PRAGMA user_version=3;
+            """
+        )
+
+    migrated = Storage(database)
+    await migrated.open()
+    try:
+        stats = await migrated.ai_stats(-100)
+        version = await migrated.db.execute_fetchall("PRAGMA user_version")
+    finally:
+        await migrated.close()
+
+    assert stats.total == 2
+    assert stats.calls == 2
+    assert stats.ads == 1
+    assert stats.failed == 1
+    assert stats.average_latency_ms == 80
+    assert version[0][0] == SCHEMA_VERSION
