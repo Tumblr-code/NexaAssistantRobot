@@ -76,6 +76,8 @@ class EphemeralMessenger:
         bot: Bot,
         storage: EphemeralStorage,
         *,
+        delete_bot: Bot | None = None,
+        delete_timeout_seconds: float = 10,
         ttl_seconds: float = 30,
         poll_interval: float = 1,
         batch_size: int = 100,
@@ -86,6 +88,8 @@ class EphemeralMessenger:
     ) -> None:
         if ttl_seconds < 0:
             raise ValueError("ttl_seconds must not be negative")
+        if not 0 < delete_timeout_seconds < float("inf"):
+            raise ValueError("delete_timeout_seconds must be finite and positive")
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
         if batch_size <= 0:
@@ -96,7 +100,9 @@ class EphemeralMessenger:
             raise ValueError("max_retry_delay_seconds must not be shorter than retry delay")
 
         self.bot = bot
+        self.delete_bot = delete_bot if delete_bot is not None else bot
         self.storage = storage
+        self.delete_timeout_seconds = delete_timeout_seconds
         self.ttl_seconds = ttl_seconds
         self.poll_interval = poll_interval
         self.batch_size = batch_size
@@ -189,7 +195,7 @@ class EphemeralMessenger:
         for record in due:
             key = (record.chat_id, record.message_id)
             try:
-                deleted = await self.bot.delete_message(record.chat_id, record.message_id)
+                deleted = await self._delete_message(record.chat_id, record.message_id)
                 if deleted is False:
                     raise RuntimeError("Telegram returned false while deleting a message")
             except asyncio.CancelledError:
@@ -236,7 +242,7 @@ class EphemeralMessenger:
                 if not force_delete and delete_at > now_iso:
                     continue
                 try:
-                    deleted = await self.bot.delete_message(chat_id, message_id)
+                    deleted = await self._delete_message(chat_id, message_id)
                     if deleted is False:
                         raise RuntimeError("Telegram returned false while deleting a message")
                 except asyncio.CancelledError:
@@ -257,6 +263,13 @@ class EphemeralMessenger:
             else:
                 self._fallback_deadlines.pop(key, None)
         return completed
+
+    async def _delete_message(self, chat_id: int, message_id: int) -> bool:
+        """Delete through the isolated client without letting one request stall the worker."""
+        return await asyncio.wait_for(
+            self.delete_bot.delete_message(chat_id, message_id),
+            timeout=self.delete_timeout_seconds,
+        )
 
     async def _run_worker(self) -> None:
         while True:
