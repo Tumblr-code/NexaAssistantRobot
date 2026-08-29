@@ -4,12 +4,13 @@ import argparse
 import os
 import re
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 BACKUP_NAME_RE = re.compile(r"guardian-(\d{8}T\d{6}Z)\.db")
+UTC = timezone.utc
 
 
 def backup_database(source_path: Path, target_directory: Path) -> Path:
@@ -23,9 +24,10 @@ def backup_database(source_path: Path, target_directory: Path) -> Path:
 
     source_uri = f"{source_path.resolve().as_uri()}?mode=ro"
     try:
-        with sqlite3.connect(source_uri, uri=True) as source, sqlite3.connect(
-            target_path
-        ) as target:
+        with (
+            sqlite3.connect(source_uri, uri=True) as source,
+            sqlite3.connect(target_path) as target,
+        ):
             source.backup(target)
             result = target.execute("PRAGMA quick_check").fetchone()
             if result is None or result[0] != "ok":

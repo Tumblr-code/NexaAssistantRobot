@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
+import io
 import logging
-from datetime import UTC, datetime, timedelta
+import time
+import weakref
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Router
-from aiogram.enums import ChatType
+from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -19,11 +24,18 @@ from aiogram.types import (
     Message,
     User,
 )
+from aiohttp import ClientError as AiohttpClientError
 
 from nexa_guardian.admin import AdminRights, AdminService
+from nexa_guardian.ai_review import (
+    AIReviewer,
+    AIReviewError,
+    normalize_signature,
+    suspicious_precheck,
+)
 from nexa_guardian.commands import (
-    batch_items,
     command_arguments,
+    command_payload,
     duration_from,
     resolve_target,
 )
@@ -37,11 +49,16 @@ from nexa_guardian.detection import (
     human_duration,
     normalize_domain,
 )
-from nexa_guardian.storage import ChatStats, Storage
+from nexa_guardian.storage import AIStats, ChatStats, Storage
 
 logger = logging.getLogger(__name__)
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 DISPLAY_TIMEZONE = ZoneInfo("Asia/Shanghai")
+UTC = timezone.utc
+AUTO_BAN_MEMORY_SECONDS = 60 * 60
+AUTO_BAN_MEMORY_MAX = 10_000
+
+
 ACTION_LABELS = {
     "delete": "删除消息",
     "warn": "警告",
@@ -57,16 +74,19 @@ ACTION_LABELS = {
     "trust": "添加可信用户",
     "untrust": "移除可信用户",
     "add_words": "添加拦截词",
+    "add_word": "添加拦截词",
     "delete_words": "移除拦截词",
     "add_domain": "添加域名白名单",
     "delete_domain": "移除域名白名单",
     "dry_run_hit": "观察模式命中",
     "delete_failed": "删除失败",
+    "ai_signature_delete": "AI 特征命中删除",
+    "ai_failure_delete": "AI 故障保护删除",
 }
 
 HELP_TEXT = """<b>Nexa Guardian 群管命令</b>
 
-自动功能：外链/关键词广告删除、刷屏检测、累计 3 次警告自动封禁。
+自动功能：GPT-5.6 广告审核、AI 特征学习、累计 3 次警告自动封禁。
 
 群内可回复成员消息；私聊机器人时，把数字用户 ID 放在命令后：
 <code>/warn</code>　警告
@@ -82,12 +102,13 @@ HELP_TEXT = """<b>Nexa Guardian 群管命令</b>
 <code>/trust</code> / <code>/untrust</code>　可信用户
 <code>/addomain example.com</code> / <code>/deldomain example.com</code>
 <code>/domains</code>　查看域名白名单
-<code>/addword 词1 词2</code> / <code>/delword 词1 词2</code>
-空格、逗号或换行可批量分隔；含空格短语请加引号。
-<code>/words</code>　查看拦截词
+<code>/words</code>　查看 AI 已学习特征
+<code>/delword 编号或完整特征</code>　停用误学特征
+<code>/aicandidates</code>　查看候选或拒绝特征
+<code>/aipause</code> / <code>/airesume</code>　暂停或恢复 AI
 
 检查：<code>/status</code> <code>/settings</code> <code>/stats</code>
-<code>/recent</code> <code>/chatid</code>
+<code>/recent</code> <code>/aistats</code> <code>/airecent</code> <code>/chatid</code>
 
 私聊示例：<code>/mute 123456789 2h</code>
 私聊仅授权管理员可用；当前只有一个授权群时会自动选择该群。"""
@@ -201,7 +222,14 @@ class ActionReporter:
 
 
 class ModerationController:
-    def __init__(self, bot: Bot, settings: Settings, storage: Storage) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        settings: Settings,
+        storage: Storage,
+        *,
+        ai_reviewer: AIReviewer | None = None,
+    ) -> None:
         self.bot = bot
         self.settings = settings
         self.storage = storage
@@ -219,10 +247,33 @@ class ModerationController:
             duplicate_window_seconds=settings.duplicate_window_seconds,
             duplicate_max_messages=settings.duplicate_max_messages,
         )
-        self._background_tasks: set[asyncio.Task[None]] = set()
+        self.ai_reviewer = ai_reviewer
+        if self.ai_reviewer is None and settings.ai_enabled:
+            self.ai_reviewer = AIReviewer(
+                base_url=settings.openai_base_url,
+                api_key=settings.openai_api_key,
+                model=settings.ai_model,
+                timeout=settings.ai_timeout_seconds,
+                concurrency=settings.ai_concurrency,
+                cache_ttl=settings.ai_cache_ttl_seconds,
+                cache_size=settings.ai_cache_max_entries,
+            )
+        self._ai_failure_streak = 0
+        self._ai_failure_lock = asyncio.Lock()
+        self._member_action_locks: weakref.WeakValueDictionary[tuple[int, int], asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+        self._auto_banned_members: OrderedDict[tuple[int, int], float] = OrderedDict()
         self._register_handlers()
 
     def _register_handlers(self) -> None:
+        # Member-authored command-looking messages are still untrusted content.
+        # Register this guard before Telegram command handlers so only verified
+        # admins (and other moderation exemptions) can reach the command path.
+        self.router.message.register(
+            self.moderate_message,
+            self._ordinary_member_command,
+        )
         self.router.message.register(self.start, CommandStart())
         self.router.message.register(self.help, Command("help"))
         self.router.message.register(self.chat_id, Command("chatid"))
@@ -247,8 +298,36 @@ class ModerationController:
         self.router.message.register(self.add_word, Command("addword"))
         self.router.message.register(self.delete_word, Command("delword"))
         self.router.message.register(self.list_words, Command("words"))
+        self.router.message.register(self.ai_candidates, Command("aicandidates"))
+        self.router.message.register(self.ai_stats, Command("aistats"))
+        self.router.message.register(self.ai_recent, Command("airecent"))
+        self.router.message.register(self.ai_pause, Command("aipause"))
+        self.router.message.register(self.ai_resume, Command("airesume"))
         self.router.message.register(self.moderate_message)
+        self.router.edited_message.register(self.moderate_message)
         self.router.chat_member.register(self.chat_member_changed)
+
+    async def _ordinary_member_command(self, message: Message) -> bool:
+        """Route untrusted group command-shaped text through moderation first."""
+        if not message.text or not message.text.startswith("/"):
+            return False
+        if message.chat.type not in GROUP_TYPES or not self.is_allowed_chat(message.chat.id):
+            return False
+        if message.is_automatic_forward:
+            return False
+        if message.sender_chat is not None and message.sender_chat.id == message.chat.id:
+            return False
+
+        user = message.from_user
+        user_id = user.id if user is not None and not user.is_bot else None
+        if user_id is not None:
+            admin_state = await self.admins.cached_is_admin(message.chat.id, user_id)
+            if admin_state is not False:
+                return False
+            if await self.storage.is_trusted(message.chat.id, user_id):
+                return False
+            return True
+        return message.sender_chat is not None
 
     async def set_commands(self) -> None:
         await self.bot.set_my_commands(
@@ -269,21 +348,22 @@ class ModerationController:
                 BotCommand(command="clearwarns", description="清除用户警告"),
                 BotCommand(command="trust", description="添加可信用户"),
                 BotCommand(command="untrust", description="移除可信用户"),
-                BotCommand(command="addword", description="批量添加拦截词，空格/逗号分隔"),
-                BotCommand(command="delword", description="批量移除拦截词，空格/逗号分隔"),
+                BotCommand(command="delword", description="停用误学的 AI 特征"),
                 BotCommand(command="domains", description="查看域名白名单"),
                 BotCommand(command="addomain", description="添加域名白名单"),
                 BotCommand(command="deldomain", description="移除域名白名单"),
-                BotCommand(command="words", description="查看广告拦截词"),
+                BotCommand(command="words", description="查看 AI 已学习特征"),
+                BotCommand(command="aicandidates", description="查看 AI 候选特征"),
+                BotCommand(command="aistats", description="查看 AI 审核统计"),
+                BotCommand(command="airecent", description="查看最近 AI 判断"),
+                BotCommand(command="aipause", description="紧急暂停 AI 审核"),
+                BotCommand(command="airesume", description="恢复 AI 审核"),
                 BotCommand(command="chatid", description="查看目标群 ID"),
             ]
         )
 
     async def shutdown(self) -> None:
-        for task in self._background_tasks:
-            task.cancel()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        return None
 
     def is_allowed_chat(self, chat_id: int) -> bool:
         return chat_id in self.settings.allowed_chat_ids
@@ -407,24 +487,31 @@ class ModerationController:
 
     async def _notice(self, message: Message, text: str) -> None:
         try:
-            sent = await message.answer(text)
+            await message.answer(text)
         except TelegramAPIError:
             logger.exception("发送群管提示失败 chat_id=%s", message.chat.id)
-            return
-        if self.settings.notice_ttl_seconds <= 0:
-            return
-        task = asyncio.create_task(
-            self._delete_later(sent.chat.id, sent.message_id, self.settings.notice_ttl_seconds)
-        )
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
 
-    async def _delete_later(self, chat_id: int, message_id: int, delay: int) -> None:
-        await asyncio.sleep(delay)
+    async def _processing_notice(self, message: Message) -> Message | None:
         try:
-            await self.bot.delete_message(chat_id, message_id)
+            return await message.reply("正在审核…")
         except TelegramAPIError:
-            logger.debug("临时提示删除失败 chat_id=%s message_id=%s", chat_id, message_id)
+            logger.exception("发送审核提示失败 chat_id=%s", message.chat.id)
+            return None
+
+    async def _finish_processing(
+        self, source: Message, processing: Message | None, text: str
+    ) -> None:
+        if processing is not None:
+            try:
+                await processing.edit_text(text)
+                return
+            except TelegramAPIError:
+                logger.debug(
+                    "编辑审核提示失败 chat_id=%s message_id=%s",
+                    processing.chat.id,
+                    processing.message_id,
+                )
+        await self._notice(source, text)
 
     async def _send_chunked_list(
         self,
@@ -455,9 +542,7 @@ class ModerationController:
             bodies.append(current)
         for index, body in enumerate(bodies, start=1):
             page = f" {index}/{len(bodies)}" if len(bodies) > 1 else ""
-            await message.answer(
-                f"<b>{html.escape(title)}（{len(items)}）{page}</b>\n{body}"
-            )
+            await message.answer(f"<b>{html.escape(title)}（{len(items)}）{page}</b>\n{body}")
 
     async def _mute_member(self, chat_id: int, user_id: int, seconds: int) -> None:
         until = datetime.now(UTC) + timedelta(seconds=seconds)
@@ -530,20 +615,22 @@ class ModerationController:
         if actor is None:
             return
         chat_id = actor[2]
-        domains = set(self.settings.allowed_domains) | await self.storage.allowed_domains(
-            chat_id
-        )
-        words = set(self.settings.blocked_words) | await self.storage.blocked_words(chat_id)
+        domains = set(self.settings.allowed_domains) | await self.storage.allowed_domains(chat_id)
+        signatures = await self.storage.ai_signatures(chat_id, statuses=("active",))
+        paused = await self.storage.runtime_setting(chat_id, "ai_paused") == "1"
         await message.answer(
             f"<b>当前群管规则</b>\n"
-            f"外链过滤：{'开' if self.settings.block_external_links else '关'}\n"
-            f"转发过滤：{'开' if self.settings.block_forwards else '关'}\n"
-            f"@账号过滤：{'开' if self.settings.block_channel_mentions else '关'}\n"
+            f"AI 审核：{'暂停' if paused else '开' if self.settings.ai_enabled else '关'}\n"
+            f"AI 模型：<code>{html.escape(self.settings.ai_model)}</code>\n"
+            f"广告阈值：{self.settings.ai_ad_threshold:.2f}\n"
+            f"学习阈值：{self.settings.ai_learn_threshold:.2f}\n"
+            "外链/转发/@账号：仅作可疑预检\n"
             f"警告阈值：{self.settings.warn_limit}\n"
             "达到阈值：自动封禁\n"
             f"手动禁言默认：{human_duration(self.settings.default_mute_seconds)}\n"
             f"域名白名单：{len(domains)} 条\n"
-            f"拦截词：{len(words)} 条\n"
+            f"AI 已学习特征：{len(signatures)} 条\n"
+            "人工关键词执行：关\n"
             f"授权管理员：{len(self.settings.authorized_admin_ids) or '全部群管理员'}\n"
             f"观察模式：{'开' if self.settings.dry_run else '关'}"
         )
@@ -607,27 +694,13 @@ class ModerationController:
         actor_id = actor[0]
         chat_id = actor[2]
         user_id, user, _ = target
-        count = await self.storage.add_warning(chat_id, user_id)
-        banned = False
-        if count >= self.settings.warn_limit:
-            try:
-                await self.bot.ban_chat_member(chat_id, user_id, revoke_messages=True)
-                await self.storage.clear_warnings(chat_id, user_id)
-                await self.reporter.record(
-                    chat_id=chat_id,
-                    action="auto_ban",
-                    actor_id=actor_id,
-                    target_id=user_id,
-                )
-                banned = True
-            except TelegramAPIError as exc:
-                await message.answer(f"警告已记录，但自动封禁失败：{html.escape(str(exc))}")
-        await self.reporter.record(
+        count, banned, ban_error = await self._warn_and_maybe_ban(
             chat_id=chat_id,
-            action="warn",
+            user_id=user_id,
             actor_id=actor_id,
-            target_id=user_id,
         )
+        if ban_error is not None:
+            await message.answer(f"警告已记录，但自动封禁失败：{html.escape(ban_error)}")
         suffix = "；达到阈值，已封禁" if banned else f"（{count}/{self.settings.warn_limit}）"
         await message.answer(f"已警告 {display_user(user, user_id)}{suffix}。")
 
@@ -679,11 +752,14 @@ class ModerationController:
             return
         chat_id = actor[2]
         user_id, user, _ = target
-        try:
-            await self.bot.ban_chat_member(chat_id, user_id, revoke_messages=True)
-        except TelegramAPIError as exc:
-            await message.answer(f"封禁失败：{html.escape(str(exc))}")
-            return
+        key = (chat_id, user_id)
+        async with self._member_action_lock(chat_id, user_id):
+            try:
+                await self.bot.ban_chat_member(chat_id, user_id, revoke_messages=True)
+            except TelegramAPIError as exc:
+                await message.answer(f"封禁失败：{html.escape(str(exc))}")
+                return
+            self._remember_auto_banned(key)
         await self.reporter.record(
             chat_id=chat_id,
             action="ban",
@@ -702,11 +778,14 @@ class ModerationController:
         except ValueError as exc:
             await message.answer(html.escape(str(exc)))
             return
-        try:
-            await self.bot.unban_chat_member(chat_id, target.user_id, only_if_banned=True)
-        except TelegramAPIError as exc:
-            await message.answer(f"解除封禁失败：{html.escape(str(exc))}")
-            return
+        key = (chat_id, target.user_id)
+        async with self._member_action_lock(chat_id, target.user_id):
+            try:
+                await self.bot.unban_chat_member(chat_id, target.user_id, only_if_banned=True)
+            except TelegramAPIError as exc:
+                await message.answer(f"解除封禁失败：{html.escape(str(exc))}")
+                return
+            self._forget_auto_banned(key)
         await self.reporter.record(
             chat_id=chat_id,
             action="unban",
@@ -722,25 +801,29 @@ class ModerationController:
         chat_id = actor[2]
         user_id, user, _ = target
         banned = False
-        try:
-            await self.bot.ban_chat_member(chat_id, user_id, revoke_messages=False)
-            banned = True
-            await self.bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-        except TelegramAPIError as exc:
-            if banned:
-                await self.reporter.record(
-                    chat_id=chat_id,
-                    action="kick_unban_failed",
-                    actor_id=actor[0],
-                    target_id=user_id,
-                )
-                await message.answer(
-                    "已将成员封禁，但解除封禁步骤失败；该成员目前可能仍在封禁名单中。"
-                    f"请核查后使用 /unban {user_id}。错误：{html.escape(str(exc))}"
-                )
-            else:
-                await message.answer(f"移出失败：{html.escape(str(exc))}")
-            return
+        key = (chat_id, user_id)
+        async with self._member_action_lock(chat_id, user_id):
+            try:
+                await self.bot.ban_chat_member(chat_id, user_id, revoke_messages=False)
+                banned = True
+                self._remember_auto_banned(key)
+                await self.bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+                self._forget_auto_banned(key)
+            except TelegramAPIError as exc:
+                if banned:
+                    await self.reporter.record(
+                        chat_id=chat_id,
+                        action="kick_unban_failed",
+                        actor_id=actor[0],
+                        target_id=user_id,
+                    )
+                    await message.answer(
+                        "已将成员封禁，但解除封禁步骤失败；该成员目前可能仍在封禁名单中。"
+                        f"请核查后使用 /unban {user_id}。错误：{html.escape(str(exc))}"
+                    )
+                else:
+                    await message.answer(f"移出失败：{html.escape(str(exc))}")
+                return
         await self.reporter.record(
             chat_id=chat_id,
             action="kick",
@@ -907,73 +990,120 @@ class ModerationController:
         await self._send_chunked_list(message, title="域名白名单", items=sorted(domains))
 
     async def add_word(self, message: Message) -> None:
-        actor = await self._group_admin(message, delete=True)
-        if actor is None:
-            return
-        chat_id = actor[2]
-        try:
-            words = batch_items(message)
-        except ValueError as exc:
-            await message.answer(html.escape(str(exc)))
-            return
-        if not words:
-            await message.answer(
-                "用法：<code>/addword 词语1 词语2</code>；含空格短语请加引号。"
-            )
-            return
-        invalid = [word for word in words if len(word) < 2 or len(word) > 64]
-        if invalid:
-            await message.answer("所有拦截词长度必须为 2–64 个字符，本次未添加。")
-            return
-        await self.storage.add_blocked_words(chat_id, words, actor[0])
-        await self.reporter.record(
-            chat_id=chat_id,
-            action="add_words",
-            actor_id=actor[0],
-        )
-        body = "、".join(f"<code>{html.escape(word)}</code>" for word in words)
-        await message.answer(f"已添加 {len(words)} 条拦截词：{body}")
+        if await self._group_admin(message, delete=True) is not None:
+            await message.answer("当前使用 AI 自动学习模式，不接受人工添加拦截词。")
 
     async def delete_word(self, message: Message) -> None:
         actor = await self._group_admin(message, delete=True)
         if actor is None:
             return
-        chat_id = actor[2]
-        try:
-            words = batch_items(message)
-        except ValueError as exc:
-            await message.answer(html.escape(str(exc)))
+        identifier = command_payload(message).strip()
+        if not identifier:
+            await message.answer("用法：<code>/delword 编号或完整特征</code>")
             return
-        if not words:
-            await message.answer(
-                "用法：<code>/delword 词语1 词语2</code>；含空格短语请加引号。"
-            )
+        if not identifier.isdigit():
+            identifier = normalize_signature(identifier)
+        if not await self.storage.disable_ai_signature(actor[2], identifier):
+            await message.answer("未找到可停用的 AI 特征。")
             return
-        global_words = set(self.settings.blocked_words)
-        protected = [word for word in words if word in global_words]
-        if protected:
-            await message.answer("包含环境变量中的全局拦截词，本次未删除。")
-            return
-        await self.storage.remove_blocked_words(chat_id, words)
-        await self.reporter.record(
-            chat_id=chat_id,
-            action="delete_words",
-            actor_id=actor[0],
-        )
-        body = "、".join(f"<code>{html.escape(word)}</code>" for word in words)
-        await message.answer(f"已移除 {len(words)} 条拦截词：{body}")
+        await self.reporter.record(chat_id=actor[2], action="delete_words", actor_id=actor[0])
+        await message.answer("已停用该 AI 特征。")
 
     async def list_words(self, message: Message) -> None:
         actor = await self._group_admin(message)
         if actor is None:
             return
-        words = set(self.settings.blocked_words) | await self.storage.blocked_words(actor[2])
+        signatures = await self.storage.ai_signatures(actor[2], statuses=("active",))
         await self._send_chunked_list(
             message,
-            title="拦截词",
-            items=sorted(words),
+            title="AI 已学习特征",
+            items=[f"{item.id}｜{item.display_signature}" for item in signatures],
             inline=True,
         )
+
+    async def ai_candidates(self, message: Message) -> None:
+        actor = await self._private_ai_admin(message)
+        if actor is None:
+            return
+        signatures = await self.storage.ai_signatures(actor[2], statuses=("candidate", "rejected"))
+        await self._send_chunked_list(
+            message,
+            title="AI 候选特征",
+            items=[f"{item.id}｜{item.status}｜{item.display_signature}" for item in signatures],
+        )
+
+    async def ai_stats(self, message: Message) -> None:
+        actor = await self._private_ai_admin(message)
+        if actor is None:
+            return
+        today_since, week_since = stats_cutoffs()
+        today, week, total = await asyncio.gather(
+            self.storage.ai_stats(actor[2], since=today_since),
+            self.storage.ai_stats(actor[2], since=week_since),
+            self.storage.ai_stats(actor[2]),
+        )
+
+        def line(label: str, stats: AIStats) -> str:
+            failure_rate = (stats.failed / stats.calls * 100) if stats.calls else 0.0
+            return (
+                f"{label}：判断 {stats.total}｜调用 {stats.calls}｜广告 {stats.ads}｜"
+                f"执行 {stats.enforced}｜失败率 {failure_rate:.1f}%｜"
+                f"缓存 {stats.cached}｜均延迟 {stats.average_latency_ms}ms"
+            )
+
+        await message.answer(
+            "<b>AI 审核统计（北京时间）</b>\n"
+            f"{line('今天', today)}\n{line('近 7 天', week)}\n{line('累计', total)}"
+        )
+
+    async def ai_recent(self, message: Message) -> None:
+        actor = await self._private_ai_admin(message)
+        if actor is None:
+            return
+        arguments = command_arguments(message)
+        try:
+            limit = int(arguments[0]) if arguments else 10
+        except ValueError:
+            limit = 0
+        if len(arguments) > 1 or not 1 <= limit <= 30:
+            await message.answer("用法：<code>/airecent [1-30]</code>")
+            return
+        decisions = await self.storage.recent_ai_decisions(actor[2], limit=limit)
+        if not decisions:
+            await message.answer("<b>最近 AI 判断</b>\n（空）")
+            return
+        lines = []
+        for decision in decisions:
+            verdict = "失败" if decision.is_ad is None else "广告" if decision.is_ad else "正常"
+            confidence = "—" if decision.confidence is None else f"{decision.confidence:.2f}"
+            lines.append(
+                f"{action_time(decision.created_at)}｜{verdict}｜{confidence}｜"
+                f"{'已执行' if decision.enforced else '未执行'}"
+            )
+        await message.answer("<b>最近 AI 判断</b>\n" + "\n".join(lines))
+
+    async def ai_pause(self, message: Message) -> None:
+        actor = await self._private_ai_admin(message)
+        if actor is None:
+            return
+        await self.storage.set_runtime_setting(actor[2], "ai_paused", "1")
+        await message.answer("AI 审核已暂停；暂停期间普通成员消息将保留。")
+
+    async def ai_resume(self, message: Message) -> None:
+        actor = await self._private_ai_admin(message)
+        if actor is None:
+            return
+        await self.storage.set_runtime_setting(actor[2], "ai_paused", "0")
+        await message.answer("AI 审核已恢复。")
+
+    async def _private_ai_admin(self, message: Message) -> tuple[int, AdminRights, int] | None:
+        actor = await self._group_admin(message)
+        if actor is None:
+            return None
+        if message.chat.type != ChatType.PRIVATE:
+            await message.answer("此 AI 管理命令仅可在机器人私聊中使用。")
+            return None
+        return actor
 
     async def moderate_message(self, message: Message) -> None:
         if message.chat.type not in GROUP_TYPES or not self.is_allowed_chat(message.chat.id):
@@ -996,6 +1126,187 @@ class ModerationController:
 
         text = message.text or message.caption or ""
         entities = message.entities if message.text is not None else message.caption_entities
+        entity_urls = extract_entity_urls(text, entities)
+
+        if not self.settings.ai_enabled or self.ai_reviewer is None:
+            await self._moderate_legacy(message, user_id, text, entity_urls)
+            return
+        if await self.storage.runtime_setting(message.chat.id, "ai_paused") == "1":
+            return
+
+        active_signatures, stored_allowed_domains = await asyncio.gather(
+            self.storage.active_ai_signatures(message.chat.id),
+            self.storage.allowed_domains(message.chat.id),
+        )
+        suspicion = suspicious_precheck(
+            text,
+            entity_urls=entity_urls,
+            is_forwarded=message.forward_origin is not None,
+            active_signatures=active_signatures,
+            allowed_domains=set(self.settings.allowed_domains) | stored_allowed_domains,
+        )
+        flood_violation = (
+            self.flood.check(message.chat.id, user_id, text)
+            if user_id is not None and message.edit_date is None
+            else None
+        )
+        target_id = user_id or (message.sender_chat.id if message.sender_chat else None)
+        if suspicion.matched_signature is not None:
+            processing = await self._processing_notice(message)
+            if await self._finish_if_ai_paused(message, processing):
+                return
+            await self.storage.record_ai_signature_hit(
+                message.chat.id,
+                suspicion.matched_signature,
+            )
+            enforced = await self._handle_violation(
+                message,
+                user_id,
+                Violation("ai_signature", ""),
+                processing=processing,
+            )
+            await self.storage.record_ai_decision(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                target_id=target_id,
+                is_ad=True,
+                confidence=1.0,
+                category="learned_signature",
+                model="local-signature",
+                latency_ms=0,
+                cached=True,
+                enforced=enforced,
+            )
+            return
+
+        has_media_preview = bool(message.photo) or (
+            message.video is not None and message.video.thumbnail is not None
+        )
+        if not text.strip() and not has_media_preview:
+            return
+
+        processing = (
+            await self._processing_notice(message)
+            if suspicion.is_suspicious or flood_violation is not None
+            else None
+        )
+        if await self._finish_if_ai_paused(message, processing):
+            return
+
+        image_data_url = await self._message_image_data_url(message)
+        if not text.strip() and image_data_url is None:
+            if processing is not None:
+                await self._finish_processing(message, processing, "审核完成。")
+            return
+
+        try:
+            safety_target = str(target_id or "unknown")
+            result = await self.ai_reviewer.review(
+                text=text,
+                image_data_url=image_data_url,
+                safety_identifier=f"{message.chat.id}:{safety_target}",
+                risk_signals=(flood_violation.code,) if flood_violation is not None else (),
+            )
+        except (AIReviewError, AiohttpClientError) as exc:
+            await self._handle_ai_failure(
+                message,
+                target_id=target_id,
+                processing=processing,
+                error_type=type(exc).__name__,
+            )
+            return
+
+        await self._note_gateway_success(cached=result.cached)
+        if await self._finish_if_ai_paused(message, processing):
+            await self.storage.record_ai_decision(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                target_id=target_id,
+                is_ad=result.is_ad,
+                confidence=result.confidence,
+                category=result.category,
+                model=self.settings.ai_model,
+                latency_ms=result.latency_ms,
+                cached=result.cached,
+                enforced=False,
+            )
+            return
+        enforce = result.is_ad and result.confidence >= self.settings.ai_ad_threshold
+        if enforce:
+            signature_status = (
+                "active" if result.confidence >= self.settings.ai_learn_threshold else "candidate"
+            )
+            for signature in result.signatures:
+                await self.storage.upsert_ai_signature(
+                    chat_id=message.chat.id,
+                    normalized_signature=signature,
+                    display_signature=signature,
+                    category=result.category,
+                    status=signature_status,
+                    confidence=result.confidence,
+                )
+            for signature in result.rejected_signatures:
+                await self.storage.upsert_ai_signature(
+                    chat_id=message.chat.id,
+                    normalized_signature=signature,
+                    display_signature=signature,
+                    category=result.category,
+                    status="rejected",
+                    confidence=result.confidence,
+                )
+            enforced = await self._handle_violation(
+                message,
+                user_id,
+                Violation("ai_ad", ""),
+                processing=processing,
+            )
+        else:
+            enforced = False
+            if processing is not None:
+                await self._finish_processing(message, processing, "审核完成。")
+
+        await self.storage.record_ai_decision(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            target_id=target_id,
+            is_ad=result.is_ad,
+            confidence=result.confidence,
+            category=result.category,
+            model=self.settings.ai_model,
+            latency_ms=result.latency_ms,
+            cached=result.cached,
+            enforced=enforced,
+        )
+
+    async def _finish_if_ai_paused(
+        self,
+        message: Message,
+        processing: Message | None,
+    ) -> bool:
+        if await self.storage.runtime_setting(message.chat.id, "ai_paused") != "1":
+            return False
+        if processing is not None:
+            await self._finish_processing(message, processing, "AI 审核已暂停，消息已保留。")
+        return True
+
+    async def _note_gateway_success(self, *, cached: bool) -> None:
+        if cached:
+            return
+        async with self._ai_failure_lock:
+            self._ai_failure_streak = 0
+
+    async def _note_gateway_failure(self) -> bool:
+        async with self._ai_failure_lock:
+            self._ai_failure_streak += 1
+            return self._ai_failure_streak == 3
+
+    async def _moderate_legacy(
+        self,
+        message: Message,
+        user_id: int | None,
+        text: str,
+        entity_urls: tuple[str, ...],
+    ) -> None:
         allowed_domains, blocked_words = await asyncio.gather(
             self.storage.allowed_domains(message.chat.id),
             self.storage.blocked_words(message.chat.id),
@@ -1003,7 +1314,7 @@ class ModerationController:
         violation = self.detector.detect(
             DetectionInput(
                 text=text,
-                entity_urls=extract_entity_urls(text, entities),
+                entity_urls=entity_urls,
                 is_forwarded=message.forward_origin is not None,
             ),
             allowed_domains=set(self.settings.allowed_domains) | allowed_domains,
@@ -1011,13 +1322,191 @@ class ModerationController:
         )
         if violation is None and user_id is not None:
             violation = self.flood.check(message.chat.id, user_id, text)
-        if violation is None:
-            return
-        await self._handle_violation(message, user_id, violation)
+        if violation is not None:
+            await self._handle_violation(message, user_id, violation)
+
+    async def _message_image_data_url(self, message: Message) -> str | None:
+        downloadable = None
+        if message.photo:
+            downloadable = message.photo[-1]
+        elif message.video is not None and message.video.thumbnail is not None:
+            downloadable = message.video.thumbnail
+        if downloadable is None:
+            return None
+        if (
+            downloadable.file_size is not None
+            and downloadable.file_size > self.settings.ai_image_max_bytes
+        ):
+            return None
+        destination = io.BytesIO()
+        try:
+            await self.bot.download(downloadable, destination=destination)
+        except (TelegramAPIError, AiohttpClientError, asyncio.TimeoutError, OSError):
+            logger.warning("媒体预览下载失败，改用可用文字审核")
+            return None
+        content = destination.getvalue()
+        if not content or len(content) > self.settings.ai_image_max_bytes:
+            return None
+        encoded = base64.b64encode(content).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+
+    async def _handle_ai_failure(
+        self,
+        message: Message,
+        *,
+        target_id: int | None,
+        processing: Message | None,
+        error_type: str,
+    ) -> None:
+        should_alert = await self._note_gateway_failure()
+        paused = await self.storage.runtime_setting(message.chat.id, "ai_paused") == "1"
+        enforced = False
+        delete_attempted = False
+        if self.settings.ai_failure_delete and not self.settings.dry_run and not paused:
+            delete_attempted = True
+            try:
+                await self.bot.delete_message(message.chat.id, message.message_id)
+            except TelegramAPIError:
+                logger.exception(
+                    "AI 故障保护删除失败 chat_id=%s message_id=%s",
+                    message.chat.id,
+                    message.message_id,
+                )
+                await self.reporter.record(
+                    chat_id=message.chat.id,
+                    action="delete_failed",
+                    message_id=message.message_id,
+                    target_id=target_id,
+                )
+            else:
+                enforced = True
+                await self.reporter.record(
+                    chat_id=message.chat.id,
+                    action="delete",
+                    message_id=message.message_id,
+                    target_id=target_id,
+                )
+        await self.storage.record_ai_decision(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            target_id=target_id,
+            is_ad=None,
+            confidence=None,
+            category="",
+            model=self.settings.ai_model,
+            latency_ms=0,
+            cached=False,
+            enforced=enforced,
+            error_type=error_type,
+        )
+        if paused:
+            result_text = "AI 审核已暂停，消息已保留。"
+        elif self.settings.dry_run:
+            result_text = "审核服务异常，观察模式下消息已保留。"
+        elif enforced:
+            result_text = "审核服务异常，消息已删除。"
+        elif delete_attempted:
+            result_text = "审核服务异常，消息删除失败。"
+        else:
+            result_text = "审核服务异常，消息已保留。"
+        if processing is not None or not paused:
+            await self._finish_processing(message, processing, result_text)
+        if should_alert:
+            await self._alert_ai_failures()
+
+    async def _alert_ai_failures(self) -> None:
+        recipients = set(self.settings.authorized_admin_ids)
+        if not recipients and self.settings.log_chat_id is not None:
+            recipients.add(self.settings.log_chat_id)
+        for recipient in recipients:
+            try:
+                await self.bot.send_message(recipient, "AI 审核已连续失败 3 次，请立即检查网关。")
+            except TelegramAPIError:
+                logger.exception("发送 AI 连续失败告警失败 recipient=%s", recipient)
+
+    def _member_action_lock(self, chat_id: int, user_id: int) -> asyncio.Lock:
+        key = (chat_id, user_id)
+        lock = self._member_action_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._member_action_locks[key] = lock
+        return lock
+
+    def _remember_auto_banned(self, key: tuple[int, int]) -> None:
+        now = time.monotonic()
+        while self._auto_banned_members:
+            oldest_key, expires_at = next(iter(self._auto_banned_members.items()))
+            if expires_at > now:
+                break
+            self._auto_banned_members.pop(oldest_key, None)
+        self._auto_banned_members[key] = now + AUTO_BAN_MEMORY_SECONDS
+        self._auto_banned_members.move_to_end(key)
+        while len(self._auto_banned_members) > AUTO_BAN_MEMORY_MAX:
+            self._auto_banned_members.popitem(last=False)
+
+    def _is_auto_banned(self, key: tuple[int, int]) -> bool:
+        expires_at = self._auto_banned_members.get(key)
+        if expires_at is None:
+            return False
+        if expires_at <= time.monotonic():
+            self._auto_banned_members.pop(key, None)
+            return False
+        self._auto_banned_members.move_to_end(key)
+        return True
+
+    def _forget_auto_banned(self, key: tuple[int, int]) -> None:
+        self._auto_banned_members.pop(key, None)
+
+    async def _warn_and_maybe_ban(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        actor_id: int | None = None,
+    ) -> tuple[int, bool, str | None]:
+        key = (chat_id, user_id)
+        async with self._member_action_lock(chat_id, user_id):
+            if self._is_auto_banned(key):
+                return self.settings.warn_limit, True, None
+
+            count = await self.storage.add_warning(chat_id, user_id)
+            await self.reporter.record(
+                chat_id=chat_id,
+                action="warn",
+                actor_id=actor_id,
+                target_id=user_id,
+            )
+            if count < self.settings.warn_limit:
+                return count, False, None
+
+            try:
+                await self.bot.ban_chat_member(
+                    chat_id,
+                    user_id,
+                    revoke_messages=True,
+                )
+            except TelegramAPIError as exc:
+                logger.exception("自动封禁失败 chat_id=%s user_id=%s", chat_id, user_id)
+                return count, False, str(exc)
+
+            self._remember_auto_banned(key)
+            await self.storage.clear_warnings(chat_id, user_id)
+            await self.reporter.record(
+                chat_id=chat_id,
+                action="auto_ban",
+                actor_id=actor_id,
+                target_id=user_id,
+            )
+            return count, True, None
 
     async def _handle_violation(
-        self, message: Message, user_id: int | None, _violation: Violation
-    ) -> None:
+        self,
+        message: Message,
+        user_id: int | None,
+        _violation: Violation,
+        *,
+        processing: Message | None = None,
+    ) -> bool:
         target_id = user_id or (message.sender_chat.id if message.sender_chat else None)
         if self.settings.dry_run:
             await self.reporter.record(
@@ -1026,7 +1515,9 @@ class ModerationController:
                 message_id=message.message_id,
                 target_id=target_id,
             )
-            return
+            if processing is not None:
+                await self._finish_processing(message, processing, "观察模式命中，未执行。")
+            return False
 
         try:
             await self.bot.delete_message(message.chat.id, message.message_id)
@@ -1040,7 +1531,8 @@ class ModerationController:
                 message_id=message.message_id,
                 target_id=target_id,
             )
-            return
+            await self._finish_processing(message, processing, "广告消息删除失败。")
+            return False
 
         await self.reporter.record(
             chat_id=message.chat.id,
@@ -1049,34 +1541,27 @@ class ModerationController:
             target_id=target_id,
         )
         if user_id is None:
-            return
+            await self._finish_processing(message, processing, "广告内容已删除。")
+            return True
 
-        count = await self.storage.add_warning(message.chat.id, user_id)
-        banned = False
-        if count >= self.settings.warn_limit:
-            try:
-                await self.bot.ban_chat_member(
-                    message.chat.id,
-                    user_id,
-                    revoke_messages=True,
-                )
-            except TelegramAPIError:
-                logger.exception("自动封禁失败 chat_id=%s user_id=%s", message.chat.id, user_id)
-            else:
-                await self.storage.clear_warnings(message.chat.id, user_id)
-                await self.reporter.record(
-                    chat_id=message.chat.id,
-                    action="auto_ban",
-                    target_id=user_id,
-                )
-                banned = True
-
-        user_label = display_user(message.from_user, user_id)
-        suffix = "，并封禁" if banned else f"，警告 {count}/{self.settings.warn_limit}"
-        await self._notice(
-            message,
-            f"已删除 {user_label} 的违规消息{suffix}。",
+        count, banned, ban_error = await self._warn_and_maybe_ban(
+            chat_id=message.chat.id,
+            user_id=user_id,
         )
+
+        if banned:
+            result_text = "广告内容已删除，用户已封禁。"
+        elif ban_error is not None:
+            result_text = "广告内容已删除，自动封禁失败。"
+        else:
+            result_text = f"广告内容已删除，警告 {count}/{self.settings.warn_limit}。"
+        await self._finish_processing(message, processing, result_text)
+        return True
 
     async def chat_member_changed(self, event: ChatMemberUpdated) -> None:
         self.admins.invalidate(event.chat.id)
+        key = (event.chat.id, event.new_chat_member.user.id)
+        if event.new_chat_member.status == ChatMemberStatus.KICKED:
+            self._remember_auto_banned(key)
+        else:
+            self._forget_auto_banned(key)

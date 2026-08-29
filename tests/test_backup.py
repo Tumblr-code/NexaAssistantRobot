@@ -1,11 +1,13 @@
 import sqlite3
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from nexa_guardian.backup import backup_database, prune_backups
 from nexa_guardian.maintenance import scrub_reasons
+
+UTC = timezone.utc
 
 
 def test_backup_database_is_consistent(tmp_path: Path) -> None:
