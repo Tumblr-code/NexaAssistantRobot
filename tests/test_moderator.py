@@ -377,6 +377,63 @@ async def test_private_command_rejects_unlisted_user(tmp_path: Path, storage: St
     private_message.answer.assert_awaited_once()
 
 
+@pytest.mark.parametrize("command", ("/start", "/help"))
+async def test_private_router_guard_silently_consumes_unauthorized_commands(
+    tmp_path: Path, storage: Storage, command: str
+) -> None:
+    controller = ModerationController(
+        FakeBot(admin_ids={7}),
+        settings(tmp_path, authorized_admin_ids=frozenset({7})),  # type: ignore[arg-type]
+        storage,
+    )
+    unauthorized = SimpleNamespace(
+        chat=SimpleNamespace(id=42, type=ChatType.PRIVATE),
+        from_user=SimpleNamespace(id=42),
+        text=command,
+        answer=AsyncMock(),
+    )
+
+    assert await controller._unauthorized_private_message(unauthorized) is True  # type: ignore[arg-type]
+    await controller._ignore_unauthorized_private(unauthorized)  # type: ignore[arg-type]
+    unauthorized.answer.assert_not_awaited()
+
+
+async def test_private_router_guard_allows_only_the_single_authorized_admin(
+    tmp_path: Path, storage: Storage
+) -> None:
+    controller = ModerationController(
+        FakeBot(admin_ids={7}),
+        settings(tmp_path, authorized_admin_ids=frozenset({7})),  # type: ignore[arg-type]
+        storage,
+    )
+    authorized = SimpleNamespace(
+        chat=SimpleNamespace(id=7, type=ChatType.PRIVATE),
+        from_user=SimpleNamespace(id=7),
+        text="/help",
+    )
+
+    assert await controller._unauthorized_private_message(authorized) is False  # type: ignore[arg-type]
+
+
+async def test_private_commands_fail_closed_when_multiple_admins_are_configured(
+    tmp_path: Path, storage: Storage
+) -> None:
+    controller = ModerationController(
+        FakeBot(admin_ids={7, 8}),
+        settings(tmp_path, authorized_admin_ids=frozenset({7, 8})),  # type: ignore[arg-type]
+        storage,
+    )
+    private_message = SimpleNamespace(
+        chat=SimpleNamespace(id=7, type=ChatType.PRIVATE),
+        from_user=SimpleNamespace(id=7),
+        sender_chat=None,
+        answer=AsyncMock(),
+    )
+
+    assert await controller._group_admin(private_message) is None  # type: ignore[arg-type]
+    private_message.answer.assert_awaited_once_with("私聊管理要求恰好配置一位授权管理员。")
+
+
 async def test_manual_ban_and_kick_ignore_legacy_reason_text(
     tmp_path: Path, storage: Storage
 ) -> None:
@@ -636,8 +693,9 @@ async def test_member_command_is_moderated_before_command_handlers(
         ai_reviewer=reviewer,  # type: ignore[arg-type]
     )
 
-    first_handler = controller.router.message.handlers[0]
-    assert first_handler.callback == controller.moderate_message
+    private_guard, member_command_guard = controller.router.message.handlers[:2]
+    assert private_guard.callback == controller._ignore_unauthorized_private
+    assert member_command_guard.callback == controller.moderate_message
     await controller.router.propagate_event(
         "message",
         group_message(42, "/help 请联系这个账号"),
