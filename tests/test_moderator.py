@@ -6,12 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 
 import pytest
-from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.enums import ChatMemberStatus, ChatType, MessageEntityType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import BanChatMember
-from aiogram.types import Chat, Message, PhotoSize, User
+from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User
 from aiohttp import ClientPayloadError
 
+from nexa_guardian.ai_contract import AI_MODEL
 from nexa_guardian.ai_review import AIReviewResult, AIReviewTimeout
 from nexa_guardian.config import Settings
 from nexa_guardian.detection import Violation
@@ -799,6 +800,192 @@ async def test_ai_suspicious_ad_shows_review_and_records_warning(
     assert "原因" not in controller._notice.await_args.args[1]
 
 
+async def test_every_successful_ad_persists_safe_candidates_before_enforcement(
+    tmp_path: Path, storage: Storage
+) -> None:
+    reviewer = SimpleNamespace(
+        review=AsyncMock(
+            return_value=AIReviewResult(
+                is_ad=True,
+                confidence=0.80,
+                category="promotion",
+                signatures=("免费领取 usdt",),
+                cached=False,
+                latency_ms=25,
+                rejected_signatures=("合作",),
+            )
+        )
+    )
+    bot = FakeBot()
+    controller = ModerationController(
+        bot,
+        settings(tmp_path, ai_enabled=True),  # type: ignore[arg-type]
+        storage,
+        ai_reviewer=reviewer,  # type: ignore[arg-type]
+    )
+    controller._processing_notice = AsyncMock(return_value=None)
+
+    await controller.moderate_message(group_message(42, "免费领取 USDT，合作", message_id=1))
+    await controller.moderate_message(group_message(42, "免费领取 USDT，合作", message_id=2))
+
+    assert bot.deleted == []
+    assert await storage.warning_count(-100, 42) == 0
+    candidates = await storage.ai_signatures(-100, statuses=("candidate",))
+    assert [(item.display_signature, item.hit_count) for item in candidates] == [
+        ("免费领取 usdt", 2)
+    ]
+    rejected = await storage.ai_signatures(-100, statuses=("rejected",))
+    assert [(item.display_signature, item.hit_count) for item in rejected] == [("合作", 2)]
+    decisions = await storage.recent_ai_decisions(-100, limit=2)
+    assert len(decisions) == 2
+    assert all(item.is_ad is True and item.enforced is False for item in decisions)
+    learning = await storage.ai_learning_memory(-100)
+    assert [(item.evidence_profile, item.decision_count) for item in learning] == [
+        ("text,promotion", 2)
+    ]
+
+
+async def test_normal_ai_decision_never_persists_signatures(
+    tmp_path: Path, storage: Storage
+) -> None:
+    reviewer = SimpleNamespace(
+        review=AsyncMock(
+            return_value=AIReviewResult(
+                is_ad=False,
+                confidence=0.10,
+                category="normal",
+                signatures=("免费领取 usdt",),
+                cached=False,
+                latency_ms=15,
+                rejected_signatures=("合作",),
+            )
+        )
+    )
+    controller = ModerationController(
+        FakeBot(),
+        settings(tmp_path, ai_enabled=True),  # type: ignore[arg-type]
+        storage,
+        ai_reviewer=reviewer,  # type: ignore[arg-type]
+    )
+    controller._processing_notice = AsyncMock(return_value=None)
+
+    await controller.moderate_message(group_message(42, "普通咨询", message_id=1))
+
+    assert await storage.ai_signatures(-100, statuses=("candidate", "active", "rejected")) == ()
+    assert await storage.ai_learning_memory(-100) == ()
+
+
+async def test_repeated_enforced_candidate_becomes_active_after_three_ad_decisions(
+    tmp_path: Path, storage: Storage
+) -> None:
+    reviewer = SimpleNamespace(
+        review=AsyncMock(
+            return_value=AIReviewResult(
+                is_ad=True,
+                confidence=0.93,
+                category="promotion",
+                signatures=("免费领取 usdt",),
+                cached=False,
+                latency_ms=20,
+            )
+        )
+    )
+    controller = ModerationController(
+        FakeBot(),
+        settings(tmp_path, ai_enabled=True),  # type: ignore[arg-type]
+        storage,
+        ai_reviewer=reviewer,  # type: ignore[arg-type]
+    )
+    controller._processing_notice = AsyncMock(return_value=None)
+    controller._notice = AsyncMock()
+
+    for message_id in range(1, 4):
+        await controller.moderate_message(group_message(42, "免费领取 USDT", message_id=message_id))
+
+    assert await storage.active_ai_signatures(-100) == {"免费领取 usdt"}
+    signatures = await storage.ai_signatures(-100)
+    assert signatures[0].hit_count == 3
+
+
+async def test_hidden_text_link_host_is_visible_to_ai_without_path_or_query(
+    tmp_path: Path, storage: Storage
+) -> None:
+    reviewer = SimpleNamespace(
+        review=AsyncMock(
+            return_value=AIReviewResult(
+                is_ad=False,
+                confidence=0.10,
+                category="normal",
+                signatures=(),
+                cached=False,
+                latency_ms=12,
+            )
+        )
+    )
+    controller = ModerationController(
+        FakeBot(),
+        settings(tmp_path, ai_enabled=True),  # type: ignore[arg-type]
+        storage,
+        ai_reviewer=reviewer,  # type: ignore[arg-type]
+    )
+    controller._processing_notice = AsyncMock(return_value=None)
+    message = Message(
+        message_id=1,
+        date=datetime.now(UTC),
+        chat=Chat(id=-100, type=ChatType.SUPERGROUP, title="Test"),
+        from_user=User(id=42, is_bot=False, first_name="Member"),
+        text="官网",
+        entities=[
+            MessageEntity(
+                type=MessageEntityType.TEXT_LINK,
+                offset=0,
+                length=2,
+                url="https://example.org.evil.example/private?token=do-not-forward",
+            )
+        ],
+    )
+
+    await controller.moderate_message(message)
+
+    assert reviewer.review.await_args.kwargs["linked_hosts"] == ("example.org.evil.example",)
+    assert reviewer.review.await_args.kwargs["risk_signals"] == ("link",)
+    assert "private" not in repr(reviewer.review.await_args.kwargs)
+    assert "do-not-forward" not in repr(reviewer.review.await_args.kwargs)
+
+
+async def test_image_ad_without_safe_signature_still_updates_permanent_learning(
+    tmp_path: Path, storage: Storage
+) -> None:
+    reviewer = SimpleNamespace(
+        review=AsyncMock(
+            return_value=AIReviewResult(
+                is_ad=True,
+                confidence=0.99,
+                category="promotion",
+                signatures=(),
+                cached=False,
+                latency_ms=18,
+            )
+        )
+    )
+    bot = FakeBot()
+    controller = ModerationController(
+        bot,
+        settings(tmp_path, ai_enabled=True),  # type: ignore[arg-type]
+        storage,
+        ai_reviewer=reviewer,  # type: ignore[arg-type]
+    )
+    controller._message_image_data_url = AsyncMock(return_value="data:image/jpeg;base64,YWQ=")
+    controller._notice = AsyncMock()
+
+    await controller.moderate_message(group_photo_message(42, message_id=1))
+
+    assert bot.deleted == [(-100, 1)]
+    assert await storage.ai_signatures(-100, statuses=("candidate", "active", "rejected")) == ()
+    learning = await storage.ai_learning_memory(-100)
+    assert [(item.evidence_profile, item.decision_count) for item in learning] == [("image", 1)]
+
+
 async def test_ai_ad_missed_by_precheck_is_deleted_with_separate_result(
     tmp_path: Path, storage: Storage
 ) -> None:
@@ -913,7 +1100,7 @@ async def test_private_ai_management_commands(tmp_path: Path, storage: Storage) 
         is_ad=True,
         confidence=0.98,
         category="crypto_ad",
-        model="gpt-5.6",
+        model=AI_MODEL,
         latency_ms=40,
         cached=False,
         enforced=True,
@@ -951,7 +1138,7 @@ async def test_private_ai_management_commands(tmp_path: Path, storage: Storage) 
     assert "判断 1｜调用 1" in stats.answer.await_args.args[0]
     assert "失败率 0.0%" in stats.answer.await_args.args[0]
     assert "广告" in recent.answer.await_args.args[0]
-    assert "gpt-5.6" not in recent.answer.await_args.args[0]
+    assert AI_MODEL not in recent.answer.await_args.args[0]
     delete.answer.assert_awaited_once_with("已停用该 AI 特征。")
     assert await storage.active_ai_signatures(-100) == set()
 
@@ -1216,7 +1403,7 @@ async def test_member_action_state_is_bounded(tmp_path: Path, storage: Storage) 
     assert len(controller._auto_banned_members) == AUTO_BAN_MEMORY_MAX
 
 
-async def test_pause_while_ai_is_in_flight_prevents_learning_and_enforcement(
+async def test_pause_while_ai_is_in_flight_preserves_learning_but_prevents_enforcement(
     tmp_path: Path, storage: Storage
 ) -> None:
     review_started = asyncio.Event()
@@ -1259,7 +1446,7 @@ async def test_pause_while_ai_is_in_flight_prevents_learning_and_enforcement(
 
     assert bot.deleted == []
     assert await storage.warning_count(-100, 42) == 0
-    assert await storage.active_ai_signatures(-100) == set()
+    assert await storage.active_ai_signatures(-100) == {"免费领取 usdt"}
     decisions = await storage.recent_ai_decisions(-100, limit=1)
     assert decisions[0].enforced is False
     processing.edit_text.assert_awaited_once_with("AI 审核已暂停，消息已保留。")

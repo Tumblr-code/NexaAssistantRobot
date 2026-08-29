@@ -1,15 +1,23 @@
 # Nexa Guardian
 
-一个独立、自托管的 Telegram 群管理机器人，使用 GPT-5.6 识别广告，并提供删除、警告、封禁和管理员私聊管理。它不会改动现有客服机器人，也不会自动接管未明确列入白名单的群。
+一个独立、自托管的 Telegram 群管理机器人，使用 GPT-5.6 Sol 识别广告，并提供删除、警告、封禁和管理员私聊管理。它不会改动现有客服机器人，也不会自动接管未明确列入白名单的群。
+
+Nexa Guardian 的身份是 Nexa 官方群管理审核员。固定的一方站点为：
+
+- Example Store：<https://example.org>
+- Example Pass：<https://pass.example.com>
+- Example Gift：<https://gift.example.com>
+
+上述精确域名本身不会被当作外部链接信号；相似域名、伪造后缀、钓鱼、冒充和附带其他广告证据的内容仍会进入审核。
 
 生产服务位于 VM `SERVER-IP`，由 `nexa-guardian.service` 持久运行，目标为 `@ExampleGroup`。仓库中的 v0.2 AI 模式只有在兼容网关探测通过并配置 `AI_ENABLED=true` 后才会启用；未启用时继续运行旧规则兼容模式。
 
 ## 已实现
 
-- GPT-5.6 结构化审核文字、媒体标题、图片和视频封面。
+- GPT-5.6 Sol 以 `high` 推理强度和低输出模式结构化审核文字、媒体标题、图片和视频封面。
 - 外链、转发、联系方式、混淆字符、刷屏及已学习特征仅作为可疑预检；正常聊天静默审核。
 - 只有可疑消息会显示“正在审核…”；结果原地更新，机器人输出统一在 30 秒后删除。
-- 高置信广告特征自动学习，后续可在不调用 API 的情况下快速拦截。
+- 每次成功广告判断都写入不含原文和用户标识的永久聚合记忆；安全短语进入候选库，高置信短语立即启用，中等置信短语重复命中 3 次后启用，后续可不调用 API 直接拦截。
 - 违规累计警告，达到阈值后自动封禁并清零。
 - 管理员命令：警告、禁言、解禁、封禁、解封、移出、删消息。
 - 每群独立的可信用户、域名白名单、AI 特征和 SQLite 状态。
@@ -60,10 +68,12 @@ ALLOWED_CHAT_IDS=-1001234567890,-1009876543210
 
 | 变量 | 默认值 | 作用 |
 |---|---:|---|
-| `AI_ENABLED` | `false` | 启用 GPT-5.6 AI 审核；启用前必须完成网关探测 |
+| `AI_ENABLED` | `false` | 启用 GPT-5.6 Sol AI 审核；启用前必须完成网关探测 |
 | `OPENAI_BASE_URL` | 空 | 兼容网关基础地址，支持 `/v1/responses` |
 | `OPENAI_API_KEY` | 空 | 兼容网关密钥，仅保存于服务器 `0600` 环境文件 |
-| `AI_MODEL` | `gpt-5.6` | 固定审核模型，不自动降级 |
+| `AI_MODEL` | `gpt-5.6-sol` | 固定审核模型，不接受家族别名或自动降级 |
+| `AI_REASONING_EFFORT` | `high` | 固定推理强度，不自动降为低强度 |
+| `AI_SERVICE_TIER` | `default` | 固定为当前兼容网关实际支持并回显的服务层 |
 | `AI_AD_THRESHOLD` | `0.92` | 删除并警告的最低广告置信度 |
 | `AI_LEARN_THRESHOLD` | `0.97` | 自动启用学习特征的最低置信度 |
 | `AI_FAILURE_DELETE` | `true` | AI 故障时删除原消息，但不警告、不学习 |
@@ -79,7 +89,9 @@ ALLOWED_CHAT_IDS=-1001234567890,-1009876543210
 | `DRY_RUN` | `false` | 只记录自动命中，不删除/警告/禁言；手动管理员命令仍执行 |
 | `LOG_CHAT_ID` | 空 | 可选的集中管理日志群/频道 |
 
-兼容网关必须同时支持 Responses API、严格 JSON Schema 和图片输入。请求设置 `store=false`，只发送待判断文本或图片，不发送用户名、用户 ID、群名和聊天历史。普通文件和无预览贴纸不送入 AI。
+兼容网关必须同时支持 Responses API、严格 JSON Schema、图片输入、`reasoning.effort=high` 和可核验的服务层。当前生产网关会把 `priority` 请求降为 `default`，因此程序明确固定并校验 `service_tier=default`，不会把降级伪装成 Priority。快速响应由低输出、8 秒总超时、并发、10 分钟缓存和已学习特征本地直拦实现。程序只接受响应中明确返回 `status=completed`、`model=gpt-5.6-sol`、`reasoning.effort=high`、`service_tier=default` 的结果，缺失或不匹配均按审核服务故障处理。请求设置 `store=false`，只发送待判断文本或图片，不发送用户名、用户 ID、群名和聊天历史。普通文件和无预览贴纸不送入 AI。
+
+模型及服务层字段依据 [OpenAI GPT-5.6 Sol 模型说明](https://developers.openai.com/api/docs/models/gpt-5.6-sol) 和 [Responses API 参考](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)。
 
 ## 3. 当前生产部署
 
@@ -178,7 +190,7 @@ uv run pytest --cov=src/nexa_guardian --cov-fail-under=75
 
 管理动作不接收、显示或记录原因；旧版命令尾部附带的文字会被兼容忽略。`/stats` 按北京时间展示今天、近 7 天和累计数据。`/recent` 默认返回 10 条、最多 30 条，为避免在群里公开用户 ID，只能由授权管理员私聊使用。
 
-`/addword` 已停用，AI 只学习通过长度、隐私及宽泛词校验的稳定广告短语。`/words` 横向排列特征并自动分段；管理员可用 `/delword` 立即停用误学项。
+`/addword` 已停用。AI 只把来自当前文字、通过长度、隐私及宽泛词校验的稳定广告短语写入永久特征库；姓名、地址、链接、账号、手机号和订单号不会进入特征。没有安全短语的图片广告等仍只累计固定分类与证据类型，不保存原文、图片、用户 ID 或消息 ID。`/words` 横向排列已启用特征并自动分段；管理员可用 `/delword` 立即停用误学项。
 
 机器人在群聊、日志群和管理员私聊发送的所有消息都会在首次发送成功 30 秒后删除；编辑“正在审核…”不会重置时间。删除队列只保存 Telegram 消息标识和到期时间，服务重启后会继续补删。
 
@@ -190,10 +202,11 @@ uv run pytest --cov=src/nexa_guardian --cov-fail-under=75
 
 ## 7. 上线验证顺序
 
-1. 执行完整 CI，并在受保护环境文件中配置网关密钥、`AI_ENABLED=true`、
+1. 执行完整 CI，并在受保护环境文件中显式配置 `AI_MODEL=gpt-5.6-sol`、
+   `AI_REASONING_EFFORT=high`、`AI_SERVICE_TIER=default`、`AI_ENABLED=true`、
    `WARN_LIMIT=3`、`NOTICE_TTL_SECONDS=30` 和 `AI_FAILURE_DELETE=true`。
 2. 运行发布脚本；脚本先备份配置、构建候选版本，并用不含群消息的请求验证 Responses API、
-   结构化输出和图片输入；通过后才短暂停服，创建并校验最终一致的 SQLite 备份并原子切换。
+   结构化输出、图片输入及响应实际采用 Sol/high/default；通过后才短暂停服，创建并校验最终一致的 SQLite 备份并原子切换。
 3. 上线后验证服务、管理员权限和临时消息补删队列。
 4. 用非管理员测试账号验证正常聊天静默、可疑提示、广告删除和第三次警告封禁。
 5. 验证 AI 超时时只删除消息、不增加警告，并确认连续失败告警与 `/aipause` 可用。
@@ -206,7 +219,7 @@ uv run pytest --cov=src/nexa_guardian --cov-fail-under=75
   --require-production-settings
 ```
 
-探测只发送固定的无害文字和 1×1 测试图片，不读取或发送群消息；成功后才允许把
-切换生产 release。
+探测只发送固定的无害文字和 1×1 测试图片，不读取或发送群消息；只有响应明确回显
+`completed`、`gpt-5.6-sol`、`high` 和 `default` 后，才允许切换生产 release。
 
 轮询启动时如果发现该 Token 已经配置 webhook，程序会拒绝启动，**不会自动删除现有 webhook**。这是为了避免误用现有客服机器人 Token 时切断原服务。

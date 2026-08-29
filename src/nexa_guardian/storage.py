@@ -1,14 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
 
-SCHEMA_VERSION = 4
+from nexa_guardian.ai_contract import AI_GATEWAY_MODELS
+
+SCHEMA_VERSION = 5
 UTC = timezone.utc
+
+AI_LEARNING_EVIDENCE_TYPES = (
+    "text",
+    "image",
+    "link",
+    "mention",
+    "forward",
+    "contact",
+    "obfuscation",
+    "promotion",
+    "flood",
+    "duplicate",
+)
+AI_LEARNING_EVIDENCE_SET = frozenset(AI_LEARNING_EVIDENCE_TYPES)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS warnings (
@@ -106,6 +123,17 @@ CREATE TABLE IF NOT EXISTS ai_signatures (
 CREATE INDEX IF NOT EXISTS idx_ai_signatures_chat_status
 ON ai_signatures (chat_id, status, id);
 
+CREATE TABLE IF NOT EXISTS ai_learning_memory (
+    chat_id INTEGER NOT NULL,
+    category TEXT NOT NULL CHECK (category <> ''),
+    evidence_profile TEXT NOT NULL CHECK (evidence_profile <> ''),
+    decision_count INTEGER NOT NULL DEFAULT 1 CHECK (decision_count >= 1),
+    max_confidence REAL NOT NULL CHECK (max_confidence >= 0 AND max_confidence <= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (chat_id, category, evidence_profile)
+);
+
 CREATE TABLE IF NOT EXISTS ephemeral_bot_messages (
     chat_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
@@ -192,6 +220,17 @@ class AISignature:
 
 
 @dataclass(frozen=True, slots=True)
+class AILearningMemory:
+    chat_id: int
+    category: str
+    evidence_profile: str
+    decision_count: int
+    max_confidence: float
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class EphemeralRecord:
     chat_id: int
     message_id: int
@@ -270,22 +309,24 @@ class Storage:
                 chat_id,
                 COUNT(*),
                 SUM(CASE
-                    WHEN model = 'gpt-5.6' AND cached = 0 THEN 1 ELSE 0
+                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND cached = 0 THEN 1 ELSE 0
                 END),
                 SUM(CASE WHEN is_ad = 1 THEN 1 ELSE 0 END),
                 SUM(enforced),
                 SUM(CASE
-                    WHEN model = 'gpt-5.6' AND error_type <> '' THEN 1 ELSE 0
+                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND error_type <> '' THEN 1 ELSE 0
                 END),
                 SUM(CASE
-                    WHEN model = 'gpt-5.6' AND cached = 1 THEN 1 ELSE 0
+                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND cached = 1 THEN 1 ELSE 0
                 END),
                 SUM(CASE
-                    WHEN model = 'gpt-5.6' AND cached = 0 AND error_type = ''
+                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol')
+                         AND cached = 0 AND error_type = ''
                     THEN latency_ms ELSE 0
                 END),
                 SUM(CASE
-                    WHEN model = 'gpt-5.6' AND cached = 0 AND error_type = ''
+                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol')
+                         AND cached = 0 AND error_type = ''
                     THEN 1 ELSE 0
                 END)
             FROM ai_decisions
@@ -537,9 +578,9 @@ class Storage:
         enforced: bool,
         error_type: str = "",
     ) -> None:
-        gateway_call = int(model == "gpt-5.6" and not cached)
-        gateway_cache = int(model == "gpt-5.6" and cached)
-        gateway_failure = int(model == "gpt-5.6" and bool(error_type))
+        gateway_call = int(model in AI_GATEWAY_MODELS and not cached)
+        gateway_cache = int(model in AI_GATEWAY_MODELS and cached)
+        gateway_failure = int(model in AI_GATEWAY_MODELS and bool(error_type))
         latency_sample = int(gateway_call == 1 and not error_type)
         safe_latency_ms = max(0, latency_ms)
         async with self._write_lock:
@@ -631,18 +672,19 @@ class Storage:
             SELECT
                 COUNT(*) AS total,
                 SUM(CASE
-                    WHEN model = 'gpt-5.6' AND cached = 0 THEN 1 ELSE 0
+                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND cached = 0 THEN 1 ELSE 0
                 END) AS calls,
                 SUM(CASE WHEN is_ad = 1 THEN 1 ELSE 0 END) AS ads,
                 SUM(enforced) AS enforced,
                 SUM(CASE
-                    WHEN model = 'gpt-5.6' AND error_type <> '' THEN 1 ELSE 0
+                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND error_type <> '' THEN 1 ELSE 0
                 END) AS failed,
                 SUM(CASE
-                    WHEN model = 'gpt-5.6' AND cached = 1 THEN 1 ELSE 0
+                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND cached = 1 THEN 1 ELSE 0
                 END) AS cached,
                 AVG(CASE
-                    WHEN model = 'gpt-5.6' AND cached = 0 AND error_type = ''
+                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol')
+                         AND cached = 0 AND error_type = ''
                     THEN latency_ms
                 END) AS average_latency_ms
             FROM ai_decisions
@@ -698,6 +740,110 @@ class Storage:
             )
             await self.db.commit()
         return cursor.rowcount
+
+    async def record_ai_learning(
+        self,
+        chat_id: int,
+        category: str,
+        evidence: tuple[str, ...],
+        confidence: float,
+    ) -> AILearningMemory:
+        normalized_category = category.strip() if isinstance(category, str) else ""
+        if (
+            not normalized_category
+            or len(normalized_category) > 64
+            or any(
+                not (character.isascii() and (character.islower() or character.isdigit()))
+                and character != "_"
+                for character in normalized_category
+            )
+        ):
+            raise ValueError("无效的 AI 学习分类")
+        if not evidence or any(
+            not isinstance(item, str) or item not in AI_LEARNING_EVIDENCE_SET for item in evidence
+        ):
+            raise ValueError("AI 学习证据必须使用固定枚举且不能为空")
+        evidence_set = frozenset(evidence)
+        evidence_profile = ",".join(
+            item for item in AI_LEARNING_EVIDENCE_TYPES if item in evidence_set
+        )
+        if isinstance(confidence, bool):
+            raise ValueError("AI 学习置信度必须在 0 到 1 之间")
+        try:
+            normalized_confidence = float(confidence)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("AI 学习置信度必须在 0 到 1 之间") from exc
+        if not math.isfinite(normalized_confidence) or not 0 <= normalized_confidence <= 1:
+            raise ValueError("AI 学习置信度必须在 0 到 1 之间")
+
+        timestamp = utc_now()
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    """
+                    INSERT INTO ai_learning_memory (
+                        chat_id, category, evidence_profile, decision_count,
+                        max_confidence, created_at, updated_at
+                    ) VALUES (?, ?, ?, 1, ?, ?, ?)
+                    ON CONFLICT(chat_id, category, evidence_profile) DO UPDATE SET
+                        decision_count = ai_learning_memory.decision_count + 1,
+                        max_confidence = MAX(
+                            ai_learning_memory.max_confidence,
+                            excluded.max_confidence
+                        ),
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        chat_id,
+                        normalized_category,
+                        evidence_profile,
+                        normalized_confidence,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                cursor = await self.db.execute(
+                    """
+                    SELECT chat_id, category, evidence_profile, decision_count,
+                           max_confidence, created_at, updated_at
+                    FROM ai_learning_memory
+                    WHERE chat_id = ? AND category = ? AND evidence_profile = ?
+                    """,
+                    (chat_id, normalized_category, evidence_profile),
+                )
+                row = await cursor.fetchone()
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        if row is None:
+            raise RuntimeError("AI 学习记忆写入后读取失败")
+        return self._learning_memory_from_row(row)
+
+    async def ai_learning_memory(self, chat_id: int) -> tuple[AILearningMemory, ...]:
+        cursor = await self.db.execute(
+            """
+            SELECT chat_id, category, evidence_profile, decision_count,
+                   max_confidence, created_at, updated_at
+            FROM ai_learning_memory
+            WHERE chat_id = ?
+            ORDER BY category, evidence_profile
+            """,
+            (chat_id,),
+        )
+        return tuple(self._learning_memory_from_row(row) for row in await cursor.fetchall())
+
+    @staticmethod
+    def _learning_memory_from_row(row: aiosqlite.Row) -> AILearningMemory:
+        return AILearningMemory(
+            chat_id=int(row["chat_id"]),
+            category=str(row["category"]),
+            evidence_profile=str(row["evidence_profile"]),
+            decision_count=int(row["decision_count"]),
+            max_confidence=float(row["max_confidence"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
 
     async def upsert_ai_signature(
         self,
@@ -793,6 +939,18 @@ class Storage:
                 WHERE chat_id = ? AND normalized_signature = ? AND status = 'active'
                 """,
                 (utc_now(), chat_id, normalized_signature),
+            )
+            await self.db.commit()
+        return cursor.rowcount > 0
+
+    async def activate_ai_signature(self, chat_id: int, signature_id: int) -> bool:
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """
+                UPDATE ai_signatures SET status = 'active', updated_at = ?
+                WHERE chat_id = ? AND id = ? AND status = 'candidate'
+                """,
+                (utc_now(), chat_id, signature_id),
             )
             await self.db.commit()
         return cursor.rowcount > 0

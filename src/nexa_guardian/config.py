@@ -6,6 +6,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from nexa_guardian.ai_contract import AI_MODEL, AI_REASONING_EFFORT, AI_SERVICE_TIER
+
 
 def _csv(value: str | None) -> tuple[str, ...]:
     if not value:
@@ -80,7 +82,9 @@ class Settings:
     log_level: str
     openai_base_url: str = ""
     openai_api_key: str = ""
-    ai_model: str = "gpt-5.6"
+    ai_model: str = AI_MODEL
+    ai_reasoning_effort: str = AI_REASONING_EFFORT
+    ai_service_tier: str = AI_SERVICE_TIER
     ai_enabled: bool = False
     ai_ad_threshold: float = 0.92
     ai_learn_threshold: float = 0.97
@@ -113,13 +117,19 @@ class Settings:
         ai_enabled = _boolean("AI_ENABLED", False)
         openai_base_url = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
         openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        ai_model = os.getenv("AI_MODEL", "gpt-5.6").strip()
+        ai_model = os.getenv("AI_MODEL", AI_MODEL).strip()
+        ai_reasoning_effort = os.getenv("AI_REASONING_EFFORT", AI_REASONING_EFFORT).strip()
+        ai_service_tier = os.getenv("AI_SERVICE_TIER", AI_SERVICE_TIER).strip()
         if ai_enabled and not openai_base_url:
             raise ValueError("AI_ENABLED=true 时必须配置 OPENAI_BASE_URL")
         if ai_enabled and not openai_api_key:
             raise ValueError("AI_ENABLED=true 时必须配置 OPENAI_API_KEY")
-        if ai_model != "gpt-5.6":
-            raise ValueError("AI_MODEL 必须固定为 gpt-5.6")
+        if ai_model != AI_MODEL:
+            raise ValueError(f"AI_MODEL 必须固定为 {AI_MODEL}")
+        if ai_reasoning_effort != AI_REASONING_EFFORT:
+            raise ValueError(f"AI_REASONING_EFFORT 必须固定为 {AI_REASONING_EFFORT}")
+        if ai_service_tier != AI_SERVICE_TIER:
+            raise ValueError(f"AI_SERVICE_TIER 必须固定为 {AI_SERVICE_TIER}")
 
         ai_ad_threshold = _float("AI_AD_THRESHOLD", 0.92, minimum=0.0, maximum=1.0)
         ai_learn_threshold = _float("AI_LEARN_THRESHOLD", 0.97, minimum=0.0, maximum=1.0)
@@ -151,6 +161,8 @@ class Settings:
             openai_base_url=openai_base_url,
             openai_api_key=openai_api_key,
             ai_model=ai_model,
+            ai_reasoning_effort=ai_reasoning_effort,
+            ai_service_tier=ai_service_tier,
             ai_enabled=ai_enabled,
             ai_ad_threshold=ai_ad_threshold,
             ai_learn_threshold=ai_learn_threshold,
