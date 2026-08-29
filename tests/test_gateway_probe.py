@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from nexa_guardian import gateway_probe
+from nexa_guardian.ai_contract import AI_MODEL, AI_REASONING_EFFORT, AI_SERVICE_TIER
 from nexa_guardian.ai_review import AIReviewResult, HTTPResponse
 from nexa_guardian.gateway_probe import PROBE_IMAGE_DATA_URL, PROBE_TEXT, probe_gateway
 
@@ -17,6 +18,10 @@ async def test_gateway_probe_uses_fixed_model_structured_output_and_image() -> N
         return HTTPResponse(
             200,
             {
+                "status": "completed",
+                "model": AI_MODEL,
+                "reasoning": {"effort": AI_REASONING_EFFORT},
+                "service_tier": AI_SERVICE_TIER,
                 "output_text": json.dumps(
                     {
                         "is_ad": False,
@@ -24,21 +29,23 @@ async def test_gateway_probe_uses_fixed_model_structured_output_and_image() -> N
                         "category": "normal",
                         "signatures": [],
                     }
-                )
+                ),
             },
         )
 
     result = await probe_gateway(
         base_url="https://gateway.example/v1",
         api_key="placeholder-credential",
-        model="gpt-5.6",
+        model=AI_MODEL,
         requester=requester,
     )
 
     assert result.is_ad is False
     payload = calls[0]["payload"]
     assert isinstance(payload, dict)
-    assert payload["model"] == "gpt-5.6"
+    assert payload["model"] == AI_MODEL
+    assert payload["reasoning"] == {"effort": AI_REASONING_EFFORT}
+    assert payload["service_tier"] == AI_SERVICE_TIER
     assert payload["store"] is False
     user_content = payload["input"][1]["content"]  # type: ignore[index]
     assert {item["type"] for item in user_content} == {"input_text", "input_image"}
@@ -46,13 +53,26 @@ async def test_gateway_probe_uses_fixed_model_structured_output_and_image() -> N
     assert PROBE_IMAGE_DATA_URL in {item.get("image_url") for item in user_content}
 
 
-async def test_gateway_probe_rejects_model_substitution() -> None:
-    with pytest.raises(ValueError, match="exactly gpt-5.6"):
-        await probe_gateway(
-            base_url="https://gateway.example/v1",
-            api_key="placeholder-credential",
-            model="fallback-model",
-        )
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"model": "gpt-5.6"}, "AI_MODEL"),
+        ({"reasoning_effort": "low"}, "AI_REASONING_EFFORT"),
+        ({"service_tier": "priority"}, "AI_SERVICE_TIER"),
+    ),
+)
+async def test_gateway_probe_rejects_contract_substitution(
+    overrides: dict[str, str], message: str
+) -> None:
+    values: dict[str, object] = {
+        "base_url": "https://gateway.example/v1",
+        "api_key": "placeholder-credential",
+        "model": AI_MODEL,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        await probe_gateway(**values)  # type: ignore[arg-type]
 
 
 def test_probe_cli_uses_exact_protected_env_file(
@@ -63,7 +83,9 @@ def test_probe_cli_uses_exact_protected_env_file(
     env_file.write_text(
         "OPENAI_BASE_URL=https://protected.example/v1\n"
         "OPENAI_API_KEY=protected-placeholder\n"
-        "AI_MODEL=gpt-5.6\n",
+        f"AI_MODEL={AI_MODEL}\n"
+        f"AI_REASONING_EFFORT={AI_REASONING_EFFORT}\n"
+        f"AI_SERVICE_TIER={AI_SERVICE_TIER}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("OPENAI_BASE_URL", "https://ambient.example/v1")
@@ -72,7 +94,9 @@ def test_probe_cli_uses_exact_protected_env_file(
     async def fake_probe_gateway(**kwargs: object) -> AIReviewResult:
         assert kwargs["base_url"] == "https://protected.example/v1"
         assert kwargs["api_key"] == "protected-placeholder"
-        assert kwargs["model"] == "gpt-5.6"
+        assert kwargs["model"] == AI_MODEL
+        assert kwargs["reasoning_effort"] == AI_REASONING_EFFORT
+        assert kwargs["service_tier"] == AI_SERVICE_TIER
         return AIReviewResult(False, 1.0, "normal", (), False, 12)
 
     monkeypatch.setattr(gateway_probe, "probe_gateway", fake_probe_gateway)
@@ -89,7 +113,9 @@ def test_probe_cli_requires_live_production_settings(
     env_file.write_text(
         "OPENAI_BASE_URL=https://protected.example/v1\n"
         "OPENAI_API_KEY=protected-placeholder\n"
-        "AI_MODEL=gpt-5.6\n"
+        f"AI_MODEL={AI_MODEL}\n"
+        f"AI_REASONING_EFFORT={AI_REASONING_EFFORT}\n"
+        f"AI_SERVICE_TIER={AI_SERVICE_TIER}\n"
         "AI_ENABLED=false\n",
         encoding="utf-8",
     )
@@ -101,7 +127,7 @@ def test_probe_cli_requires_live_production_settings(
     probe.assert_not_awaited()
 
 
-def test_probe_cli_accepts_required_production_defaults(
+def test_probe_cli_accepts_explicit_required_production_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -109,7 +135,9 @@ def test_probe_cli_accepts_required_production_defaults(
     env_file.write_text(
         "OPENAI_BASE_URL=https://protected.example/v1\n"
         "OPENAI_API_KEY=protected-placeholder\n"
-        "AI_MODEL=gpt-5.6\n"
+        f"AI_MODEL={AI_MODEL}\n"
+        f"AI_REASONING_EFFORT={AI_REASONING_EFFORT}\n"
+        f"AI_SERVICE_TIER={AI_SERVICE_TIER}\n"
         "AI_ENABLED=true\n",
         encoding="utf-8",
     )
@@ -128,7 +156,7 @@ def test_probe_cli_does_not_accept_credentials_from_ambient_environment(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     env_file = tmp_path / "guardian.env"
-    env_file.write_text("AI_MODEL=gpt-5.6\n", encoding="utf-8")
+    env_file.write_text(f"AI_MODEL={AI_MODEL}\n", encoding="utf-8")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://ambient.example/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "ambient-placeholder")
     monkeypatch.setenv("AI_ENABLED", "true")
@@ -143,6 +171,9 @@ def test_probe_cli_does_not_accept_credentials_from_ambient_environment(
 @pytest.mark.parametrize(
     ("setting", "value"),
     (
+        ("AI_MODEL", "gpt-5.6"),
+        ("AI_REASONING_EFFORT", "low"),
+        ("AI_SERVICE_TIER", "priority"),
         ("DRY_RUN", "true"),
         ("AI_FAILURE_DELETE", "false"),
         ("WARN_LIMIT", "4"),
@@ -167,9 +198,41 @@ def test_probe_cli_rejects_non_release_policy(
     env_file.write_text(
         "OPENAI_BASE_URL=https://protected.example/v1\n"
         "OPENAI_API_KEY=protected-placeholder\n"
-        "AI_MODEL=gpt-5.6\n"
+        f"AI_MODEL={AI_MODEL}\n"
+        f"AI_REASONING_EFFORT={AI_REASONING_EFFORT}\n"
+        f"AI_SERVICE_TIER={AI_SERVICE_TIER}\n"
         "AI_ENABLED=true\n"
         f"{setting}={value}\n",
+        encoding="utf-8",
+    )
+    probe = AsyncMock()
+    monkeypatch.setattr(gateway_probe, "probe_gateway", probe)
+
+    assert gateway_probe.main(["--env-file", str(env_file), "--require-production-settings"]) == 1
+    probe.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "missing_setting",
+    ("AI_MODEL", "AI_REASONING_EFFORT", "AI_SERVICE_TIER"),
+)
+def test_probe_cli_requires_explicit_model_contract_for_production(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_setting: str,
+) -> None:
+    env_file = tmp_path / "guardian.env"
+    values = {
+        "OPENAI_BASE_URL": "https://protected.example/v1",
+        "OPENAI_API_KEY": "protected-placeholder",
+        "AI_MODEL": AI_MODEL,
+        "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
+        "AI_SERVICE_TIER": AI_SERVICE_TIER,
+        "AI_ENABLED": "true",
+    }
+    del values[missing_setting]
+    env_file.write_text(
+        "".join(f"{name}={value}\n" for name, value in values.items()),
         encoding="utf-8",
     )
     probe = AsyncMock()

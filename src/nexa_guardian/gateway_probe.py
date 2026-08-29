@@ -8,7 +8,12 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-from nexa_guardian.ai_review import AIReviewer, AIReviewResult, ResponseRequester
+from nexa_guardian.ai_contract import AI_MODEL, AI_REASONING_EFFORT, AI_SERVICE_TIER
+from nexa_guardian.ai_review import (
+    AIReviewer,
+    AIReviewResult,
+    ResponseRequester,
+)
 
 PROBE_TEXT = "Benign capability probe for a Telegram moderation gateway."
 PROBE_IMAGE_DATA_URL = (
@@ -22,16 +27,25 @@ async def probe_gateway(
     base_url: str,
     api_key: str,
     model: str,
+    reasoning_effort: str = AI_REASONING_EFFORT,
+    service_tier: str = AI_SERVICE_TIER,
     requester: ResponseRequester | None = None,
 ) -> AIReviewResult:
     """Verify Responses, strict structured output, and image input without group data."""
 
-    if model != "gpt-5.6":
-        raise ValueError("AI_MODEL must be exactly gpt-5.6")
+    if model != AI_MODEL:
+        raise ValueError(f"AI_MODEL must be exactly {AI_MODEL}")
+    if reasoning_effort != AI_REASONING_EFFORT:
+        raise ValueError(f"AI_REASONING_EFFORT must be exactly {AI_REASONING_EFFORT}")
+    if service_tier != AI_SERVICE_TIER:
+        raise ValueError(f"AI_SERVICE_TIER must be exactly {AI_SERVICE_TIER}")
+
     reviewer = AIReviewer(
         base_url=base_url,
         api_key=api_key,
         model=model,
+        reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         requester=requester,
         timeout=8,
         concurrency=1,
@@ -46,7 +60,7 @@ async def probe_gateway(
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Probe the configured GPT-5.6 gateway")
+    parser = argparse.ArgumentParser(description="Probe the configured GPT-5.6 Sol gateway")
     parser.add_argument(
         "--env-file",
         type=Path,
@@ -75,6 +89,16 @@ def _validate_production_settings(values: Mapping[str, str | None]) -> None:
         raise ValueError("AI_FAILURE_DELETE must be true for production")
     if _env_value(values, "DRY_RUN", "false").casefold() not in false_values:
         raise ValueError("DRY_RUN must be false for production")
+    fixed_settings = {
+        "AI_MODEL": AI_MODEL,
+        "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
+        "AI_SERVICE_TIER": AI_SERVICE_TIER,
+    }
+    for name, expected in fixed_settings.items():
+        if name not in values or not _env_value(values, name):
+            raise ValueError(f"{name} must be explicitly configured for production")
+        if _env_value(values, name) != expected:
+            raise ValueError(f"{name} must be {expected} for production")
 
     integer_settings = {
         "WARN_LIMIT": (3, "3"),
@@ -116,20 +140,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     values = dotenv_values(arguments.env_file, interpolate=False)
     base_url = _env_value(values, "OPENAI_BASE_URL")
     api_key = _env_value(values, "OPENAI_API_KEY")
-    model = _env_value(values, "AI_MODEL", "gpt-5.6")
+    model = _env_value(values, "AI_MODEL", AI_MODEL)
+    reasoning_effort = _env_value(values, "AI_REASONING_EFFORT", AI_REASONING_EFFORT)
+    service_tier = _env_value(values, "AI_SERVICE_TIER", AI_SERVICE_TIER)
     if not base_url or not api_key:
         print("gateway probe failed: gateway credentials are not configured", file=sys.stderr)
         return 1
     try:
         if arguments.require_production_settings:
             _validate_production_settings(values)
-        result = asyncio.run(probe_gateway(base_url=base_url, api_key=api_key, model=model))
+        result = asyncio.run(
+            probe_gateway(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
+            )
+        )
     except Exception as exc:
         print(f"gateway probe failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
-        "gateway probe ok: model=gpt-5.6 structured_output=true "
-        f"image_input=true latency_ms={result.latency_ms}"
+        f"gateway probe ok: model={AI_MODEL} reasoning={AI_REASONING_EFFORT} "
+        f"service_tier={AI_SERVICE_TIER} structured_output=true image_input=true "
+        f"latency_ms={result.latency_ms}"
     )
     return 0
 

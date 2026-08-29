@@ -1,8 +1,10 @@
+import asyncio
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from nexa_guardian.ai_contract import AI_MODEL
 from nexa_guardian.storage import SCHEMA_VERSION, Storage
 
 
@@ -108,7 +110,7 @@ async def test_ai_schema_decisions_and_signatures(storage: Storage) -> None:
         is_ad=True,
         confidence=0.98,
         category="crypto_ad",
-        model="gpt-5.6",
+        model=AI_MODEL,
         latency_ms=321,
         cached=False,
         enforced=True,
@@ -144,15 +146,100 @@ async def test_ai_schema_decisions_and_signatures(storage: Storage) -> None:
     assert await storage.disable_ai_signature(-100, str(created.id))
     assert await storage.active_ai_signatures(-100) == set()
 
+    candidate = await storage.upsert_ai_signature(
+        chat_id=-100,
+        normalized_signature="guaranteed profit",
+        display_signature="guaranteed profit",
+        category="promotion",
+        status="candidate",
+        confidence=0.80,
+    )
+    assert not await storage.activate_ai_signature(-200, candidate.id)
+    assert await storage.activate_ai_signature(-100, candidate.id)
+    assert not await storage.activate_ai_signature(-100, candidate.id)
+    await storage.disable_ai_signature(-100, str(candidate.id))
+    assert not await storage.activate_ai_signature(-100, candidate.id)
+
+
+async def test_ai_learning_memory_is_private_canonical_and_atomic(storage: Storage) -> None:
+    columns = await storage.db.execute_fetchall("PRAGMA table_info(ai_learning_memory)")
+    assert [row["name"] for row in columns] == [
+        "chat_id",
+        "category",
+        "evidence_profile",
+        "decision_count",
+        "max_confidence",
+        "created_at",
+        "updated_at",
+    ]
+
+    first = await storage.record_ai_learning(
+        -100,
+        "promotion",
+        ("promotion", "text", "link", "text"),
+        0.80,
+    )
+    assert first.evidence_profile == "text,link,promotion"
+    assert first.decision_count == 1
+    assert first.max_confidence == 0.80
+
+    await asyncio.gather(
+        *(
+            storage.record_ai_learning(
+                -100,
+                "promotion",
+                ("link", "text", "promotion"),
+                confidence,
+            )
+            for confidence in (0.81, 0.95, 0.85)
+        )
+    )
+    await storage.record_ai_learning(-100, "external_contact", ("contact", "mention"), 0.91)
+    await storage.record_ai_learning(-200, "promotion", ("text", "link"), 0.99)
+
+    memories = await storage.ai_learning_memory(-100)
+    assert [
+        (item.category, item.evidence_profile, item.decision_count, item.max_confidence)
+        for item in memories
+    ] == [
+        ("external_contact", "mention,contact", 1, 0.91),
+        ("promotion", "text,link,promotion", 4, 0.95),
+    ]
+    assert len(await storage.ai_learning_memory(-200)) == 1
+
+
+@pytest.mark.parametrize(
+    ("category", "evidence", "confidence"),
+    [
+        ("promotion", (), 0.90),
+        ("promotion", ("text", "raw message"), 0.90),
+        ("promotion", ("https://evil.example",), 0.90),
+        ("raw category", ("text",), 0.90),
+        ("promotion", ("text",), -0.01),
+        ("promotion", ("text",), 1.01),
+        ("promotion", ("text",), float("nan")),
+    ],
+)
+async def test_ai_learning_memory_rejects_non_aggregate_data(
+    storage: Storage,
+    category: str,
+    evidence: tuple[str, ...],
+    confidence: float,
+) -> None:
+    with pytest.raises(ValueError):
+        await storage.record_ai_learning(-100, category, evidence, confidence)
+    assert await storage.ai_learning_memory(-100) == ()
+
 
 async def test_ai_stats_distinguish_gateway_calls_cache_and_local_signatures(
     storage: Storage,
 ) -> None:
     records = (
         ("gpt-5.6", False, True, "", 120),
-        ("gpt-5.6", True, True, "", 0),
+        (AI_MODEL, False, True, "", 80),
+        (AI_MODEL, True, True, "", 0),
         ("local-signature", True, True, "", 0),
-        ("gpt-5.6", False, None, "AIReviewTimeout", 0),
+        (AI_MODEL, False, None, "AIReviewTimeout", 0),
         ("local-media", True, None, "MediaReviewError", 0),
     )
     for message_id, (model, cached, is_ad, error_type, latency_ms) in enumerate(records, 1):
@@ -172,18 +259,46 @@ async def test_ai_stats_distinguish_gateway_calls_cache_and_local_signatures(
 
     stats = await storage.ai_stats(-100)
 
-    assert stats.total == 5
-    assert stats.calls == 2
-    assert stats.ads == 3
+    assert stats.total == 6
+    assert stats.calls == 3
+    assert stats.ads == 4
     assert stats.failed == 1
     assert stats.cached == 1
-    assert stats.average_latency_ms == 120
+    assert stats.average_latency_ms == 100
+
+    recent_stats = await storage.ai_stats(-100, since="2000-01-01T00:00:00+00:00")
+    assert recent_stats.calls == 3
+    assert recent_stats.failed == 1
+    assert recent_stats.cached == 1
+    assert recent_stats.average_latency_ms == 100
 
     await storage.db.execute("UPDATE ai_decisions SET created_at = '2000-01-01T00:00:00+00:00'")
     await storage.db.commit()
-    assert await storage.prune_ai_decisions(retention_days=30) == 5
-    assert (await storage.ai_stats(-100)).total == 5
+    await storage.upsert_ai_signature(
+        chat_id=-100,
+        normalized_signature="claim airdrop",
+        display_signature="claim airdrop",
+        category="promotion",
+        status="candidate",
+        confidence=0.80,
+    )
+    await storage.record_ai_learning(
+        -100,
+        "promotion",
+        ("text", "link", "promotion"),
+        0.80,
+    )
+    assert await storage.prune_ai_decisions(retention_days=30) == 6
+    assert (await storage.ai_stats(-100)).total == 6
     assert (await storage.ai_stats(-100, since="2026-01-01T00:00:00+00:00")).total == 0
+    persistent = await storage.ai_signatures(-100, statuses=("candidate",))
+    assert [(item.normalized_signature, item.hit_count) for item in persistent] == [
+        ("claim airdrop", 1)
+    ]
+    learning = await storage.ai_learning_memory(-100)
+    assert [(item.evidence_profile, item.decision_count) for item in learning] == [
+        ("text,link,promotion", 1)
+    ]
 
 
 async def test_runtime_and_ephemeral_queue(storage: Storage) -> None:
@@ -257,7 +372,9 @@ async def test_schema_v3_backfills_cumulative_ai_totals(tmp_path: Path) -> None:
                 (-100, 1, 0.98, 'promotion', 'gpt-5.6', 80, 0, 1, '',
                  '2026-08-01T00:00:00+00:00'),
                 (-100, NULL, NULL, '', 'gpt-5.6', 0, 0, 0, 'AIReviewTimeout',
-                 '2026-08-01T00:01:00+00:00');
+                 '2026-08-01T00:01:00+00:00'),
+                (-100, 1, 0.96, 'promotion', 'gpt-5.6-sol', 120, 0, 1, '',
+                 '2026-08-01T00:02:00+00:00');
             PRAGMA user_version=3;
             """
         )
@@ -270,9 +387,59 @@ async def test_schema_v3_backfills_cumulative_ai_totals(tmp_path: Path) -> None:
     finally:
         await migrated.close()
 
-    assert stats.total == 2
-    assert stats.calls == 2
-    assert stats.ads == 1
+    assert stats.total == 3
+    assert stats.calls == 3
+    assert stats.ads == 2
     assert stats.failed == 1
-    assert stats.average_latency_ms == 80
+    assert stats.average_latency_ms == 100
+    assert version[0][0] == SCHEMA_VERSION
+
+
+async def test_schema_v4_migrates_to_private_ai_learning_memory(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-v4.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE migration_marker (value TEXT NOT NULL);
+            INSERT INTO migration_marker VALUES ('preserved');
+            PRAGMA user_version=4;
+            """
+        )
+
+    migrated = Storage(database)
+    await migrated.open()
+    try:
+        columns = await migrated.db.execute_fetchall("PRAGMA table_info(ai_learning_memory)")
+        marker = await migrated.db.execute_fetchall("SELECT value FROM migration_marker")
+        version = await migrated.db.execute_fetchall("PRAGMA user_version")
+        recorded = await migrated.record_ai_learning(
+            -100,
+            "promotion",
+            ("text", "obfuscation"),
+            0.94,
+        )
+    finally:
+        await migrated.close()
+
+    reopened = Storage(database)
+    await reopened.open()
+    try:
+        persisted = await reopened.ai_learning_memory(-100)
+    finally:
+        await reopened.close()
+
+    assert [row["name"] for row in columns] == [
+        "chat_id",
+        "category",
+        "evidence_profile",
+        "decision_count",
+        "max_confidence",
+        "created_at",
+        "updated_at",
+    ]
+    assert marker[0]["value"] == "preserved"
+    assert recorded.evidence_profile == "text,obfuscation"
+    assert [(item.evidence_profile, item.decision_count) for item in persisted] == [
+        ("text,obfuscation", 1)
+    ]
     assert version[0][0] == SCHEMA_VERSION

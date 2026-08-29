@@ -18,11 +18,14 @@
 - 使用 `--source` 时，还需安装 Python `build`、`uv` 或可用的 `python3 -m pip`；生产发布优先使用 CI 构建的 wheel。
 - 在运行脚本前，将仓库或 wheel 放到 VM 上的明确绝对路径；不要把 API Key 写入 wheel、源码或命令行。
 - `/etc/nexa-guardian/guardian.env` 必须配置兼容网关的 `OPENAI_BASE_URL`、
-  `OPENAI_API_KEY` 和固定的 `AI_MODEL=gpt-5.6`。发布脚本会用候选虚拟环境的
-  `nexa-guardian-probe --require-production-settings` 验证 Responses、严格结构化输出和图片
-  输入，并拒绝未启用 AI、警告阈值不是 3、消息保留时间不是 30 秒或关闭故障删除的配置；
-  同时核对发布计划固定的阈值、超时、并发、缓存、保留期及图片大小。探测只发送固定的
-  无害文本及 1×1 测试图片，不读取群消息，也不会输出密钥。
+  `OPENAI_API_KEY`、`AI_MODEL=gpt-5.6-sol`、`AI_REASONING_EFFORT=high` 和
+  `AI_SERVICE_TIER=default`；三项模型契约必须显式存在，不接受默认补齐、家族别名或静默改写。
+  发布脚本会用候选虚拟环境的 `nexa-guardian-probe --require-production-settings` 验证
+  Responses、严格结构化输出和图片输入，并要求响应明确返回 `status=completed`、
+  `model=gpt-5.6-sol`、`reasoning.effort=high`、`service_tier=default`。探针还会拒绝未启用
+  AI、警告阈值不是 3、消息保留时间不是 30 秒或关闭故障删除的配置，同时核对发布计划固定
+  的阈值、超时、并发、缓存、保留期及图片大小。探测只发送固定的无害文本及 1×1 测试图片，
+  不读取群消息，也不会输出密钥或响应正文。
 
 ## 发布命令
 
@@ -32,7 +35,7 @@
 sudo /path/to/repository/deploy/release.sh \
   --wheel /root/releases/nexa_guardian-0.2.0-py3-none-any.whl \
   --git-sha 0123456789abcdef0123456789abcdef01234567 \
-  --schema-version 4
+  --schema-version 5
 ```
 
 直接从已检出的源码构建：
@@ -40,7 +43,7 @@ sudo /path/to/repository/deploy/release.sh \
 ```bash
 sudo /path/to/repository/deploy/release.sh \
   --source /root/NexaAssistantRobot \
-  --schema-version 4
+  --schema-version 5
 ```
 
 当前版本的 `--schema-version` 必须明确传入 `4`，脚本会在启动后核对数据库的
@@ -55,14 +58,14 @@ sudo /path/to/repository/deploy/release.sh \
    `/var/backups/nexa-guardian/manual/pre-release-<release-id>.env`，校验内容一致并固定为
    `root:root 0600`；日志只显示备份路径，不输出配置内容。
 3. 校验或构建 wheel，计算并复核 SHA256，创建服务组只读的独立虚拟环境。
-4. 使用候选版本对兼容网关执行固定无害请求，验证 Responses、严格结构化输出及图片输入；
-   任一能力失败即停止，不切换生产。
+4. 使用候选版本对兼容网关执行固定无害请求，验证 Responses、严格结构化输出、图片输入及
+   服务端实际采用 `gpt-5.6-sol`、`high`、`default`；任一能力或响应契约失败即停止，不切换生产。
 5. 写入 `release.json` 并完成候选 release 后，停止服务并确认它不再写库。
 6. 使用 SQLite 在线备份 API 创建最终一致的
    `/var/backups/nexa-guardian/manual/pre-release-<release-id>.db`，运行
    `PRAGMA quick_check`、`PRAGMA foreign_key_check` 并记录 SHA256。
 7. 将 `current` 软链接原子切换到 `<UTC timestamp>-<short SHA>` release，启动服务。
-8. 检查 systemd 启用/运行状态、主进程、退出状态、自动重启次数和数据库完整性；失败时执行下述数据库与代码回滚。
+8. 检查 systemd 启用/运行状态、主进程、退出状态、自动重启次数、数据库完整性和 schema 5；失败时执行下述数据库与代码回滚。
 9. 验证成功后，仅清理标准命名的旧代码 release，固定保留 `current` 和最近两个旧版本；
    备份目录、非标准目录及 `current` 指向的 release 不会被清理。
 
@@ -96,5 +99,6 @@ cat /opt/nexa-guardian/current/release.json
 systemctl status nexa-guardian-backup.timer --no-pager
 ```
 
-脚本只验证服务和 SQLite 的基础健康状态。Telegram 权限、管理员私聊、AI 网关结构化输出、
-30 秒消息清理及真实群组审核行为仍需按照发布验收清单逐项检查。
+脚本只验证服务和 SQLite 的基础健康状态。Telegram 权限、管理员私聊、Nexa Guardian 官方
+群管理审核员身份、三个一方站点的精确域名行为、AI 网关 Sol/high/default 响应契约、30 秒
+消息清理及真实群组审核行为仍需按照发布验收清单逐项检查。

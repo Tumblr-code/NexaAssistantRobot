@@ -4,6 +4,8 @@ IFS=$'\n\t'
 umask 0077
 
 readonly SERVICE_NAME="nexa-guardian.service"
+readonly BACKUP_SERVICE_NAME="nexa-guardian-backup.service"
+readonly BACKUP_TIMER_NAME="nexa-guardian-backup.timer"
 readonly SERVICE_USER="nexa-guardian"
 readonly SERVICE_GROUP="nexa-guardian"
 readonly APP_ROOT="/opt/nexa-guardian"
@@ -15,13 +17,14 @@ readonly BACKUP_ROOT="/var/backups/nexa-guardian"
 readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
 readonly PYTHON_BIN="/usr/bin/python3"
-readonly CODE_SCHEMA_VERSION="4"
+readonly CODE_SCHEMA_VERSION="5"
 
 artifact_mode=""
 artifact_path=""
 git_sha=""
 schema_version=""
 stage_path=""
+candidate_release_path=""
 build_path=""
 switch_path=""
 config_backup_staging=""
@@ -36,6 +39,7 @@ previous_target=""
 switched=0
 release_stable=0
 service_stopped=0
+backup_timer_paused=0
 
 usage() {
   cat <<'EOF'
@@ -76,6 +80,64 @@ is_path_below() {
   [[ "${candidate}" == "${root}/"* ]]
 }
 
+is_same_or_below() {
+  local candidate="$1"
+  local root="$2"
+  [[ "${candidate}" == "${root}" || "${candidate}" == "${root}/"* ]]
+}
+
+path_contains_mountpoint() {
+  local root="$1"
+  local mount_targets=""
+  local mount_target=""
+
+  mount_targets="$(findmnt -rn -o TARGET)" || return 2
+  while IFS= read -r mount_target; do
+    if is_same_or_below "${mount_target}" "${root}"; then
+      return 0
+    fi
+  done <<<"${mount_targets}"
+  return 1
+}
+
+safe_remove_tree() {
+  local target="$1"
+  local allowed_root="$2"
+  local target_real=""
+  local allowed_root_real=""
+  local mount_check=0
+
+  [[ -d "${target}" && ! -L "${target}" ]] || return 1
+  target_real="$(canonical_path "${target}")" || return 1
+  allowed_root_real="$(canonical_path "${allowed_root}")" || return 1
+  is_path_below "${target_real}" "${allowed_root_real}" || return 1
+  if path_contains_mountpoint "${target_real}"; then
+    return 1
+  else
+    mount_check=$?
+  fi
+  (( mount_check == 1 )) || return 1
+  rm -rf --one-file-system -- "${target_real}"
+}
+
+wait_for_backup_service_idle() {
+  local active_state=""
+  local queued_job=""
+
+  for _attempt in {1..120}; do
+    active_state="$(
+      systemctl show "${BACKUP_SERVICE_NAME}" --property=ActiveState --value
+    )" || return 1
+    queued_job="$(systemctl show "${BACKUP_SERVICE_NAME}" --property=Job --value)" \
+      || return 1
+    if [[ "${active_state}" == "inactive" && -z "${queued_job}" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 switch_current_to() {
   local target="$1"
   switch_path="${CURRENT_LINK}.new.$$"
@@ -103,33 +165,41 @@ restore_previous_release() {
   fi
 
   printf '[release] deployment failed after switching current; rolling back\n' >&2
+  if ! systemctl stop "${BACKUP_SERVICE_NAME}"; then
+    printf '[release] CRITICAL: failed to stop database backup service; database was not changed\n' >&2
+    return 1
+  fi
+  if ! wait_for_backup_service_idle; then
+    printf '[release] CRITICAL: database backup service is still active; database was not changed\n' >&2
+    return 1
+  fi
   if ! systemctl stop "${SERVICE_NAME}"; then
     printf '[release] CRITICAL: failed to stop service; database was not changed\n' >&2
-    return
+    return 1
   fi
   if systemctl is-active --quiet "${SERVICE_NAME}"; then
     printf '[release] CRITICAL: service is still active; database was not changed\n' >&2
-    return
+    return 1
   fi
 
   if (( database_backup_validated != 1 || database_metadata_captured != 1 )) \
     || [[ -z "${backup_path}" || -z "${database_backup_sha256}" \
       || ! -f "${backup_path}" || -L "${backup_path}" ]]; then
     printf '[release] CRITICAL: validated database backup is unavailable; database was not changed\n' >&2
-    return
+    return 1
   fi
   if ! is_path_below "$(canonical_path "${backup_path}")" \
     "$(canonical_path "${MANUAL_BACKUP_ROOT}")"; then
     printf '[release] CRITICAL: database backup resolved outside manual backup root\n' >&2
-    return
+    return 1
   fi
   if ! current_backup_sha256="$(sha256sum -- "${backup_path}" | awk '{print $1}')"; then
     printf '[release] CRITICAL: database backup checksum could not be read; database was not changed\n' >&2
-    return
+    return 1
   fi
   if [[ "${current_backup_sha256}" != "${database_backup_sha256}" ]]; then
     printf '[release] CRITICAL: database backup checksum changed; database was not changed\n' >&2
-    return
+    return 1
   fi
 
   if ! "${PYTHON_BIN}" - \
@@ -213,7 +283,7 @@ except BaseException:
 PY
   then
     printf '[release] CRITICAL: database restore failed; previous service was not started\n' >&2
-    return
+    return 1
   fi
 
   if [[ -n "${previous_target}" && -d "${previous_target}" ]]; then
@@ -222,42 +292,122 @@ PY
       if systemctl start "${SERVICE_NAME}" \
         && systemctl is-active --quiet "${SERVICE_NAME}"; then
         printf '[release] rollback restored the database and previous release\n' >&2
+        return 0
       else
         printf '[release] CRITICAL: previous release did not start cleanly\n' >&2
+        return 1
       fi
     else
       printf '[release] CRITICAL: failed to restore previous current link; service remains stopped\n' >&2
       [[ ! -L "${rollback_link}" ]] || rm -f -- "${rollback_link}"
+      return 1
     fi
   elif [[ -L "${CURRENT_LINK}" ]]; then
     rm -f -- "${CURRENT_LINK}"
     printf '[release] WARNING: no previous release exists; service remains stopped\n' >&2
+    return 1
   fi
+
+  printf '[release] CRITICAL: rollback had no previous release to restore\n' >&2
+  return 1
 }
 
 cleanup() {
   local exit_code=$?
-  restore_previous_release
+  local candidate_real=""
+  local current_real=""
+  local releases_root_real=""
+  local rollback_succeeded=1
+
+  # Cleanup must reach the recovery blocks even when a noncritical removal
+  # fails. Do not allow another INT/TERM to interrupt an in-progress rollback.
+  trap '' INT TERM
+  set +e
+  if (( switched == 1 && release_stable == 0 )); then
+    # A timer restarted just before a signal could otherwise launch a backup
+    # while rollback replaces the database and clears its WAL files.
+    backup_timer_paused=1
+    if ! systemctl stop "${BACKUP_TIMER_NAME}" \
+      || systemctl is-active --quiet "${BACKUP_TIMER_NAME}"; then
+      printf '[release] CRITICAL: backup timer could not be stopped before rollback\n' >&2
+      rollback_succeeded=0
+      exit_code=1
+    fi
+  fi
+  if (( rollback_succeeded == 1 )); then
+    if ! restore_previous_release; then
+      rollback_succeeded=0
+      exit_code=1
+    fi
+  fi
 
   if (( switched == 0 && service_stopped == 1 && release_stable == 0 )); then
     if systemctl start "${SERVICE_NAME}"; then
       printf '[release] previous service restarted after pre-switch failure\n' >&2
     else
       printf '[release] CRITICAL: failed to restart previous service after pre-switch failure\n' >&2
+      exit_code=1
     fi
   fi
 
   if [[ -n "${stage_path}" && -d "${stage_path}" ]]; then
-    rm -rf --one-file-system -- "${stage_path}"
+    if ! safe_remove_tree "${stage_path}" "${RELEASES_ROOT}"; then
+      printf '[release] WARNING: failed to remove staging directory\n' >&2
+      (( release_stable == 1 )) || exit_code=1
+    fi
+  fi
+  if (( release_stable == 0 )) \
+    && [[ -n "${candidate_release_path}" && -d "${candidate_release_path}" \
+      && ! -L "${candidate_release_path}" ]]; then
+    if ! releases_root_real="$(canonical_path "${RELEASES_ROOT}")" \
+      || ! candidate_real="$(canonical_path "${candidate_release_path}")" \
+      || ! is_path_below "${candidate_real}" "${releases_root_real}"; then
+      printf '[release] CRITICAL: refusing to remove failed candidate outside releases root\n' >&2
+      exit_code=1
+    else
+      if [[ -L "${CURRENT_LINK}" ]]; then
+        current_real="$(canonical_path "${CURRENT_LINK}" 2>/dev/null || true)"
+      fi
+      if is_same_or_below "${current_real}" "${candidate_real}"; then
+        printf '[release] WARNING: failed candidate is still current and was retained\n' >&2
+        exit_code=1
+      else
+        if ! safe_remove_tree "${candidate_real}" "${RELEASES_ROOT}"; then
+          printf '[release] WARNING: failed candidate could not be removed\n' >&2
+          exit_code=1
+        fi
+      fi
+    fi
   fi
   if [[ -n "${build_path}" && -d "${build_path}" ]]; then
-    rm -rf --one-file-system -- "${build_path}"
+    if ! safe_remove_tree "${build_path}" "/tmp"; then
+      printf '[release] WARNING: failed to remove build directory\n' >&2
+      (( release_stable == 1 )) || exit_code=1
+    fi
   fi
   if [[ -n "${switch_path}" && -L "${switch_path}" ]]; then
-    rm -f -- "${switch_path}"
+    if ! rm -f -- "${switch_path}"; then
+      printf '[release] WARNING: failed to remove temporary current link\n' >&2
+      (( release_stable == 1 )) || exit_code=1
+    fi
   fi
   if [[ -n "${config_backup_staging}" && -f "${config_backup_staging}" ]]; then
-    rm -f -- "${config_backup_staging}"
+    if ! rm -f -- "${config_backup_staging}"; then
+      printf '[release] WARNING: failed to remove temporary configuration backup\n' >&2
+      (( release_stable == 1 )) || exit_code=1
+    fi
+  fi
+
+  if (( backup_timer_paused == 1 )); then
+    if (( switched == 1 && release_stable == 0 && rollback_succeeded == 0 )); then
+      printf '[release] CRITICAL: backup timer remains stopped after incomplete rollback\n' >&2
+      exit_code=1
+    elif systemctl start "${BACKUP_TIMER_NAME}"; then
+      printf '[release] backup timer restarted after release interruption\n' >&2
+    else
+      printf '[release] CRITICAL: failed to restart backup timer\n' >&2
+      exit_code=1
+    fi
   fi
 
   exit "${exit_code}"
@@ -313,6 +463,7 @@ done
 
 require_command flock
 require_command getent
+require_command findmnt
 require_command cmp
 require_command mv
 require_command readlink
@@ -395,8 +546,14 @@ if [[ -e "${CURRENT_LINK}" && ! -L "${CURRENT_LINK}" ]]; then
 fi
 if [[ -L "${CURRENT_LINK}" ]]; then
   previous_target="$(canonical_path "${CURRENT_LINK}")"
-  is_path_below "${previous_target}" "$(canonical_path "${RELEASES_ROOT}")" \
+  releases_root_real="$(canonical_path "${RELEASES_ROOT}")"
+  is_path_below "${previous_target}" "${releases_root_real}" \
     || die "current points outside ${RELEASES_ROOT}: ${previous_target}"
+  [[ "$(dirname -- "${previous_target}")" == "${releases_root_real}" ]] \
+    || die "current must point to a direct child of ${RELEASES_ROOT}: ${previous_target}"
+  [[ "$(basename -- "${previous_target}")" \
+    =~ ^[0-9]{8}T[0-9]{6}Z(-[0-9a-f]{7,12})?$ ]] \
+    || die "current release name is invalid: ${previous_target}"
   [[ -d "${previous_target}" ]] || die "current points to a missing release: ${previous_target}"
 fi
 
@@ -473,16 +630,6 @@ copied_wheel="${stage_path}/artifacts/$(basename "${artifact_path}")"
 [[ "$(sha256sum -- "${copied_wheel}" | awk '{print $1}')" == "${wheel_sha256}" ]] \
   || die "copied wheel checksum does not match source artifact"
 
-log "creating isolated virtual environment"
-"${PYTHON_BIN}" -m venv "${stage_path}/.venv"
-"${stage_path}/.venv/bin/python" -m pip install --disable-pip-version-check --no-cache-dir \
-  "${copied_wheel}"
-"${stage_path}/.venv/bin/python" -c 'import nexa_guardian'
-log "probing GPT-5.6 capabilities and required production settings"
-"${stage_path}/.venv/bin/nexa-guardian-probe" \
-  --env-file "${CONFIG_PATH}" --require-production-settings \
-  || die "gateway capability probe failed; production was not switched"
-
 "${PYTHON_BIN}" - \
   "${stage_path}/release.json" \
   "${git_sha}" \
@@ -510,19 +657,45 @@ with open(path, "x", encoding="utf-8") as stream:
     os.fsync(stream.fileno())
 PY
 chmod 0644 -- "${stage_path}/release.json"
-chown -hR "root:${SERVICE_GROUP}" -- "${stage_path}"
-chmod -R u=rwX,g=rX,o= -- "${stage_path}"
 
-mv -- "${stage_path}" "${final_release}"
+mv -T -- "${stage_path}" "${final_release}"
+candidate_release_path="${final_release}"
 stage_path=""
+copied_wheel="${final_release}/artifacts/$(basename "${artifact_path}")"
+[[ "$(sha256sum -- "${copied_wheel}" | awk '{print $1}')" == "${wheel_sha256}" ]] \
+  || die "final wheel checksum does not match source artifact"
+
+# Build the virtual environment at its permanent path. Python entry-point
+# shebangs embed the venv path and break if a completed venv is moved later.
+log "creating isolated virtual environment"
+"${PYTHON_BIN}" -m venv "${final_release}/.venv"
+"${final_release}/.venv/bin/python" -m pip install \
+  --disable-pip-version-check --no-cache-dir "${copied_wheel}"
+"${final_release}/.venv/bin/python" -c 'import nexa_guardian'
+log "probing GPT-5.6 Sol high-reasoning low-output capabilities and production settings"
+"${final_release}/.venv/bin/nexa-guardian-probe" \
+  --env-file "${CONFIG_PATH}" --require-production-settings \
+  || die "gateway capability probe failed; production was not switched"
+chown -hR "root:${SERVICE_GROUP}" -- "${final_release}"
+chmod -R u=rwX,g=rX,o= -- "${final_release}"
+
+systemctl is-enabled --quiet "${BACKUP_TIMER_NAME}" \
+  || die "backup timer must be enabled before release"
+systemctl is-active --quiet "${BACKUP_TIMER_NAME}" \
+  || die "backup timer must be active before release"
+log "pausing ${BACKUP_TIMER_NAME} during the final database transition"
+backup_timer_paused=1
+systemctl stop "${BACKUP_TIMER_NAME}" || die "failed to pause backup timer"
+wait_for_backup_service_idle \
+  || die "database backup service did not become idle after pausing the timer"
 
 systemctl is-active --quiet "${SERVICE_NAME}" \
   || die "service must be active before the final database backup"
 log "stopping ${SERVICE_NAME} for a final consistent database backup"
+service_stopped=1
 systemctl stop "${SERVICE_NAME}" || die "failed to stop service before database backup"
 systemctl is-active --quiet "${SERVICE_NAME}" \
   && die "service is still active after stop"
-service_stopped=1
 
 log "creating validated database backup at ${backup_path}"
 "${PYTHON_BIN}" - "${DATABASE_PATH}" "${backup_path}" <<'PY'
@@ -626,37 +799,57 @@ finally:
     connection.close()
 PY
 
+log "running one verified database backup with the new release"
+systemctl start "${BACKUP_SERVICE_NAME}" || die "new release database backup failed"
+wait_for_backup_service_idle \
+  || die "new release database backup did not return to idle"
+backup_result="$(systemctl show "${BACKUP_SERVICE_NAME}" --property=Result --value)"
+backup_exec_status="$(
+  systemctl show "${BACKUP_SERVICE_NAME}" --property=ExecMainStatus --value
+)"
+[[ "${backup_result}" == "success" && "${backup_exec_status}" == "0" ]] \
+  || die "new release database backup did not complete successfully"
+
+systemctl start "${BACKUP_TIMER_NAME}" || die "failed to resume backup timer"
+systemctl is-enabled --quiet "${BACKUP_TIMER_NAME}" || die "backup timer is not enabled"
+systemctl is-active --quiet "${BACKUP_TIMER_NAME}" || die "backup timer is not active"
 release_stable=1
+backup_timer_paused=0
 log "release is healthy; pruning old code releases"
 mapfile -t release_names < <(
   find "${RELEASES_ROOT}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r
 )
 old_releases_kept=0
-releases_root_real="$(canonical_path "${RELEASES_ROOT}")"
-current_target="$(canonical_path "${CURRENT_LINK}")"
-is_path_below "${current_target}" "${releases_root_real}" \
-  || die "current points outside releases root: ${current_target}"
-for candidate_name in "${release_names[@]}"; do
-  if [[ ! "${candidate_name}" =~ ^[0-9]{8}T[0-9]{6}Z(-[0-9a-f]{7,12})?$ ]]; then
-    continue
-  fi
-  candidate="${RELEASES_ROOT}/${candidate_name}"
-  candidate_real="$(canonical_path "${candidate}")"
-  is_path_below "${candidate_real}" "${releases_root_real}" \
-    || die "refusing to prune path outside releases root: ${candidate_real}"
-  if [[ "${candidate_real}" == "${current_target}" ]]; then
-    continue
-  fi
-  ((old_releases_kept += 1))
-  if (( old_releases_kept <= 2 )); then
-    continue
-  fi
-  [[ "${candidate_real}" != "${current_target}" ]] \
-    || die "refusing to prune current release: ${candidate_real}"
-  [[ ! -L "${candidate}" ]] || die "refusing to recursively remove a symlink: ${candidate}"
-  log "removing old code release ${candidate}"
-  rm -rf --one-file-system -- "${candidate}"
-done
+if ! releases_root_real="$(canonical_path "${RELEASES_ROOT}")" \
+  || ! current_target="$(canonical_path "${CURRENT_LINK}")" \
+  || ! is_path_below "${current_target}" "${releases_root_real}"; then
+  printf '[release] WARNING: release is live, but old-release pruning was skipped\n' >&2
+else
+  for candidate_name in "${release_names[@]}"; do
+    if [[ ! "${candidate_name}" =~ ^[0-9]{8}T[0-9]{6}Z(-[0-9a-f]{7,12})?$ ]]; then
+      continue
+    fi
+    candidate="${RELEASES_ROOT}/${candidate_name}"
+    if [[ -L "${candidate}" ]] || ! candidate_real="$(canonical_path "${candidate}")" \
+      || ! is_path_below "${candidate_real}" "${releases_root_real}"; then
+      printf '[release] WARNING: unsafe old-release candidate was not removed: %s\n' \
+        "${candidate}" >&2
+      continue
+    fi
+    if is_same_or_below "${current_target}" "${candidate_real}"; then
+      continue
+    fi
+    ((old_releases_kept += 1))
+    if (( old_releases_kept <= 2 )); then
+      continue
+    fi
+    log "removing old code release ${candidate}"
+    if ! safe_remove_tree "${candidate_real}" "${RELEASES_ROOT}"; then
+      printf '[release] WARNING: release is live, but old release could not be removed: %s\n' \
+        "${candidate_real}" >&2
+    fi
+  done
+fi
 
 log "deployed ${release_id}"
 log "configuration backup: ${config_backup_path}"

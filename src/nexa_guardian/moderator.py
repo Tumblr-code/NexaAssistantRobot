@@ -45,6 +45,7 @@ from nexa_guardian.detection import (
     DetectionInput,
     FloodGuard,
     Violation,
+    domain_from_url,
     extract_entity_urls,
     human_duration,
     normalize_domain,
@@ -57,6 +58,19 @@ DISPLAY_TIMEZONE = ZoneInfo("Asia/Shanghai")
 UTC = timezone.utc
 AUTO_BAN_MEMORY_SECONDS = 60 * 60
 AUTO_BAN_MEMORY_MAX = 10_000
+AI_CANDIDATE_PROMOTION_HITS = 3
+AI_LEARNING_EVIDENCE = (
+    "link",
+    "mention",
+    "forward",
+    "contact",
+    "obfuscation",
+    "promotion",
+    "flood",
+    "duplicate",
+    "text",
+    "image",
+)
 
 
 ACTION_LABELS = {
@@ -253,6 +267,8 @@ class ModerationController:
                 base_url=settings.openai_base_url,
                 api_key=settings.openai_api_key,
                 model=settings.ai_model,
+                reasoning_effort=settings.ai_reasoning_effort,
+                service_tier=settings.ai_service_tier,
                 timeout=settings.ai_timeout_seconds,
                 concurrency=settings.ai_concurrency,
                 cache_ttl=settings.ai_cache_ttl_seconds,
@@ -1201,11 +1217,25 @@ class ModerationController:
 
         try:
             safety_target = str(target_id or "unknown")
+            risk_signals = set(suspicion.reasons)
+            if flood_violation is not None:
+                risk_signals.add(flood_violation.code)
+            normalized_risk_signals = tuple(
+                signal for signal in AI_LEARNING_EVIDENCE if signal in risk_signals
+            )
+            linked_hosts = tuple(
+                dict.fromkeys(
+                    host
+                    for raw_url in entity_urls
+                    if (host := domain_from_url(raw_url)) is not None
+                )
+            )
             result = await self.ai_reviewer.review(
                 text=text,
                 image_data_url=image_data_url,
                 safety_identifier=f"{message.chat.id}:{safety_target}",
-                risk_signals=(flood_violation.code,) if flood_violation is not None else (),
+                risk_signals=normalized_risk_signals,
+                linked_hosts=linked_hosts,
             )
         except (AIReviewError, AiohttpClientError) as exc:
             await self._handle_ai_failure(
@@ -1217,6 +1247,48 @@ class ModerationController:
             return
 
         await self._note_gateway_success(cached=result.cached)
+        if result.is_ad:
+            evidence = set(normalized_risk_signals)
+            if text.strip():
+                evidence.add("text")
+            if image_data_url is not None:
+                evidence.add("image")
+            await self.storage.record_ai_learning(
+                chat_id=message.chat.id,
+                category=result.category,
+                evidence=tuple(signal for signal in AI_LEARNING_EVIDENCE if signal in evidence),
+                confidence=result.confidence,
+            )
+            signature_status = (
+                "active" if result.confidence >= self.settings.ai_learn_threshold else "candidate"
+            )
+            for signature in result.signatures:
+                learned_signature = await self.storage.upsert_ai_signature(
+                    chat_id=message.chat.id,
+                    normalized_signature=signature,
+                    display_signature=signature,
+                    category=result.category,
+                    status=signature_status,
+                    confidence=result.confidence,
+                )
+                if (
+                    learned_signature.status == "candidate"
+                    and learned_signature.hit_count >= AI_CANDIDATE_PROMOTION_HITS
+                    and learned_signature.max_confidence >= self.settings.ai_ad_threshold
+                ):
+                    await self.storage.activate_ai_signature(
+                        message.chat.id,
+                        learned_signature.id,
+                    )
+            for signature in result.rejected_signatures:
+                await self.storage.upsert_ai_signature(
+                    chat_id=message.chat.id,
+                    normalized_signature=signature,
+                    display_signature=signature,
+                    category=result.category,
+                    status="rejected",
+                    confidence=result.confidence,
+                )
         if await self._finish_if_ai_paused(message, processing):
             await self.storage.record_ai_decision(
                 chat_id=message.chat.id,
@@ -1233,27 +1305,6 @@ class ModerationController:
             return
         enforce = result.is_ad and result.confidence >= self.settings.ai_ad_threshold
         if enforce:
-            signature_status = (
-                "active" if result.confidence >= self.settings.ai_learn_threshold else "candidate"
-            )
-            for signature in result.signatures:
-                await self.storage.upsert_ai_signature(
-                    chat_id=message.chat.id,
-                    normalized_signature=signature,
-                    display_signature=signature,
-                    category=result.category,
-                    status=signature_status,
-                    confidence=result.confidence,
-                )
-            for signature in result.rejected_signatures:
-                await self.storage.upsert_ai_signature(
-                    chat_id=message.chat.id,
-                    normalized_signature=signature,
-                    display_signature=signature,
-                    category=result.category,
-                    status="rejected",
-                    confidence=result.confidence,
-                )
             enforced = await self._handle_violation(
                 message,
                 user_id,
