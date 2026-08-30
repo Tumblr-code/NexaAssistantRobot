@@ -1,6 +1,6 @@
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -9,28 +9,34 @@ import pytest
 from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.methods import BanChatMember, UnbanChatMember
-from aiogram.types import Chat, Message, User
 
 from nexa_guardian.admin import AdminRights
 from nexa_guardian.config import Settings
+from nexa_guardian.member_cleanup import (
+    REASON_DELETED,
+    REASON_LAST_MONTH,
+    REASON_SILENT,
+    MemberCandidate,
+    MemberScanError,
+    MemberScanResult,
+    MemberState,
+)
 from nexa_guardian.moderator import (
     ModerationController,
-    PendingInactiveCleanup,
+    PendingMemberCleanup,
     telegram_call_with_bounded_retry,
 )
 from nexa_guardian.storage import Storage
 
-UTC = timezone.utc
 ADMIN_ID = 7
 GROUP_ID = -100
+UTC = timezone.utc
 
 
 class MemberCleanupBot:
     def __init__(self) -> None:
         self.members: dict[int, tuple[ChatMemberStatus, bool]] = {}
-        self.member_checks: list[tuple[int, int]] = []
         self.banned: list[tuple[int, int, bool]] = []
-        self.ban_until_dates: list[datetime | None] = []
         self.unbanned: list[tuple[int, int, bool]] = []
 
     async def get_chat_administrators(self, chat_id: int, **_kwargs: object):
@@ -43,15 +49,11 @@ class MemberCleanupBot:
         ]
 
     async def get_chat_member(self, chat_id: int, user_id: int):
-        self.member_checks.append((chat_id, user_id))
         if user_id == ADMIN_ID:
             status, is_bot = ChatMemberStatus.CREATOR, False
         else:
             status, is_bot = self.members.get(user_id, (ChatMemberStatus.MEMBER, False))
-        return SimpleNamespace(
-            status=status,
-            user=SimpleNamespace(id=user_id, is_bot=is_bot),
-        )
+        return SimpleNamespace(status=status, user=SimpleNamespace(id=user_id, is_bot=is_bot))
 
     async def ban_chat_member(
         self,
@@ -61,8 +63,9 @@ class MemberCleanupBot:
         until_date: datetime | None = None,
         revoke_messages: bool,
     ) -> bool:
+        if not revoke_messages:
+            assert until_date is not None and until_date > datetime.now(UTC)
         self.banned.append((chat_id, user_id, revoke_messages))
-        self.ban_until_dates.append(until_date)
         return True
 
     async def unban_chat_member(
@@ -76,35 +79,91 @@ class MemberCleanupBot:
         return True
 
 
-def cleanup_settings(tmp_path: Path, **overrides: object) -> Settings:
-    values: dict[str, object] = {
-        "bot_token": "123:ABC",
-        "allowed_chat_ids": frozenset({GROUP_ID}),
-        "authorized_admin_ids": frozenset({ADMIN_ID}),
-        "log_chat_id": None,
-        "database_path": tmp_path / "guardian.db",
-        "allowed_domains": (),
-        "blocked_words": (),
-        "block_external_links": True,
-        "block_forwards": False,
-        "block_channel_mentions": False,
-        "warn_limit": 3,
-        "default_mute_seconds": 3600,
-        "notice_ttl_seconds": 0,
-        "flood_window_seconds": 8,
-        "flood_max_messages": 6,
-        "duplicate_window_seconds": 30,
-        "duplicate_max_messages": 2,
-        "dry_run": False,
-        "log_level": "INFO",
-    }
-    values.update(overrides)
-    return Settings(**values)
+class FakeScanner:
+    def __init__(self, candidates: tuple[MemberCandidate, ...]) -> None:
+        self.candidates = candidates
+        self.history_complete = True
+        self.scan_error: Exception | None = None
+        self.active_since_preview: frozenset[int] = frozenset()
+        self.activity_during_preview_at: datetime | None = None
+        self.current = {
+            candidate.user_id: MemberState(
+                user_id=candidate.user_id,
+                deleted=REASON_DELETED in candidate.reasons,
+                bot=False,
+                administrator=False,
+                joined_at=candidate.joined_at,
+                status_reason=(
+                    REASON_LAST_MONTH if REASON_LAST_MONTH in candidate.reasons else None
+                ),
+                last_online_at=candidate.last_online_at,
+            )
+            for candidate in candidates
+        }
+
+    async def scan(self, chat_id: int, *, cutoff: datetime) -> MemberScanResult:
+        assert chat_id == GROUP_ID
+        assert cutoff < datetime.now(UTC)
+        if self.scan_error is not None:
+            raise self.scan_error
+        return MemberScanResult(
+            candidates=self.candidates,
+            history_complete=self.history_complete,
+            participants_scanned=100,
+        )
+
+    async def current_members(
+        self,
+        chat_id: int,
+        *,
+        cutoff: datetime,
+        activity_since: datetime,
+        user_ids: frozenset[int],
+    ) -> tuple[dict[int, MemberState], frozenset[int]]:
+        assert chat_id == GROUP_ID
+        assert activity_since > cutoff
+        active_ids = self.active_since_preview.intersection(user_ids)
+        if (
+            self.activity_during_preview_at is not None
+            and activity_since <= self.activity_during_preview_at
+        ):
+            active_ids = active_ids.union(user_ids)
+        return (
+            {user_id: self.current[user_id] for user_id in user_ids if user_id in self.current},
+            active_ids,
+        )
 
 
-def private_command(text: str, *, user_id: int = ADMIN_ID) -> SimpleNamespace:
+def settings(tmp_path: Path) -> Settings:
+    return Settings(
+        bot_token="123:ABC",  # noqa: S106 - inert test credential
+        allowed_chat_ids=frozenset({GROUP_ID}),
+        authorized_admin_ids=frozenset({ADMIN_ID}),
+        log_chat_id=None,
+        database_path=tmp_path / "guardian.db",
+        allowed_domains=(),
+        blocked_words=(),
+        block_external_links=True,
+        block_forwards=False,
+        block_channel_mentions=False,
+        warn_limit=3,
+        default_mute_seconds=3600,
+        notice_ttl_seconds=0,
+        flood_window_seconds=8,
+        flood_max_messages=6,
+        duplicate_window_seconds=30,
+        duplicate_max_messages=2,
+        dry_run=False,
+        log_level="INFO",
+    )
+
+
+def command(text: str, *, private: bool = True, user_id: int = ADMIN_ID) -> SimpleNamespace:
     return SimpleNamespace(
-        chat=SimpleNamespace(id=user_id, type=ChatType.PRIVATE),
+        chat=SimpleNamespace(
+            id=user_id if private else GROUP_ID,
+            type=ChatType.PRIVATE if private else ChatType.SUPERGROUP,
+        ),
         from_user=SimpleNamespace(id=user_id),
         sender_chat=None,
         text=text,
@@ -113,262 +172,258 @@ def private_command(text: str, *, user_id: int = ADMIN_ID) -> SimpleNamespace:
     )
 
 
-def group_command(text: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        chat=SimpleNamespace(id=GROUP_ID, type=ChatType.SUPERGROUP),
-        from_user=SimpleNamespace(id=ADMIN_ID),
-        sender_chat=None,
-        text=text,
-        date=datetime.now(UTC),
-        answer=AsyncMock(),
-    )
-
-
 @pytest.fixture
-async def cleanup_storage(tmp_path: Path):
+async def storage(tmp_path: Path):
     instance = Storage(tmp_path / "guardian.db")
     await instance.open()
     yield instance
     await instance.close()
 
 
-async def test_inactive_members_is_private_only_and_uses_observed_group_activity(
+def candidate(user_id: int, *reasons: str) -> MemberCandidate:
+    return MemberCandidate(
+        user_id=user_id,
+        reasons=tuple(reasons),
+        last_online_at=None,
+        joined_at=datetime.now(UTC) - timedelta(days=90),
+    )
+
+
+async def test_del_members_is_private_only_and_requires_restrict_right(
     tmp_path: Path,
-    cleanup_storage: Storage,
+    storage: Storage,
 ) -> None:
-    bot = MemberCleanupBot()
-    controller = ModerationController(  # type: ignore[arg-type]
-        bot,
-        cleanup_settings(tmp_path),
-        cleanup_storage,
-    )
-    await cleanup_storage.record_member_status(
-        GROUP_ID,
-        101,
-        "member",
-        observed_at="2000-01-01T00:00:00+00:00",
-    )
-    await cleanup_storage.record_member_message(
-        GROUP_ID,
-        202,
-        observed_at="2099-01-01T00:00:00+00:00",
-    )
+    controller = ModerationController(MemberCleanupBot(), settings(tmp_path), storage)  # type: ignore[arg-type]
+    controller.member_scanner = FakeScanner((candidate(101, REASON_DELETED),))  # type: ignore[assignment]
 
-    private = private_command("/inactive")
-    group = group_command("/inactive")
-    await controller.inactive_members(private)  # type: ignore[arg-type]
-    await controller.inactive_members(group)  # type: ignore[arg-type]
-
-    output = private.answer.await_args.args[0]
-    assert "30" in output
-    assert "101" in output
-    assert "202" not in output
-    assert "群内活动不代表 Telegram 最后上线" in output
+    group = command("/del members", private=False)
+    await controller.delete_replied(group)  # type: ignore[arg-type]
     assert "私聊" in group.answer.await_args.args[0]
 
+    controller.admins.rights = AsyncMock(return_value=AdminRights(True, True, False))
+    denied = command("/del members")
+    await controller.delete_replied(denied)  # type: ignore[arg-type]
+    assert "封禁/限制成员" in denied.answer.await_args.args[0]
 
-@pytest.mark.parametrize("days", (29, 366))
-async def test_inactive_members_rejects_days_outside_30_to_365(
+
+async def test_del_members_preview_creates_confirmation_and_reports_degraded_history(
     tmp_path: Path,
-    cleanup_storage: Storage,
-    days: int,
+    storage: Storage,
 ) -> None:
-    controller = ModerationController(  # type: ignore[arg-type]
-        MemberCleanupBot(),
-        cleanup_settings(tmp_path),
-        cleanup_storage,
-    )
-    message = private_command(f"/inactive {days}")
-
-    await controller.inactive_members(message)  # type: ignore[arg-type]
-
-    assert "30" in message.answer.await_args.args[0]
-    assert "365" in message.answer.await_args.args[0]
-
-
-async def test_inactive_cleanup_requires_the_sole_private_admin_and_restrict_right(
-    tmp_path: Path,
-    cleanup_storage: Storage,
-) -> None:
-    bot = MemberCleanupBot()
-    controller = ModerationController(  # type: ignore[arg-type]
-        bot,
-        cleanup_settings(tmp_path),
-        cleanup_storage,
-    )
-
-    unauthorized = private_command("/cleanupinactive 30", user_id=99)
-    group = group_command("/cleanupinactive 30")
-    await controller.cleanup_inactive(unauthorized)  # type: ignore[arg-type]
-    await controller.cleanup_inactive(group)  # type: ignore[arg-type]
-
-    assert "授权管理员" in unauthorized.answer.await_args.args[0]
-    assert "私聊" in group.answer.await_args.args[0]
-    assert bot.banned == []
-
-    controller.admins.rights = AsyncMock(
-        return_value=AdminRights(
-            is_admin=True,
-            can_delete_messages=True,
-            can_restrict_members=False,
+    controller = ModerationController(MemberCleanupBot(), settings(tmp_path), storage)  # type: ignore[arg-type]
+    scanner = FakeScanner(
+        (
+            candidate(101, REASON_DELETED),
+            candidate(102, REASON_LAST_MONTH, REASON_SILENT),
         )
     )
-    no_right = private_command("/cleanupinactive 30")
-    await controller.cleanup_inactive(no_right)  # type: ignore[arg-type]
+    scanner.history_complete = False
+    controller.member_scanner = scanner  # type: ignore[assignment]
+    preview = command("/del members")
 
-    assert "封禁/限制成员" in no_right.answer.await_args.args[0]
-    assert bot.banned == []
+    await controller.delete_replied(preview)  # type: ignore[arg-type]
+
+    text = preview.answer.await_args.args[0]
+    assert "101" in text and "已注销" in text
+    assert "102" in text and "上月上线（模糊）" in text
+    assert "未使用“30 天无发言”条件" in text
+    assert re.search(r"/del members [A-F0-9]{6} confirm", text)
 
 
-async def test_inactive_cleanup_requires_a_valid_unexpired_confirmation_code(
+async def test_del_members_scan_failure_does_not_create_plan(
     tmp_path: Path,
-    cleanup_storage: Storage,
+    storage: Storage,
+) -> None:
+    controller = ModerationController(MemberCleanupBot(), settings(tmp_path), storage)  # type: ignore[arg-type]
+    scanner = FakeScanner(())
+    scanner.scan_error = MemberScanError("未配置")
+    controller.member_scanner = scanner  # type: ignore[assignment]
+    message = command("/del members")
+
+    await controller.delete_replied(message)  # type: ignore[arg-type]
+
+    assert "成员扫描失败" in message.answer.await_args.args[0]
+    assert controller._member_cleanup_plans == {}
+
+
+async def test_del_members_limits_plan_and_rejects_expired_confirmation(
+    tmp_path: Path,
+    storage: Storage,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = {"now": 100.0}
     monkeypatch.setattr("nexa_guardian.moderator.time.monotonic", lambda: clock["now"])
     bot = MemberCleanupBot()
-    controller = ModerationController(  # type: ignore[arg-type]
-        bot,
-        cleanup_settings(tmp_path),
-        cleanup_storage,
-    )
-    await cleanup_storage.record_member_message(
-        GROUP_ID,
-        101,
-        observed_at="2000-01-01T00:00:00+00:00",
-    )
-
-    preview = private_command("/cleanupinactive 30")
-    await controller.cleanup_inactive(preview)  # type: ignore[arg-type]
-
-    preview_text = preview.answer.await_args.args[0]
-    match = re.search(r"/cleanupinactive\s+([A-Z0-9]{6})\s+confirm", preview_text)
-    assert match is not None
-    code = match.group(1)
-    assert bot.banned == []
-    assert "群内活动不代表 Telegram 最后上线" in preview_text
-
-    wrong = private_command("/cleanupinactive WRONG1 confirm")
-    await controller.cleanup_inactive(wrong)  # type: ignore[arg-type]
-    assert "无效" in wrong.answer.await_args.args[0]
-    assert bot.banned == []
-
-    clock["now"] += 601
-    expired = private_command(f"/cleanupinactive {code} confirm")
-    await controller.cleanup_inactive(expired)  # type: ignore[arg-type]
-    assert "过期" in expired.answer.await_args.args[0]
-    assert bot.banned == []
-
-
-async def test_confirmed_inactive_cleanup_rechecks_every_candidate_and_only_kicks_safe_targets(
-    tmp_path: Path,
-    cleanup_storage: Storage,
-) -> None:
-    bot = MemberCleanupBot()
-    controller = ModerationController(  # type: ignore[arg-type]
-        bot,
-        cleanup_settings(tmp_path),
-        cleanup_storage,
-    )
-    candidates = (101, 102, 103, 104, 105, 106)
-    for user_id in candidates:
-        await cleanup_storage.record_member_message(
-            GROUP_ID,
-            user_id,
-            observed_at="2000-01-01T00:00:00+00:00",
-        )
-
-    preview = private_command("/cleanupinactive 30")
-    await controller.cleanup_inactive(preview)  # type: ignore[arg-type]
-    match = re.search(
-        r"/cleanupinactive\s+([A-Z0-9]{6})\s+confirm",
-        preview.answer.await_args.args[0],
-    )
-    assert match is not None
-    code = match.group(1)
-    assert bot.banned == []
-
-    bot.members.update(
-        {
-            102: (ChatMemberStatus.ADMINISTRATOR, False),
-            103: (ChatMemberStatus.MEMBER, True),
-            104: (ChatMemberStatus.MEMBER, False),
-            105: (ChatMemberStatus.LEFT, False),
-            106: (ChatMemberStatus.MEMBER, False),
-        }
-    )
-    await cleanup_storage.add_trusted_user(GROUP_ID, 104, ADMIN_ID)
-    await cleanup_storage.record_member_message(
-        GROUP_ID,
-        106,
-        observed_at="2099-01-01T00:00:00+00:00",
-    )
-    bot.member_checks.clear()
-
-    confirm = private_command(f"/cleanupinactive {code} confirm")
-    await controller.cleanup_inactive(confirm)  # type: ignore[arg-type]
-
-    candidate_checks = {
-        (chat_id, user_id) for chat_id, user_id in bot.member_checks if user_id != ADMIN_ID
-    }
-    assert candidate_checks == {(GROUP_ID, user_id) for user_id in candidates}
-    assert bot.banned == [(GROUP_ID, 101, False)]
-    assert bot.ban_until_dates[0] is not None
-    assert bot.ban_until_dates[0] > datetime.now(UTC)
-    assert bot.unbanned == [(GROUP_ID, 101, True)]
-    rows = await cleanup_storage.db.execute_fetchall(
-        "SELECT action, actor_id, target_id FROM moderation_log WHERE action = 'cleanup_inactive'"
-    )
-    assert [tuple(row) for row in rows] == [("cleanup_inactive", ADMIN_ID, 101)]
-    summary = confirm.answer.await_args.args[0]
-    assert "已移出 1" in summary
-    assert "跳过 5" in summary
-
-
-async def test_cleanup_stops_after_unban_failure_and_uses_temporary_ban_fallback(
-    tmp_path: Path,
-    cleanup_storage: Storage,
-) -> None:
-    bot = MemberCleanupBot()
-    controller = ModerationController(  # type: ignore[arg-type]
-        bot,
-        cleanup_settings(tmp_path),
-        cleanup_storage,
-    )
-    for user_id in (101, 102):
-        await cleanup_storage.record_member_message(
-            GROUP_ID,
-            user_id,
-            observed_at="2000-01-01T00:00:00+00:00",
-        )
-    preview = private_command("/cleanupinactive 30")
-    await controller.cleanup_inactive(preview)  # type: ignore[arg-type]
-    code = re.search(
-        r"/cleanupinactive\s+([A-Z0-9]{6})\s+confirm",
-        preview.answer.await_args.args[0],
-    )
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    controller.member_scanner = FakeScanner(
+        tuple(candidate(user_id, REASON_DELETED) for user_id in range(100, 155))
+    )  # type: ignore[assignment]
+    preview = command("/del members")
+    await controller.delete_replied(preview)  # type: ignore[arg-type]
+    text = preview.answer.await_args.args[0]
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", text)
     assert code is not None
+    assert "（50/55）" in text
+    assert len(next(iter(controller._member_cleanup_plans.values())).members) == 50
+
+    wrong = command("/del members BAD999 confirm")
+    await controller.delete_replied(wrong)  # type: ignore[arg-type]
+    assert "无效或已过期" in wrong.answer.await_args.args[0]
+
+    clock["now"] = 701.0
+    expired = command(f"/del members {code.group(1)} confirm")
+    await controller.delete_replied(expired)  # type: ignore[arg-type]
+    assert "无效或已过期" in expired.answer.await_args.args[0]
+    assert bot.banned == []
+
+
+async def test_del_members_confirmation_rechecks_and_kicks_only_safe_targets(
+    tmp_path: Path,
+    storage: Storage,
+) -> None:
+    bot = MemberCleanupBot()
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    scanner = FakeScanner(
+        tuple(candidate(user_id, REASON_DELETED) for user_id in (101, 102, 103, 104, 105))
+    )
+    controller.member_scanner = scanner  # type: ignore[assignment]
+    preview = command("/del members")
+    await controller.delete_replied(preview)  # type: ignore[arg-type]
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview.answer.await_args.args[0])
+    assert code is not None
+
+    scanner.current[102] = MemberState(102, True, True, False, None, None, None)
+    scanner.current[103] = MemberState(103, True, False, True, None, None, None)
+    bot.members[104] = (ChatMemberStatus.LEFT, False)
+    await storage.add_trusted_user(GROUP_ID, 105, ADMIN_ID)
+    confirm = command(f"/del members {code.group(1)} confirm")
+
+    await controller.delete_replied(confirm)  # type: ignore[arg-type]
+
+    assert bot.banned == [(GROUP_ID, 101, False)]
+    assert bot.unbanned == [(GROUP_ID, 101, True)]
+    assert "已移出 1" in confirm.answer.await_args.args[0]
+    rows = await storage.db.execute_fetchall(
+        "SELECT action, actor_id, target_id, reason FROM moderation_log "
+        "WHERE action = 'cleanup_inactive'"
+    )
+    assert [(row[0], row[1], row[2]) for row in rows] == [("cleanup_inactive", ADMIN_ID, 101)]
+    assert all(not row[3] for row in rows)
+
+
+async def test_del_members_skips_member_active_after_preview(
+    tmp_path: Path,
+    storage: Storage,
+) -> None:
+    bot = MemberCleanupBot()
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    controller.member_scanner = FakeScanner(  # type: ignore[assignment]
+        (candidate(101, REASON_LAST_MONTH, REASON_SILENT),)
+    )
+    preview = command("/del members")
+    await controller.delete_replied(preview)  # type: ignore[arg-type]
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview.answer.await_args.args[0])
+    assert code is not None
+    await storage.record_member_message(GROUP_ID, 101, observed_at=datetime.now(UTC).isoformat())
+
+    confirm = command(f"/del members {code.group(1)} confirm")
+    await controller.delete_replied(confirm)  # type: ignore[arg-type]
+
+    assert bot.banned == []
+    assert "跳过 1" in confirm.answer.await_args.args[0]
+
+
+async def test_del_members_uses_mtproto_activity_recheck_after_preview(
+    tmp_path: Path,
+    storage: Storage,
+) -> None:
+    bot = MemberCleanupBot()
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    scanner = FakeScanner((candidate(101, REASON_LAST_MONTH),))
+    controller.member_scanner = scanner  # type: ignore[assignment]
+    preview = command("/del members")
+    await controller.delete_replied(preview)  # type: ignore[arg-type]
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview.answer.await_args.args[0])
+    assert code is not None
+    scanner.active_since_preview = frozenset({101})
+
+    confirm = command(f"/del members {code.group(1)} confirm")
+    await controller.delete_replied(confirm)  # type: ignore[arg-type]
+
+    assert bot.banned == []
+    assert "跳过 1" in confirm.answer.await_args.args[0]
+
+
+async def test_del_members_recheck_window_starts_before_initial_scan(
+    tmp_path: Path,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    clock = {"now": started_at}
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return clock["now"]
+
+    class GapScanner(FakeScanner):
+        async def scan(self, chat_id: int, *, cutoff: datetime) -> MemberScanResult:
+            result = await super().scan(chat_id, cutoff=cutoff)
+            self.activity_during_preview_at = started_at + timedelta(seconds=1)
+            clock["now"] = started_at + timedelta(seconds=5)
+            return result
+
+    monkeypatch.setattr("nexa_guardian.moderator.datetime", FakeDateTime)
+    bot = MemberCleanupBot()
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    scanner = GapScanner((candidate(101, REASON_LAST_MONTH),))
+    controller.member_scanner = scanner  # type: ignore[assignment]
+    preview = command("/del members")
+    await controller.delete_replied(preview)  # type: ignore[arg-type]
+    plan = next(iter(controller._member_cleanup_plans.values()))
+    assert plan.created_at == started_at
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview.answer.await_args.args[0])
+    assert code is not None
+
+    confirm = command(f"/del members {code.group(1)} confirm")
+    await controller.delete_replied(confirm)  # type: ignore[arg-type]
+
+    assert bot.banned == []
+    assert "跳过 1" in confirm.answer.await_args.args[0]
+
+
+async def test_del_members_stops_after_unban_failure(
+    tmp_path: Path,
+    storage: Storage,
+) -> None:
+    bot = MemberCleanupBot()
     bot.unban_chat_member = AsyncMock(
         side_effect=TelegramBadRequest(
             method=UnbanChatMember(chat_id=GROUP_ID, user_id=101),
-            message="temporary failure",
+            message="failed",
         )
     )
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    controller.member_scanner = FakeScanner(
+        (candidate(101, REASON_DELETED), candidate(102, REASON_DELETED))
+    )  # type: ignore[assignment]
+    preview = command("/del members")
+    await controller.delete_replied(preview)  # type: ignore[arg-type]
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview.answer.await_args.args[0])
+    assert code is not None
 
-    confirm = private_command(f"/cleanupinactive {code.group(1)} confirm")
-    await controller.cleanup_inactive(confirm)  # type: ignore[arg-type]
+    confirm = command(f"/del members {code.group(1)} confirm")
+    await controller.delete_replied(confirm)  # type: ignore[arg-type]
 
     assert bot.banned == [(GROUP_ID, 101, False)]
-    assert bot.ban_until_dates[0] is not None
-    assert bot.ban_until_dates[0] > datetime.now(UTC)
     assert "解除封禁失败" in confirm.answer.await_args.args[0]
     assert "未继续处理 1" in confirm.answer.await_args.args[0]
 
 
-async def test_cleanup_and_permanent_ban_are_serialized_per_member(
+async def test_member_cleanup_and_permanent_ban_are_serialized(
     tmp_path: Path,
-    cleanup_storage: Storage,
+    storage: Storage,
 ) -> None:
     started = asyncio.Event()
     release = asyncio.Event()
@@ -409,28 +464,19 @@ async def test_cleanup_and_permanent_ban_are_serialized_per_member(
             )
 
     bot = BlockingBot()
-    controller = ModerationController(  # type: ignore[arg-type]
-        bot,
-        cleanup_settings(tmp_path),
-        cleanup_storage,
-    )
-    await cleanup_storage.record_member_message(
-        GROUP_ID,
-        101,
-        observed_at="2000-01-01T00:00:00+00:00",
-    )
-    activity = await cleanup_storage.member_activity(GROUP_ID, 101)
-    assert activity is not None
-    plan = PendingInactiveCleanup(
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    member = candidate(101, REASON_DELETED)
+    controller.member_scanner = FakeScanner((member,))  # type: ignore[assignment]
+    plan = PendingMemberCleanup(
         actor_id=ADMIN_ID,
         chat_id=GROUP_ID,
-        days=30,
-        cutoff="2020-01-01T00:00:00+00:00",
-        members=((101, controller._member_activity_stamp(activity)),),
+        cutoff=datetime.now(UTC) - timedelta(days=30),
+        created_at=datetime.now(UTC),
+        members=(member,),
         expires_at=float("inf"),
     )
     cleanup = asyncio.create_task(
-        controller._execute_inactive_cleanup(private_command("cleanup"), plan)  # type: ignore[arg-type]
+        controller._execute_member_cleanup(command("cleanup"), plan)  # type: ignore[arg-type]
     )
     await started.wait()
 
@@ -445,52 +491,6 @@ async def test_cleanup_and_permanent_ban_are_serialized_per_member(
     await asyncio.gather(cleanup, permanent)
 
     assert calls == [("ban", False), ("unban", True), ("ban", True)]
-
-
-async def test_new_member_message_wins_lock_before_cleanup_recheck(
-    tmp_path: Path,
-    cleanup_storage: Storage,
-) -> None:
-    bot = MemberCleanupBot()
-    controller = ModerationController(  # type: ignore[arg-type]
-        bot,
-        cleanup_settings(tmp_path),
-        cleanup_storage,
-    )
-    await cleanup_storage.record_member_message(
-        GROUP_ID,
-        101,
-        observed_at="2000-01-01T00:00:00+00:00",
-    )
-    activity = await cleanup_storage.member_activity(GROUP_ID, 101)
-    assert activity is not None
-    plan = PendingInactiveCleanup(
-        actor_id=ADMIN_ID,
-        chat_id=GROUP_ID,
-        days=30,
-        cutoff="2020-01-01T00:00:00+00:00",
-        members=((101, controller._member_activity_stamp(activity)),),
-        expires_at=float("inf"),
-    )
-    message = Message(
-        message_id=1,
-        date=datetime.now(UTC),
-        chat=Chat(id=GROUP_ID, type=ChatType.SUPERGROUP, title="Test"),
-        from_user=User(id=101, is_bot=False, first_name="Member"),
-        text="normal chat",
-    )
-    lock = controller._member_action_lock(GROUP_ID, 101)
-    await lock.acquire()
-    activity_task = asyncio.create_task(controller.moderate_message(message))
-    await asyncio.sleep(0)
-    cleanup_task = asyncio.create_task(
-        controller._execute_inactive_cleanup(private_command("cleanup"), plan)  # type: ignore[arg-type]
-    )
-    await asyncio.sleep(0)
-    lock.release()
-    await asyncio.gather(activity_task, cleanup_task)
-
-    assert bot.banned == []
 
 
 async def test_telegram_retry_after_is_bounded_and_retried_once(

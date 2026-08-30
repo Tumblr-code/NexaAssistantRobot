@@ -57,7 +57,20 @@ from nexa_guardian.detection import (
     normalize_domain,
     parse_duration,
 )
-from nexa_guardian.history_purge import HistoryPurgeError, HistoryPurger
+from nexa_guardian.history_purge import (
+    HistoryPurgeError,
+    HistoryPurger,
+    TelegramAdminSession,
+)
+from nexa_guardian.member_cleanup import (
+    REASON_DELETED,
+    REASON_LAST_MONTH,
+    REASON_OFFLINE,
+    REASON_SILENT,
+    MemberCandidate,
+    MemberScanError,
+    MemberScanner,
+)
 from nexa_guardian.storage import (
     AIStats,
     ChatStats,
@@ -75,8 +88,7 @@ UTC = timezone.utc
 AUTO_BAN_MEMORY_SECONDS = 60 * 60
 AUTO_BAN_MEMORY_MAX = 10_000
 AI_CANDIDATE_PROMOTION_HITS = 3
-INACTIVE_MIN_DAYS = 30
-INACTIVE_MAX_DAYS = 365
+MEMBER_CLEANUP_DAYS = 30
 INACTIVE_CLEANUP_LIMIT = 50
 INACTIVE_CONFIRM_TTL_SECONDS = 10 * 60
 INACTIVE_KICK_FALLBACK_SECONDS = 5 * 60
@@ -165,12 +177,12 @@ def select_photo_preview(
 
 
 @dataclass(frozen=True, slots=True)
-class PendingInactiveCleanup:
+class PendingMemberCleanup:
     actor_id: int
     chat_id: int
-    days: int
-    cutoff: str
-    members: tuple[tuple[int, str], ...]
+    cutoff: datetime
+    created_at: datetime
+    members: tuple[MemberCandidate, ...]
     expires_at: float
 
 
@@ -243,6 +255,8 @@ HELP_TEXT = """<b>Nexa Guardian</b>
 <code>/ban</code>　回复成员消息后封禁
 <code>/del</code>　回复消息后删除
 <code>/del all</code>　清理全部群历史
+<code>/del members</code>　私聊预览长期不活跃成员
+<code>/del members 确认码 confirm</code>　确认移出候选成员
 <code>/lottery 30m 1 参与 奖品</code>　创建关键词抽奖
 <code>/lottery end|cancel|reroll</code>　管理抽奖
 
@@ -466,7 +480,7 @@ class ModerationController:
             weakref.WeakValueDictionary()
         )
         self._auto_banned_members: OrderedDict[tuple[int, int], float] = OrderedDict()
-        self._inactive_cleanup_plans: dict[tuple[int, str], PendingInactiveCleanup] = {}
+        self._member_cleanup_plans: dict[tuple[int, str], PendingMemberCleanup] = {}
         self._policy_cache: dict[int, ModerationPolicySnapshot] = {}
         self._policy_locks: dict[int, asyncio.Lock] = {}
         self._policy_versions: dict[int, int] = {}
@@ -476,10 +490,21 @@ class ModerationController:
         self._raffle_card_tasks: dict[int, asyncio.Task[None]] = {}
         self._raffle_worker_task: asyncio.Task[None] | None = None
         self._stopping = False
+        telegram_admin_session = TelegramAdminSession(
+            api_id=settings.telegram_api_id,
+            api_hash=settings.telegram_api_hash,
+            session_path=settings.telegram_session_path,
+            authorized_user_ids=settings.authorized_admin_ids,
+        )
         self.history_purger = HistoryPurger(
             api_id=settings.telegram_api_id,
             api_hash=settings.telegram_api_hash,
             session_path=settings.telegram_session_path,
+            authorized_user_ids=settings.authorized_admin_ids,
+            session=telegram_admin_session,
+        )
+        self.member_scanner = MemberScanner(
+            telegram_admin_session,
             authorized_user_ids=settings.authorized_admin_ids,
         )
         self._register_handlers()
@@ -970,7 +995,8 @@ class ModerationController:
             f"限制成员权限：{'有' if can_restrict else '缺少'}\n"
             f"AI 审核：{'开' if self.settings.ai_enabled else '关'}\n"
             f"抽奖：{raffle_status}\n"
-            f"全群清理：{'已配置' if self.settings.mtproto_ready else '待配置 Telegram API 凭据'}"
+            f"MTProto 管理："
+            f"{'已配置' if self.settings.mtproto_ready else '待配置 Telegram API 凭据'}"
             f"{health_line}"
         )
 
@@ -1666,11 +1692,14 @@ class ModerationController:
         await message.answer(f"已移出 {display_user(user, user_id)}。")
 
     async def delete_replied(self, message: Message) -> None:
+        arguments = command_arguments(message)
+        if arguments and arguments[0].casefold() == "members":
+            await self._delete_members(message, arguments[1:])
+            return
         actor = await self._group_admin(message, delete=True)
         if actor is None:
             return
         chat_id = actor[2]
-        arguments = command_arguments(message)
         if arguments and arguments[0].casefold() == "all":
             await message.answer("正在清理群历史，期间群聊保持开放。")
             try:
@@ -1986,18 +2015,6 @@ class ModerationController:
         return actor
 
     @staticmethod
-    def _inactive_days(arguments: tuple[str, ...]) -> int | None:
-        if len(arguments) > 1:
-            return None
-        if not arguments:
-            return INACTIVE_MIN_DAYS
-        try:
-            days = int(arguments[0])
-        except ValueError:
-            return None
-        return days if INACTIVE_MIN_DAYS <= days <= INACTIVE_MAX_DAYS else None
-
-    @staticmethod
     def _member_activity_stamp(activity: MemberActivity) -> str:
         return max(
             activity.first_observed_at,
@@ -2005,129 +2022,140 @@ class ModerationController:
             activity.last_membership_at or activity.first_observed_at,
         )
 
-    async def _inactive_candidates(
-        self,
-        chat_id: int,
-        *,
-        cutoff: str,
-    ) -> tuple[MemberActivity, ...]:
-        observed = await self.storage.inactive_member_candidates(
-            chat_id,
-            cutoff=cutoff,
-            limit=INACTIVE_CLEANUP_LIMIT * 5,
-        )
-        eligible: list[MemberActivity] = []
-        for activity in observed:
-            if activity.user_id in self.settings.authorized_admin_ids:
-                continue
-            is_admin, is_trusted = await asyncio.gather(
-                self.admins.cached_is_admin(chat_id, activity.user_id),
-                self.storage.is_trusted(chat_id, activity.user_id),
-            )
-            # An unknown administrator state is never safe to clean.
-            if is_admin is not False or is_trusted:
-                continue
-            eligible.append(activity)
-            if len(eligible) >= INACTIVE_CLEANUP_LIMIT:
-                break
-        return tuple(eligible)
-
-    async def inactive_members(self, message: Message) -> None:
-        actor = await self._private_member_admin(message, restrict=False)
-        if actor is None:
-            return
-        arguments = command_arguments(message)
-        days = self._inactive_days(arguments)
-        if days is None:
-            await message.answer("用法：<code>/inactive [30-365]</code>")
-            return
-        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
-        candidates = await self._inactive_candidates(actor[2], cutoff=cutoff)
-        if not candidates:
-            await message.answer(
-                f"<b>{days} 天未发言候选（0）</b>\n"
-                "当前没有满足条件的已观察成员。\n\n"
-                "群内活动不代表 Telegram 最后上线；机器人无法读取用户最后上线时间，"
-                "也无法枚举接入前的历史成员。"
-            )
-            return
-        lines = [
-            f"<code>{item.user_id}</code>｜最后群内活动 "
-            f"{action_time(self._member_activity_stamp(item))}"
-            for item in candidates
-        ]
-        await message.answer(
-            f"<b>{days} 天未发言候选（{len(candidates)}）</b>\n"
-            + "\n".join(lines)
-            + "\n\n群内活动不代表 Telegram 最后上线；清理前还会重新核验身份和最新活动。"
-        )
-
-    def _prune_inactive_cleanup_plans(self) -> None:
+    def _prune_member_cleanup_plans(self) -> None:
         now = time.monotonic()
-        for key, plan in tuple(self._inactive_cleanup_plans.items()):
+        for key, plan in tuple(self._member_cleanup_plans.items()):
             if plan.expires_at <= now:
-                self._inactive_cleanup_plans.pop(key, None)
+                self._member_cleanup_plans.pop(key, None)
 
-    def _new_inactive_confirmation_code(self, actor_id: int) -> str:
+    def _new_member_confirmation_code(self, actor_id: int) -> str:
         while True:
             code = secrets.token_hex(3).upper()
-            if (actor_id, code) not in self._inactive_cleanup_plans:
+            if (actor_id, code) not in self._member_cleanup_plans:
                 return code
 
-    async def cleanup_inactive(self, message: Message) -> None:
+    @staticmethod
+    def _member_reason_text(candidate: MemberCandidate) -> str:
+        labels = {
+            REASON_DELETED: "已注销",
+            REASON_OFFLINE: "精确离线超过 30 天",
+            REASON_LAST_MONTH: "上月上线（模糊）",
+            REASON_SILENT: "30 天无发言",
+        }
+        return "、".join(labels[reason] for reason in candidate.reasons)
+
+    async def _delete_members(self, message: Message, arguments: tuple[str, ...]) -> None:
         actor = await self._private_member_admin(message, restrict=True)
         if actor is None:
             return
-        self._prune_inactive_cleanup_plans()
-        arguments = command_arguments(message)
+        self._prune_member_cleanup_plans()
         if len(arguments) == 2 and arguments[1].casefold() == "confirm":
             code = arguments[0].upper()
-            plan = self._inactive_cleanup_plans.pop((actor[0], code), None)
+            plan = self._member_cleanup_plans.pop((actor[0], code), None)
             if plan is None or plan.expires_at <= time.monotonic():
                 await message.answer("确认码无效或已过期；请重新生成清理计划。")
                 return
-            await self._execute_inactive_cleanup(message, plan)
+            await self._execute_member_cleanup(message, plan)
             return
-
-        days = self._inactive_days(arguments)
-        if days is None:
+        if arguments:
             await message.answer(
-                "用法：<code>/cleanupinactive [30-365]</code>\n"
-                "确认：<code>/cleanupinactive 确认码 confirm</code>"
+                "用法：<code>/del members</code>\n确认：<code>/del members 确认码 confirm</code>"
             )
             return
-        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
-        candidates = await self._inactive_candidates(actor[2], cutoff=cutoff)
-        if not candidates:
+        preview_started_at = datetime.now(UTC).replace(microsecond=0)
+        cutoff = preview_started_at - timedelta(days=MEMBER_CLEANUP_DAYS)
+        try:
+            result = await self.member_scanner.scan(actor[2], cutoff=cutoff)
+        except MemberScanError as exc:
+            await message.answer(f"成员扫描失败：{html.escape(str(exc))}")
+            return
+        eligible: list[MemberCandidate] = []
+        for candidate in result.candidates:
+            is_admin, is_trusted = await asyncio.gather(
+                self.admins.cached_is_admin(actor[2], candidate.user_id),
+                self.storage.is_trusted(actor[2], candidate.user_id),
+            )
+            if is_admin is not False or is_trusted:
+                continue
+            eligible.append(candidate)
+        if not eligible:
             await message.answer(
-                f"没有可清理的 {days} 天未发言成员。\n群内活动不代表 Telegram 最后上线。"
+                f"成员扫描完成：共核验 {result.participants_scanned} 人，没有清理候选。"
+                + (
+                    "\n群历史读取不完整，本次未使用“30 天无发言”条件。"
+                    if not result.history_complete
+                    else ""
+                )
             )
             return
-        for key in tuple(self._inactive_cleanup_plans):
+        selected = tuple(eligible[:INACTIVE_CLEANUP_LIMIT])
+        for key in tuple(self._member_cleanup_plans):
             if key[0] == actor[0]:
-                self._inactive_cleanup_plans.pop(key, None)
-        code = self._new_inactive_confirmation_code(actor[0])
-        plan = PendingInactiveCleanup(
+                self._member_cleanup_plans.pop(key, None)
+        code = self._new_member_confirmation_code(actor[0])
+        plan = PendingMemberCleanup(
             actor_id=actor[0],
             chat_id=actor[2],
-            days=days,
             cutoff=cutoff,
-            members=tuple((item.user_id, self._member_activity_stamp(item)) for item in candidates),
+            created_at=preview_started_at,
+            members=selected,
             expires_at=time.monotonic() + INACTIVE_CONFIRM_TTL_SECONDS,
         )
-        self._inactive_cleanup_plans[(actor[0], code)] = plan
+        self._member_cleanup_plans[(actor[0], code)] = plan
+        lines = [
+            f"<code>{candidate.user_id}</code>｜{self._member_reason_text(candidate)}"
+            for candidate in selected
+        ]
         await message.answer(
-            f"已生成清理计划：{len(plan.members)} 人，阈值 {days} 天。\n"
-            "机器人会再次核验管理员、机器人、可信用户、成员状态和最新群内活动。\n"
-            "群内活动不代表 Telegram 最后上线。\n"
-            f"10 分钟内发送：<code>/cleanupinactive {code} confirm</code>"
+            f"<b>成员清理预览（{len(selected)}/{len(eligible)}）</b>\n"
+            + "\n".join(lines)
+            + (
+                "\n\n群历史读取不完整，本次未使用“30 天无发言”条件。"
+                if not result.history_complete
+                else ""
+            )
+            + "\n\n清理前会再次核验管理员、机器人、可信用户、成员状态和新增群活动。"
+            + (
+                "\n候选超过 50 人，本次只处理排序最前的 50 人。"
+                if len(eligible) > INACTIVE_CLEANUP_LIMIT
+                else ""
+            )
+            + f"\n10 分钟内发送：<code>/del members {code} confirm</code>"
         )
 
-    async def _execute_inactive_cleanup(
+    @staticmethod
+    def _member_candidate_still_matches(
+        candidate: MemberCandidate,
+        *,
+        current_status_reason: str | None,
+        current_deleted: bool,
+        recently_active: bool,
+    ) -> bool:
+        if recently_active:
+            return False
+        status_reasons = {REASON_OFFLINE, REASON_LAST_MONTH}
+        deleted_match = REASON_DELETED in candidate.reasons and current_deleted
+        status_match = bool(status_reasons.intersection(candidate.reasons)) and (
+            current_status_reason in status_reasons
+        )
+        silent_match = REASON_SILENT in candidate.reasons
+        return deleted_match or status_match or silent_match
+
+    async def _execute_member_cleanup(
         self,
         message: Message,
-        plan: PendingInactiveCleanup,
+        plan: PendingMemberCleanup,
     ) -> None:
+        try:
+            current_states, active_since_preview = await self.member_scanner.current_members(
+                plan.chat_id,
+                cutoff=plan.cutoff,
+                activity_since=plan.created_at,
+                user_ids=frozenset(candidate.user_id for candidate in plan.members),
+            )
+        except MemberScanError as exc:
+            await message.answer(f"成员复核失败，未执行清理：{html.escape(str(exc))}")
+            return
         cleaned = 0
         skipped = 0
         failed = 0
@@ -2135,7 +2163,8 @@ class ModerationController:
         not_processed = 0
         admin_statuses = {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR}
         absent_statuses = {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}
-        for index, (user_id, expected_activity) in enumerate(plan.members):
+        for index, candidate in enumerate(plan.members):
+            user_id = candidate.user_id
             async with self._member_action_lock(plan.chat_id, user_id):
                 activity, is_trusted = await asyncio.gather(
                     self.storage.member_activity(plan.chat_id, user_id),
@@ -2162,15 +2191,27 @@ class ModerationController:
                     )
                     failed += 1
                     continue
+                state = current_states.get(user_id)
+                recently_active = user_id in active_since_preview or (
+                    activity is not None
+                    and self._member_activity_stamp(activity)
+                    >= plan.created_at.isoformat(timespec="seconds")
+                )
                 if (
-                    activity is None
-                    or self._member_activity_stamp(activity) != expected_activity
-                    or self._member_activity_stamp(activity) >= plan.cutoff
-                    or activity.last_status in {"left", "kicked"}
+                    state is None
+                    or state.administrator
+                    or state.bot
+                    or (activity is not None and activity.last_status in {"left", "kicked"})
                     or user_id in self.settings.authorized_admin_ids
                     or is_trusted
                     or member.status in admin_statuses | absent_statuses
                     or getattr(getattr(member, "user", None), "is_bot", False)
+                    or not self._member_candidate_still_matches(
+                        candidate,
+                        current_status_reason=state.status_reason,
+                        current_deleted=state.deleted,
+                        recently_active=recently_active,
+                    )
                 ):
                     skipped += 1
                     continue
@@ -2241,7 +2282,7 @@ class ModerationController:
                 if unban_failed
                 else ""
             )
-            + "本次依据为机器人观察到的群内活动，不是 Telegram 最后上线时间。"
+            + "本次候选依据为 Telegram 账号状态或最近 30 天群内发言。"
         )
 
     async def moderate_message(self, message: Message) -> None:
