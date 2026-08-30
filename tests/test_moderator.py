@@ -91,8 +91,11 @@ class FakeBot:
 
 
 class RaffleBot(FakeBot):
-    def __init__(self, *, pin_result: bool = True) -> None:
-        super().__init__(admin_ids={7})
+    def __init__(self, *, pin_result: bool = True, anonymous_admin: bool = False) -> None:
+        super().__init__(
+            admin_ids=set() if anonymous_admin else {7},
+            anonymous_admin_ids={7} if anonymous_admin else set(),
+        )
         self.pin_result = pin_result
         self.pinned: list[tuple[int, int, bool]] = []
         self.unpinned: list[tuple[int, int]] = []
@@ -525,6 +528,42 @@ async def test_raffle_keyword_join_is_exact_deletes_source_and_confirms(
     assert await storage.raffle_entry_ids(raffle.id) == (42,)
     assert bot.deleted[-1] == (-100, 7)
     assert bot.sent[-1] == (-100, "你已参加过，本次不重复登记。")
+
+
+async def test_unique_authorized_anonymous_admin_can_join_keyword_raffle(
+    tmp_path: Path, storage: Storage
+) -> None:
+    bot = RaffleBot(anonymous_admin=True)
+    controller = ModerationController(
+        bot,
+        settings(tmp_path, authorized_admin_ids=frozenset({7})),  # type: ignore[arg-type]
+        storage,
+    )
+    raffle = await storage.create_raffle(
+        chat_id=-100,
+        creator_id=7,
+        keyword="参与",
+        prize="GiftPass",
+        winner_count=1,
+        ends_at="2099-01-01T00:00:00+00:00",
+    )
+    assert await storage.set_raffle_message(raffle.id, 88)
+    assert await storage.activate_raffle(raffle.id)
+    anonymous = Message(
+        message_id=9,
+        date=datetime.now(UTC),
+        chat=Chat(id=-100, type=ChatType.SUPERGROUP, title="Test"),
+        from_user=User(id=1087968824, is_bot=True, first_name="GroupAnonymousBot"),
+        sender_chat=Chat(id=-100, type=ChatType.SUPERGROUP, title="Test"),
+        text="参与",
+    )
+
+    assert await controller._raffle_keyword_message(anonymous)
+    await controller.join_lottery_keyword(anonymous)
+
+    assert await storage.raffle_entry_ids(raffle.id) == (7,)
+    assert bot.deleted == [(-100, 9)]
+    assert bot.sent[-1] == (-100, "已参加抽奖，当前 1 人。")
 
 
 @pytest.mark.parametrize("operation", ("end", "cancel"))
