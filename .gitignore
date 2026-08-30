@@ -10,6 +10,10 @@ htmlcov/
 *.db
 *.db-shm
 *.db-wal
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
 data/
 dist/
 build/

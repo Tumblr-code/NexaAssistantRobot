@@ -85,7 +85,6 @@ class Settings:
     block_forwards: bool
     block_channel_mentions: bool
     warn_limit: int
-    default_mute_seconds: int
     notice_ttl_seconds: int
     flood_window_seconds: int
     flood_max_messages: int
@@ -139,10 +138,6 @@ class Settings:
             raise ValueError("LOG_CHAT_ID 必须是整数") from exc
 
         warn_limit = _integer("WARN_LIMIT", 3, minimum=1)
-        mute_seconds = _integer("DEFAULT_MUTE_SECONDS", 3600, minimum=60)
-        if mute_seconds > 366 * 24 * 60 * 60:
-            raise ValueError("DEFAULT_MUTE_SECONDS 不能超过 366 天")
-
         ai_enabled = _boolean("AI_ENABLED", False)
         openai_base_url = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
         openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -200,7 +195,6 @@ class Settings:
             block_forwards=_boolean("BLOCK_FORWARDS", False),
             block_channel_mentions=_boolean("BLOCK_CHANNEL_MENTIONS", False),
             warn_limit=warn_limit,
-            default_mute_seconds=mute_seconds,
             notice_ttl_seconds=_integer("NOTICE_TTL_SECONDS", 30),
             flood_window_seconds=_integer("FLOOD_WINDOW_SECONDS", 8, minimum=1),
             flood_max_messages=_integer("FLOOD_MAX_MESSAGES", 6, minimum=1),

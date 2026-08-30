@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import shlex
 from dataclasses import dataclass
 
 from aiogram.types import Message, User
-
-from nexa_guardian.detection import parse_duration
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,24 +23,6 @@ def command_payload(message: Message) -> str:
     return parts[1].strip() if len(parts) == 2 else ""
 
 
-def batch_items(message: Message, *, limit: int = 20) -> tuple[str, ...]:
-    payload = command_payload(message).translate(
-        str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
-    )
-    lexer = shlex.shlex(payload, posix=True)
-    lexer.commenters = ""
-    lexer.whitespace += ",，"
-    lexer.whitespace_split = True
-    try:
-        parsed = tuple(lexer)
-    except ValueError as exc:
-        raise ValueError("拦截词引号未闭合，请补全后重试") from exc
-    items = tuple(dict.fromkeys(item.strip() for item in parsed if item.strip()))
-    if len(items) > limit:
-        raise ValueError(f"每次最多处理 {limit} 条")
-    return items
-
-
 def resolve_target(message: Message) -> CommandTarget:
     arguments = command_arguments(message)
     reply = message.reply_to_message
@@ -58,12 +37,3 @@ def resolve_target(message: Message) -> CommandTarget:
     if user_id <= 0:
         raise ValueError("用户 ID 必须是正整数")
     return CommandTarget(user_id, None, arguments[1:])
-
-
-def duration_from(arguments: tuple[str, ...], *, default_seconds: int) -> int:
-    if not arguments:
-        return default_seconds
-    first = arguments[0]
-    if first[:1].isdigit():
-        return parse_duration(first)
-    return default_seconds

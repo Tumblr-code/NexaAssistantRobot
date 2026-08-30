@@ -12,6 +12,7 @@ from aiogram.methods import BanChatMember, UnbanChatMember
 
 from nexa_guardian.admin import AdminRights
 from nexa_guardian.config import Settings
+from nexa_guardian.member_activity import MemberActivityTracker
 from nexa_guardian.member_cleanup import (
     REASON_DELETED,
     REASON_LAST_MONTH,
@@ -21,11 +22,11 @@ from nexa_guardian.member_cleanup import (
     MemberScanResult,
     MemberState,
 )
-from nexa_guardian.moderator import (
-    ModerationController,
+from nexa_guardian.member_cleanup_service import (
     PendingMemberCleanup,
     telegram_call_with_bounded_retry,
 )
+from nexa_guardian.moderator import ModerationController
 from nexa_guardian.storage import Storage
 
 ADMIN_ID = 7
@@ -85,7 +86,6 @@ class FakeScanner:
         self.history_complete = True
         self.scan_error: Exception | None = None
         self.active_since_preview: frozenset[int] = frozenset()
-        self.activity_during_preview_at: datetime | None = None
         self.current = {
             candidate.user_id: MemberState(
                 user_id=candidate.user_id,
@@ -123,11 +123,6 @@ class FakeScanner:
         assert chat_id == GROUP_ID
         assert activity_since > cutoff
         active_ids = self.active_since_preview.intersection(user_ids)
-        if (
-            self.activity_during_preview_at is not None
-            and activity_since <= self.activity_during_preview_at
-        ):
-            active_ids = active_ids.union(user_ids)
         return (
             {user_id: self.current[user_id] for user_id in user_ids if user_id in self.current},
             active_ids,
@@ -147,7 +142,6 @@ def settings(tmp_path: Path) -> Settings:
         block_forwards=False,
         block_channel_mentions=False,
         warn_limit=3,
-        default_mute_seconds=3600,
         notice_ttl_seconds=0,
         flood_window_seconds=8,
         flood_max_messages=6,
@@ -172,6 +166,18 @@ def command(text: str, *, private: bool = True, user_id: int = ADMIN_ID) -> Simp
     )
 
 
+def response_text(message: SimpleNamespace) -> str:
+    progress = message.answer.return_value
+    if progress.edit_text.await_args is not None:
+        return str(progress.edit_text.await_args.args[0])
+    return str(message.answer.await_args.args[0])
+
+
+def install_scanner(controller: ModerationController, scanner: FakeScanner) -> None:
+    controller.member_scanner = scanner  # type: ignore[assignment]
+    controller.member_cleanup.scanner = scanner  # type: ignore[assignment]
+
+
 @pytest.fixture
 async def storage(tmp_path: Path):
     instance = Storage(tmp_path / "guardian.db")
@@ -189,21 +195,46 @@ def candidate(user_id: int, *reasons: str) -> MemberCandidate:
     )
 
 
+async def add_trusted(storage: Storage, user_id: int) -> None:
+    await storage.db.execute(
+        "INSERT INTO trusted_users VALUES (?, ?, ?, ?)",
+        (GROUP_ID, user_id, ADMIN_ID, datetime.now(UTC).isoformat()),
+    )
+    await storage.db.commit()
+
+
+async def create_active_raffle(storage: Storage, *entry_ids: int) -> int:
+    raffle = await storage.create_raffle(
+        chat_id=GROUP_ID,
+        creator_id=ADMIN_ID,
+        keyword="参与",
+        prize="测试奖品",
+        winner_count=1,
+        ends_at=(datetime.now(UTC) + timedelta(days=1)).isoformat(),
+    )
+    assert await storage.set_raffle_message(raffle.id, 500)
+    assert await storage.activate_raffle(raffle.id)
+    for user_id in entry_ids:
+        joined, _count = await storage.join_raffle(raffle.id, user_id)
+        assert joined
+    return raffle.id
+
+
 async def test_del_members_is_private_only_and_requires_restrict_right(
     tmp_path: Path,
     storage: Storage,
 ) -> None:
     controller = ModerationController(MemberCleanupBot(), settings(tmp_path), storage)  # type: ignore[arg-type]
-    controller.member_scanner = FakeScanner((candidate(101, REASON_DELETED),))  # type: ignore[assignment]
+    install_scanner(controller, FakeScanner((candidate(101, REASON_DELETED),)))
 
     group = command("/del members", private=False)
     await controller.delete_replied(group)  # type: ignore[arg-type]
-    assert "私聊" in group.answer.await_args.args[0]
+    assert "私聊" in response_text(group)
 
     controller.admins.rights = AsyncMock(return_value=AdminRights(True, True, False))
     denied = command("/del members")
     await controller.delete_replied(denied)  # type: ignore[arg-type]
-    assert "封禁/限制成员" in denied.answer.await_args.args[0]
+    assert "封禁/限制成员" in response_text(denied)
 
 
 async def test_del_members_preview_creates_confirmation_and_reports_degraded_history(
@@ -218,14 +249,14 @@ async def test_del_members_preview_creates_confirmation_and_reports_degraded_his
         )
     )
     scanner.history_complete = False
-    controller.member_scanner = scanner  # type: ignore[assignment]
+    install_scanner(controller, scanner)
     preview = command("/del members")
 
     await controller.delete_replied(preview)  # type: ignore[arg-type]
 
-    text = preview.answer.await_args.args[0]
+    text = response_text(preview)
     assert "101" in text and "已注销" in text
-    assert "102" in text and "上月上线（模糊）" in text
+    assert "102" in text and "Telegram 模糊状态：约一周至一个月" in text
     assert "未使用“30 天无发言”条件" in text
     assert re.search(r"/del members [A-F0-9]{6} confirm", text)
 
@@ -237,77 +268,93 @@ async def test_del_members_scan_failure_does_not_create_plan(
     controller = ModerationController(MemberCleanupBot(), settings(tmp_path), storage)  # type: ignore[arg-type]
     scanner = FakeScanner(())
     scanner.scan_error = MemberScanError("未配置")
-    controller.member_scanner = scanner  # type: ignore[assignment]
+    install_scanner(controller, scanner)
     message = command("/del members")
 
     await controller.delete_replied(message)  # type: ignore[arg-type]
 
-    assert "成员扫描失败" in message.answer.await_args.args[0]
-    assert controller._member_cleanup_plans == {}
+    assert "成员扫描失败" in response_text(message)
+    assert controller.member_cleanup._plans == {}
 
 
 async def test_del_members_limits_plan_and_rejects_expired_confirmation(
     tmp_path: Path,
     storage: Storage,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = {"now": 100.0}
-    monkeypatch.setattr("nexa_guardian.moderator.time.monotonic", lambda: clock["now"])
     bot = MemberCleanupBot()
     controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
-    controller.member_scanner = FakeScanner(
-        tuple(candidate(user_id, REASON_DELETED) for user_id in range(100, 155))
-    )  # type: ignore[assignment]
+    tracker = MemberActivityTracker(
+        default_ttl_seconds=600,
+        clock=lambda: clock["now"],
+    )
+    controller.member_cleanup.activity = tracker
+    controller.member_activity_tracker = tracker
+    install_scanner(
+        controller,
+        FakeScanner(tuple(candidate(user_id, REASON_DELETED) for user_id in range(100, 155))),
+    )
     preview = command("/del members")
     await controller.delete_replied(preview)  # type: ignore[arg-type]
-    text = preview.answer.await_args.args[0]
+    text = response_text(preview)
     code = re.search(r"/del members ([A-F0-9]{6}) confirm", text)
     assert code is not None
     assert "（50/55）" in text
-    assert len(next(iter(controller._member_cleanup_plans.values())).members) == 50
+    assert len(next(iter(controller.member_cleanup._plans.values())).members) == 50
 
     wrong = command("/del members BAD999 confirm")
     await controller.delete_replied(wrong)  # type: ignore[arg-type]
-    assert "无效或已过期" in wrong.answer.await_args.args[0]
+    assert "无效或已过期" in response_text(wrong)
 
     clock["now"] = 701.0
     expired = command(f"/del members {code.group(1)} confirm")
     await controller.delete_replied(expired)  # type: ignore[arg-type]
-    assert "无效或已过期" in expired.answer.await_args.args[0]
+    assert "无效或已过期" in response_text(expired)
     assert bot.banned == []
 
 
 async def test_del_members_confirmation_rechecks_and_kicks_only_safe_targets(
     tmp_path: Path,
     storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bot = MemberCleanupBot()
     controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
     scanner = FakeScanner(
-        tuple(candidate(user_id, REASON_DELETED) for user_id in (101, 102, 103, 104, 105))
+        tuple(candidate(user_id, REASON_DELETED) for user_id in (101, 102, 103, 104, 105, 106))
     )
-    controller.member_scanner = scanner  # type: ignore[assignment]
+    install_scanner(controller, scanner)
+    await add_trusted(storage, 105)
+    raffle_id = await create_active_raffle(storage, 104)
+    trusted_lookup = AsyncMock(wraps=storage.trusted_user_ids)
+    monkeypatch.setattr(storage, "trusted_user_ids", trusted_lookup)
     preview = command("/del members")
     await controller.delete_replied(preview)  # type: ignore[arg-type]
-    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview.answer.await_args.args[0])
+    preview_text = response_text(preview)
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview_text)
     assert code is not None
+    assert "<code>104</code>" not in preview_text
+    assert "<code>105</code>" not in preview_text
+    plan = next(iter(controller.member_cleanup._plans.values()))
+    assert {item.user_id for item in plan.members} == {101, 102, 103, 106}
 
-    scanner.current[102] = MemberState(102, True, True, False, None, None, None)
     scanner.current[103] = MemberState(103, True, False, True, None, None, None)
-    bot.members[104] = (ChatMemberStatus.LEFT, False)
-    await storage.add_trusted_user(GROUP_ID, 105, ADMIN_ID)
+    await add_trusted(storage, 102)
+    assert await storage.join_raffle(raffle_id, 101) == (True, 2)
     confirm = command(f"/del members {code.group(1)} confirm")
 
     await controller.delete_replied(confirm)  # type: ignore[arg-type]
 
-    assert bot.banned == [(GROUP_ID, 101, False)]
-    assert bot.unbanned == [(GROUP_ID, 101, True)]
-    assert "已移出 1" in confirm.answer.await_args.args[0]
+    assert bot.banned == [(GROUP_ID, 106, False)]
+    assert bot.unbanned == [(GROUP_ID, 106, True)]
+    assert "已移出 1" in response_text(confirm)
+    assert "跳过 3" in response_text(confirm)
+    assert trusted_lookup.await_count == 2
     rows = await storage.db.execute_fetchall(
         "SELECT action, actor_id, target_id, reason FROM moderation_log "
-        "WHERE action = 'cleanup_inactive'"
+        "WHERE action = 'member_cleanup'"
     )
-    assert [(row[0], row[1], row[2]) for row in rows] == [("cleanup_inactive", ADMIN_ID, 101)]
+    assert [(row[0], row[1], row[2]) for row in rows] == [("member_cleanup", ADMIN_ID, 106)]
     assert all(not row[3] for row in rows)
 
 
@@ -317,20 +364,27 @@ async def test_del_members_skips_member_active_after_preview(
 ) -> None:
     bot = MemberCleanupBot()
     controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
-    controller.member_scanner = FakeScanner(  # type: ignore[assignment]
-        (candidate(101, REASON_LAST_MONTH, REASON_SILENT),)
+    install_scanner(
+        controller,
+        FakeScanner((candidate(101, REASON_LAST_MONTH, REASON_SILENT),)),
     )
     preview = command("/del members")
     await controller.delete_replied(preview)  # type: ignore[arg-type]
-    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview.answer.await_args.args[0])
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", response_text(preview))
     assert code is not None
-    await storage.record_member_message(GROUP_ID, 101, observed_at=datetime.now(UTC).isoformat())
+    assert controller.member_cleanup.activity.note(
+        GROUP_ID,
+        101,
+        observed_at=datetime.now(UTC),
+    )
 
     confirm = command(f"/del members {code.group(1)} confirm")
     await controller.delete_replied(confirm)  # type: ignore[arg-type]
 
     assert bot.banned == []
-    assert "跳过 1" in confirm.answer.await_args.args[0]
+    assert "跳过 1" in response_text(confirm)
+    rows = await storage.db.execute_fetchall("SELECT * FROM member_activity")
+    assert rows == []
 
 
 async def test_del_members_uses_mtproto_activity_recheck_after_preview(
@@ -340,10 +394,10 @@ async def test_del_members_uses_mtproto_activity_recheck_after_preview(
     bot = MemberCleanupBot()
     controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
     scanner = FakeScanner((candidate(101, REASON_LAST_MONTH),))
-    controller.member_scanner = scanner  # type: ignore[assignment]
+    install_scanner(controller, scanner)
     preview = command("/del members")
     await controller.delete_replied(preview)  # type: ignore[arg-type]
-    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview.answer.await_args.args[0])
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", response_text(preview))
     assert code is not None
     scanner.active_since_preview = frozenset({101})
 
@@ -351,7 +405,37 @@ async def test_del_members_uses_mtproto_activity_recheck_after_preview(
     await controller.delete_replied(confirm)  # type: ignore[arg-type]
 
     assert bot.banned == []
-    assert "跳过 1" in confirm.answer.await_args.args[0]
+    assert "跳过 1" in response_text(confirm)
+
+
+async def test_del_members_skips_silent_candidate_who_rejoined_after_preview(
+    tmp_path: Path,
+    storage: Storage,
+) -> None:
+    bot = MemberCleanupBot()
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    scanner = FakeScanner((candidate(101, REASON_SILENT),))
+    install_scanner(controller, scanner)
+    preview = command("/del members")
+    await controller.delete_replied(preview)  # type: ignore[arg-type]
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", response_text(preview))
+    assert code is not None
+    current = scanner.current[101]
+    scanner.current[101] = MemberState(
+        user_id=current.user_id,
+        deleted=current.deleted,
+        bot=current.bot,
+        administrator=current.administrator,
+        joined_at=datetime.now(UTC),
+        status_reason=current.status_reason,
+        last_online_at=current.last_online_at,
+    )
+
+    confirm = command(f"/del members {code.group(1)} confirm")
+    await controller.delete_replied(confirm)  # type: ignore[arg-type]
+
+    assert bot.banned == []
+    assert "跳过 1" in response_text(confirm)
 
 
 async def test_del_members_recheck_window_starts_before_initial_scan(
@@ -370,27 +454,24 @@ async def test_del_members_recheck_window_starts_before_initial_scan(
     class GapScanner(FakeScanner):
         async def scan(self, chat_id: int, *, cutoff: datetime) -> MemberScanResult:
             result = await super().scan(chat_id, cutoff=cutoff)
-            self.activity_during_preview_at = started_at + timedelta(seconds=1)
+            assert controller.member_cleanup.activity.note(
+                GROUP_ID,
+                101,
+                observed_at=started_at + timedelta(seconds=1),
+            )
             clock["now"] = started_at + timedelta(seconds=5)
             return result
 
-    monkeypatch.setattr("nexa_guardian.moderator.datetime", FakeDateTime)
+    monkeypatch.setattr("nexa_guardian.member_cleanup_service.datetime", FakeDateTime)
     bot = MemberCleanupBot()
     controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
     scanner = GapScanner((candidate(101, REASON_LAST_MONTH),))
-    controller.member_scanner = scanner  # type: ignore[assignment]
+    install_scanner(controller, scanner)
     preview = command("/del members")
     await controller.delete_replied(preview)  # type: ignore[arg-type]
-    plan = next(iter(controller._member_cleanup_plans.values()))
-    assert plan.created_at == started_at
-    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview.answer.await_args.args[0])
-    assert code is not None
-
-    confirm = command(f"/del members {code.group(1)} confirm")
-    await controller.delete_replied(confirm)  # type: ignore[arg-type]
-
+    assert controller.member_cleanup._plans == {}
     assert bot.banned == []
-    assert "跳过 1" in confirm.answer.await_args.args[0]
+    assert "没有清理候选" in response_text(preview)
 
 
 async def test_del_members_stops_after_unban_failure(
@@ -405,20 +486,21 @@ async def test_del_members_stops_after_unban_failure(
         )
     )
     controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
-    controller.member_scanner = FakeScanner(
-        (candidate(101, REASON_DELETED), candidate(102, REASON_DELETED))
-    )  # type: ignore[assignment]
+    install_scanner(
+        controller,
+        FakeScanner((candidate(101, REASON_DELETED), candidate(102, REASON_DELETED))),
+    )
     preview = command("/del members")
     await controller.delete_replied(preview)  # type: ignore[arg-type]
-    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview.answer.await_args.args[0])
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", response_text(preview))
     assert code is not None
 
     confirm = command(f"/del members {code.group(1)} confirm")
     await controller.delete_replied(confirm)  # type: ignore[arg-type]
 
     assert bot.banned == [(GROUP_ID, 101, False)]
-    assert "解除封禁失败" in confirm.answer.await_args.args[0]
-    assert "未继续处理 1" in confirm.answer.await_args.args[0]
+    assert "解除封禁失败" in response_text(confirm)
+    assert "未继续处理 1" in response_text(confirm)
 
 
 async def test_member_cleanup_and_permanent_ban_are_serialized(
@@ -466,17 +548,34 @@ async def test_member_cleanup_and_permanent_ban_are_serialized(
     bot = BlockingBot()
     controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
     member = candidate(101, REASON_DELETED)
-    controller.member_scanner = FakeScanner((member,))  # type: ignore[assignment]
+    install_scanner(controller, FakeScanner((member,)))
+    created_at = datetime.now(UTC)
+    activity_session = controller.member_cleanup.activity.begin(
+        actor_id=ADMIN_ID,
+        chat_id=GROUP_ID,
+        cutoff=created_at - timedelta(days=30),
+        created_at=created_at,
+    )
+    controller.member_cleanup.activity.bind(
+        activity_session,
+        confirmation_code="ABC123",
+        candidate_ids=(member.user_id,),
+    )
+    activity_plan = controller.member_cleanup.activity.start_execution(
+        actor_id=ADMIN_ID,
+        confirmation_code="ABC123",
+    )
+    assert activity_plan is not None
     plan = PendingMemberCleanup(
         actor_id=ADMIN_ID,
         chat_id=GROUP_ID,
-        cutoff=datetime.now(UTC) - timedelta(days=30),
-        created_at=datetime.now(UTC),
+        cutoff=created_at - timedelta(days=30),
+        created_at=created_at,
         members=(member,),
-        expires_at=float("inf"),
+        activity_plan=activity_plan,
     )
     cleanup = asyncio.create_task(
-        controller._execute_member_cleanup(command("cleanup"), plan)  # type: ignore[arg-type]
+        controller.member_cleanup._execute(command("cleanup"), plan)  # type: ignore[arg-type]
     )
     await started.wait()
 
@@ -489,6 +588,7 @@ async def test_member_cleanup_and_permanent_ban_are_serialized(
     assert calls == [("ban", False)]
     release.set()
     await asyncio.gather(cleanup, permanent)
+    controller.member_cleanup.activity.finish(activity_plan)
 
     assert calls == [("ban", False), ("unban", True), ("ban", True)]
 

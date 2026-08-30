@@ -17,12 +17,27 @@ async def storage(tmp_path: Path):
 
 
 async def test_warning_increment_and_clear(storage: Storage) -> None:
-    assert await storage.warning_count(-100, 42) == 0
-    assert await storage.add_warning(-100, 42) == 1
-    assert await storage.add_warning(-100, 42) == 2
-    assert await storage.warning_count(-100, 42) == 2
+    empty = await storage.warning_stats(-100)
+    assert (empty.users, empty.total) == (0, 0)
+    assert await storage.add_warning_and_record_action(-100, 42) == 1
+    assert await storage.add_warning_and_record_action(-100, 42) == 2
+    assert (await storage.warning_stats(-100)).total == 2
     await storage.clear_warnings(-100, 42)
-    assert await storage.warning_count(-100, 42) == 0
+    assert (await storage.warning_stats(-100)).total == 0
+
+
+async def test_warning_stats_ignore_legacy_zero_count_rows(storage: Storage) -> None:
+    await storage.db.execute(
+        """
+        INSERT INTO warnings (chat_id, user_id, count, last_reason, updated_at)
+        VALUES (-100, 42, 0, '', '2026-08-31T00:00:00+00:00')
+        """
+    )
+    await storage.db.commit()
+
+    stats = await storage.warning_stats(-100)
+
+    assert (stats.users, stats.total) == (0, 0)
 
 
 async def test_raffle_lifecycle_is_persistent_and_idempotent(storage: Storage) -> None:
@@ -37,6 +52,9 @@ async def test_raffle_lifecycle_is_persistent_and_idempotent(storage: Storage) -
     assert await storage.set_raffle_message(raffle.id, 88)
     assert await storage.activate_raffle(raffle.id)
     assert (await storage.active_raffle(-100)).message_id == 88  # type: ignore[union-attr]
+    assert await storage.replace_active_raffle_message(raffle.id, 88, 89)
+    assert not await storage.replace_active_raffle_message(raffle.id, 88, 90)
+    assert (await storage.active_raffle(-100)).message_id == 89  # type: ignore[union-attr]
 
     assert await storage.join_raffle(raffle.id, 41) == (True, 1)
     assert await storage.join_raffle(raffle.id, 41) == (False, 1)
@@ -45,6 +63,7 @@ async def test_raffle_lifecycle_is_persistent_and_idempotent(storage: Storage) -
 
     assert await storage.finish_raffle(raffle.id, (42, 41))
     assert not await storage.finish_raffle(raffle.id, (41,))
+    assert not await storage.replace_active_raffle_message(raffle.id, 89, 90)
     winners = await storage.raffle_winners(raffle.id)
     assert [(item.position, item.user_id) for item in winners] == [(1, 42), (2, 41)]
     assert await storage.active_raffle(-100) is None
@@ -74,8 +93,45 @@ async def test_raffle_allows_only_one_running_per_chat_and_supports_reroll(
     assert await storage.activate_raffle(raffle.id)
     await storage.join_raffle(raffle.id, 41)
     assert await storage.finish_raffle(raffle.id, (41,))
-    assert await storage.add_reroll(raffle.id, (41,)) == 2
+    assert (
+        await storage.add_reroll(
+            raffle.id,
+            (41,),
+            result_delivery_stage="group_and_admin",
+        )
+        == 2
+    )
     assert (await storage.raffle_winners(raffle.id))[0].round == 2
+    pending = await storage.pending_raffle_results(chat_ids={-100})
+    assert [(item.round_number, item.stage) for item in pending] == [(2, "group_and_admin")]
+
+
+async def test_pending_raffle_results_are_sorted_by_numeric_round(storage: Storage) -> None:
+    raffle = await storage.create_raffle(
+        chat_id=-100,
+        creator_id=7,
+        keyword="参与",
+        prize="GiftPass",
+        winner_count=1,
+        ends_at="2099-01-01T00:00:00+00:00",
+    )
+    assert await storage.set_raffle_message(raffle.id, 88)
+    assert await storage.activate_raffle(raffle.id)
+    assert await storage.finish_raffle(raffle.id, ())
+    await storage.set_runtime_setting(
+        -100,
+        f"raffle_result_pending:{raffle.id}:10",
+        "group_only",
+    )
+    await storage.set_runtime_setting(
+        -100,
+        f"raffle_result_pending:{raffle.id}:2",
+        "group_only",
+    )
+
+    pending = await storage.pending_raffle_results(chat_ids={-100})
+
+    assert [item.round_number for item in pending] == [2, 10]
 
 
 def test_raffle_keyword_normalization_is_exact_and_rejects_unsafe_values() -> None:
@@ -99,11 +155,32 @@ async def test_pending_raffle_is_not_joinable_until_activated(storage: Storage) 
 
     assert raffle.publication_state == "pending"
     assert await storage.active_raffle(-100) is None
-    assert await storage.active_raffle_for_keyword(-100, "参与") is None
     assert await storage.join_raffle(raffle.id, 41) == (False, 0)
     assert await storage.set_raffle_message(raffle.id, 88)
     assert await storage.activate_raffle(raffle.id)
-    assert (await storage.active_raffle_for_keyword(-100, "参与")).id == raffle.id  # type: ignore[union-attr]
+    active = await storage.active_raffle(-100)
+    assert active is not None and active.id == raffle.id
+
+
+async def test_raffle_work_queries_are_scoped_to_allowed_chats(storage: Storage) -> None:
+    for chat_id, message_id in ((-100, 88), (-200, 99)):
+        raffle = await storage.create_raffle(
+            chat_id=chat_id,
+            creator_id=7,
+            keyword=f"join{abs(chat_id)}",
+            prize="GiftPass",
+            winner_count=1,
+            ends_at="2026-08-30T00:00:00+00:00",
+        )
+        assert await storage.set_raffle_message(raffle.id, message_id)
+        assert await storage.activate_raffle(raffle.id)
+
+    due = await storage.due_raffles(
+        "2026-08-31T00:00:00+00:00",
+        chat_ids=frozenset({-100}),
+    )
+
+    assert [raffle.chat_id for raffle in due] == [-100]
 
 
 async def test_schema_v8_migrates_finished_raffles_but_rejects_running_v7(
@@ -171,46 +248,61 @@ async def test_schema_v8_migrates_finished_raffles_but_rejects_running_v7(
 
 
 async def test_trusted_users_are_scoped_per_chat(storage: Storage) -> None:
-    await storage.add_trusted_user(-100, 42, 7)
+    await storage.db.execute(
+        "INSERT INTO trusted_users VALUES (?, ?, ?, ?)",
+        (-100, 42, 7, "2026-08-30T00:00:00+00:00"),
+    )
+    await storage.db.execute(
+        "INSERT INTO trusted_users VALUES (?, ?, ?, ?)",
+        (-100, 43, 7, "2026-08-30T00:00:00+00:00"),
+    )
+    await storage.db.commit()
     assert await storage.is_trusted(-100, 42)
     assert not await storage.is_trusted(-200, 42)
-    await storage.remove_trusted_user(-100, 42)
-    assert not await storage.is_trusted(-100, 42)
+    assert await storage.trusted_user_ids(-100) == frozenset({42, 43})
+    assert await storage.trusted_user_ids(-200) == frozenset()
 
 
 async def test_domains_and_words_are_scoped_per_chat(storage: Storage) -> None:
-    await storage.add_allowed_domain(-100, "example.com", 7)
-    await storage.add_blocked_word(-100, "加微信", 7)
+    await storage.db.execute(
+        "INSERT INTO allowed_domains VALUES (?, ?, ?, ?)",
+        (-100, "example.com", 7, "2026-08-30T00:00:00+00:00"),
+    )
+    await storage.db.execute(
+        "INSERT INTO blocked_words VALUES (?, ?, ?, ?)",
+        (-100, "加微信", 7, "2026-08-30T00:00:00+00:00"),
+    )
+    await storage.db.commit()
     assert await storage.allowed_domains(-100) == {"example.com"}
     assert await storage.blocked_words(-100) == {"加微信"}
     assert await storage.allowed_domains(-200) == set()
-    await storage.remove_allowed_domain(-100, "example.com")
-    await storage.remove_blocked_word(-100, "加微信")
-    assert await storage.allowed_domains(-100) == set()
-    assert await storage.blocked_words(-100) == set()
-
-
-async def test_batch_words_are_written_and_removed_together(storage: Storage) -> None:
-    await storage.add_blocked_words(-100, ("词语一", "guaranteed profit"), 7)
-    assert await storage.blocked_words(-100) == {"词语一", "guaranteed profit"}
-    await storage.remove_blocked_words(-100, ("词语一", "guaranteed profit"))
-    assert await storage.blocked_words(-100) == set()
 
 
 async def test_action_stats(storage: Storage) -> None:
-    await storage.record_action(chat_id=-100, action="delete")
-    await storage.record_action(chat_id=-100, action="warn")
-    await storage.record_action(chat_id=-100, action="mute")
-    await storage.record_action(chat_id=-100, action="auto_mute")
-    await storage.record_action(chat_id=-100, action="ban")
-    await storage.record_action(chat_id=-100, action="auto_ban")
+    actions = (
+        "delete",
+        "warn",
+        "ban",
+        "auto_ban",
+        "member_cleanup",
+        "cleanup_inactive",
+        "kick",
+        "member_cleanup_unban_failed",
+        "cleanup_inactive_unban_failed",
+        "kick_unban_failed",
+        "history_purge",
+        "mute",
+    )
+    for action in actions:
+        await storage.record_action(chat_id=-100, action=action)
     await storage.record_action(chat_id=-200, action="delete")
     stats = await storage.chat_stats(-100)
     assert stats.deleted == 1
     assert stats.warned == 1
-    assert stats.muted == 2
     assert stats.banned == 2
-    assert stats.total_actions == 6
+    assert stats.removed == 3
+    assert stats.cleanup_failures == 3
+    assert stats.history_purges == 1
     row = await storage.db.execute_fetchall(
         "SELECT reason FROM moderation_log WHERE chat_id = ?",
         (-100,),
@@ -218,7 +310,7 @@ async def test_action_stats(storage: Storage) -> None:
     assert {item["reason"] for item in row} == {""}
 
 
-async def test_time_filtered_stats_warning_totals_and_recent_actions(storage: Storage) -> None:
+async def test_time_filtered_stats_and_warning_totals(storage: Storage) -> None:
     await storage.record_action(chat_id=-100, action="delete", target_id=41)
     await storage.record_action(chat_id=-100, action="warn", actor_id=7, target_id=42)
     await storage.db.execute(
@@ -226,22 +318,22 @@ async def test_time_filtered_stats_warning_totals_and_recent_actions(storage: St
         ("2026-08-20T00:00:00+00:00", 41),
     )
     await storage.db.commit()
-    await storage.add_warning(-100, 42)
-    await storage.add_warning(-100, 42)
-    await storage.add_warning(-100, 43)
+    await storage.db.executemany(
+        "INSERT INTO warnings VALUES (?, ?, ?, '', ?)",
+        (
+            (-100, 42, 2, "2026-08-30T00:00:00+00:00"),
+            (-100, 43, 1, "2026-08-30T00:00:00+00:00"),
+        ),
+    )
+    await storage.db.commit()
 
     recent_stats = await storage.chat_stats(-100, since="2026-08-26T00:00:00+00:00")
     warning_stats = await storage.warning_stats(-100)
-    actions = await storage.recent_actions(-100, limit=1)
 
     assert recent_stats.deleted == 0
     assert recent_stats.warned == 1
     assert warning_stats.users == 2
     assert warning_stats.total == 3
-    assert len(actions) == 1
-    assert actions[0].action == "warn"
-    assert actions[0].actor_id == 7
-    assert actions[0].target_id == 42
 
 
 async def test_ai_schema_decisions_and_signatures(storage: Storage) -> None:
@@ -272,19 +364,27 @@ async def test_ai_schema_decisions_and_signatures(storage: Storage) -> None:
     stats = await storage.ai_stats(-100)
     assert (stats.total, stats.ads, stats.enforced, stats.failed) == (1, 1, 1, 0)
     assert stats.calls == 1
-    recent = await storage.recent_ai_decisions(-100, limit=1)
-    assert recent[0].is_ad is True
-    assert recent[0].category == "crypto_ad"
-    assert recent[0].reasoning_effort == "high"
-    assert recent[0].service_tier == "priority"
-    assert recent[0].review_path == "gateway"
+    rows = await storage.db.execute_fetchall(
+        """
+        SELECT is_ad, category, reasoning_effort, service_tier, review_path,
+               media_latency_ms, queue_latency_ms, request_latency_ms,
+               action_latency_ms, total_latency_ms, attempt_count
+        FROM ai_decisions WHERE chat_id = ?
+        """,
+        (-100,),
+    )
+    assert bool(rows[0]["is_ad"])
+    assert rows[0]["category"] == "crypto_ad"
+    assert rows[0]["reasoning_effort"] == "high"
+    assert rows[0]["service_tier"] == "priority"
+    assert rows[0]["review_path"] == "gateway"
     assert (
-        recent[0].media_latency_ms,
-        recent[0].queue_latency_ms,
-        recent[0].request_latency_ms,
-        recent[0].action_latency_ms,
-        recent[0].total_latency_ms,
-        recent[0].attempt_count,
+        rows[0]["media_latency_ms"],
+        rows[0]["queue_latency_ms"],
+        rows[0]["request_latency_ms"],
+        rows[0]["action_latency_ms"],
+        rows[0]["total_latency_ms"],
+        rows[0]["attempt_count"],
     ) == (20, 10, 250, 31, 311, 1)
 
     created = await storage.upsert_ai_signature(
@@ -479,18 +579,11 @@ async def test_runtime_and_ephemeral_queue(storage: Storage) -> None:
     assert await storage.due_ephemeral("2026-08-29T01:00:00+00:00") == ()
 
 
-async def test_ephemeral_queue_batch_ack_and_reschedule(storage: Storage) -> None:
+async def test_ephemeral_queue_tracks_independent_records(storage: Storage) -> None:
     await storage.enqueue_ephemeral(-100, 1, "2026-08-29T00:00:00+00:00")
     await storage.enqueue_ephemeral(-100, 2, "2026-08-29T00:00:00+00:00")
-    await storage.enqueue_ephemeral(-100, 3, "2026-08-29T00:00:00+00:00")
-
-    await storage.reschedule_ephemeral_many(
-        (
-            (-100, 1, "2026-08-29T00:10:00+00:00"),
-            (-100, 2, "2026-08-29T00:20:00+00:00"),
-        )
-    )
-    await storage.ack_ephemeral_many(((-100, 2), (-100, 3)))
+    await storage.reschedule_ephemeral(-100, 1, "2026-08-29T00:10:00+00:00")
+    await storage.ack_ephemeral(-100, 2)
 
     assert await storage.due_ephemeral("2026-08-29T00:05:00+00:00") == ()
     due = await storage.due_ephemeral("2026-08-29T00:15:00+00:00")
@@ -541,7 +634,7 @@ async def test_warning_action_and_log_outbox_are_atomic(storage: Storage) -> Non
             7,
             enqueue_log=True,
         )
-    assert await storage.warning_count(-100, 42) == 0
+    assert (await storage.warning_stats(-100)).total == 0
     assert await storage.db.execute_fetchall("SELECT * FROM moderation_log") == []
     assert await storage.db.execute_fetchall("SELECT * FROM log_outbox") == []
 
@@ -624,6 +717,38 @@ async def test_log_outbox_claim_lease_reschedule_and_ack(storage: Storage) -> No
     )
 
 
+async def test_queue_health_counts_due_and_retried_records(storage: Storage) -> None:
+    await storage.enqueue_ephemeral(-100, 1, "2026-08-30T00:00:00+00:00")
+    await storage.enqueue_ephemeral(-100, 2, "2026-08-31T00:00:00+00:00")
+    await storage.record_action(
+        chat_id=-100,
+        action="warn",
+        enqueue_log=True,
+        log_due_at="2026-08-30T00:00:00+00:00",
+    )
+    await storage.record_action(
+        chat_id=-100,
+        action="ban",
+        enqueue_log=True,
+        log_due_at="2026-08-31T00:00:00+00:00",
+    )
+    claimed = await storage.claim_due_log_outbox(
+        "2026-08-30T00:01:00+00:00",
+        lease_until="2026-08-30T00:02:00+00:00",
+    )
+    await storage.reschedule_log_outbox(claimed[0].id, "2026-08-30T00:03:00+00:00")
+
+    health = await storage.queue_health("2026-08-30T00:01:00+00:00")
+
+    assert (
+        health.ephemeral_total,
+        health.ephemeral_due,
+        health.log_outbox_total,
+        health.log_outbox_due,
+        health.log_outbox_retrying,
+    ) == (2, 1, 2, 0, 1)
+
+
 async def test_ai_diagnostic_counts_and_percentiles(storage: Storage) -> None:
     requests = (10, 20, 30, 40, 100)
     totals = (15, 25, 35, 45, 105)
@@ -663,9 +788,7 @@ async def test_ai_diagnostic_counts_and_percentiles(storage: Storage) -> None:
     assert (stats.total_latency_p50_ms, stats.total_latency_p95_ms) == (35, 105)
 
 
-async def test_member_activity_tracks_only_metadata_and_selects_inactive(
-    storage: Storage,
-) -> None:
+async def test_member_activity_table_remains_for_rollback_compatibility(storage: Storage) -> None:
     columns = await storage.db.execute_fetchall("PRAGMA table_info(member_activity)")
     assert [row["name"] for row in columns] == [
         "chat_id",
@@ -676,89 +799,6 @@ async def test_member_activity_tracks_only_metadata_and_selects_inactive(
         "last_status",
         "message_count",
     ]
-
-    await storage.record_member_message(
-        -100,
-        1,
-        observed_at="2026-08-01T00:00:00+00:00",
-    )
-    await storage.record_member_status(
-        -100,
-        1,
-        "member",
-        observed_at="2026-08-02T00:00:00+00:00",
-    )
-    await storage.record_member_message(
-        -100,
-        1,
-        observed_at="2026-08-03T00:00:00+00:00",
-    )
-    # Delayed updates must not rewind the latest activity or membership state.
-    await storage.record_member_message(
-        -100,
-        1,
-        observed_at="2026-07-31T00:00:00+00:00",
-    )
-    await storage.record_member_status(
-        -100,
-        1,
-        "restricted",
-        observed_at="2026-07-30T00:00:00+00:00",
-    )
-    await storage.record_member_status(
-        -100,
-        2,
-        "member",
-        observed_at="2026-08-01T12:00:00+00:00",
-    )
-    await storage.record_member_message(
-        -100,
-        3,
-        observed_at="2026-08-01T00:00:00+00:00",
-    )
-    await storage.record_member_status(
-        -100,
-        3,
-        "left",
-        observed_at="2026-08-02T00:00:00+00:00",
-    )
-    await storage.record_member_message(
-        -100,
-        4,
-        observed_at="2026-08-05T00:00:00+00:00",
-    )
-    await storage.record_member_message(
-        -100,
-        6,
-        observed_at="2026-08-01T00:00:00+00:00",
-    )
-    await storage.record_member_status(
-        -100,
-        6,
-        "member",
-        observed_at="2026-08-05T00:00:00+00:00",
-    )
-    await storage.record_member_message(
-        -200,
-        5,
-        observed_at="2026-08-01T00:00:00+00:00",
-    )
-
-    member = await storage.member_activity(-100, 1)
-    assert member is not None
-    assert member.first_observed_at == "2026-07-30T00:00:00+00:00"
-    assert member.last_message_at == "2026-08-03T00:00:00+00:00"
-    assert member.last_membership_at == "2026-08-02T00:00:00+00:00"
-    assert member.last_status == "member"
-    assert member.message_count == 3
-    assert await storage.member_activity(-100, 999) is None
-
-    candidates = await storage.inactive_member_candidates(
-        -100,
-        cutoff="2026-08-04T00:00:00+00:00",
-        limit=10,
-    )
-    assert [candidate.user_id for candidate in candidates] == [2, 1]
 
 
 async def test_ephemeral_queue_migration_removes_persisted_attempts(tmp_path: Path) -> None:
@@ -829,7 +869,10 @@ async def test_schema_v5_migrates_ai_diagnostics_and_private_activity_tables(
     await migrated.open()
     try:
         columns = await migrated.db.execute_fetchall("PRAGMA table_info(ai_decisions)")
-        recent = await migrated.recent_ai_decisions(-100, limit=1)
+        decision_count = await migrated.db.execute_fetchall(
+            "SELECT COUNT(*) AS total FROM ai_decisions WHERE chat_id = ?",
+            (-100,),
+        )
         activity_columns = await migrated.db.execute_fetchall("PRAGMA table_info(member_activity)")
         outbox_columns = await migrated.db.execute_fetchall("PRAGMA table_info(log_outbox)")
         version = await migrated.db.execute_fetchall("PRAGMA user_version")
@@ -847,7 +890,7 @@ async def test_schema_v5_migrates_ai_diagnostics_and_private_activity_tables(
         "total_latency_ms",
         "attempt_count",
     ]
-    assert recent == ()
+    assert decision_count[0]["total"] == 0
     assert [row["name"] for row in activity_columns] == [
         "chat_id",
         "user_id",
@@ -977,7 +1020,10 @@ async def test_schema_v7_clears_retired_history_but_preserves_learning_and_ephem
         confidence=0.99,
     )
     await legacy.enqueue_ephemeral(-100, 99, "2099-01-01T00:00:00+00:00")
-    await legacy.add_warning(-100, 42)
+    await legacy.db.execute(
+        "INSERT INTO warnings VALUES (?, ?, ?, '', ?)",
+        (-100, 42, 1, "2026-08-30T00:00:00+00:00"),
+    )
     await legacy.record_action(chat_id=-100, action="warn", target_id=42)
     await legacy.db.execute("PRAGMA user_version=6")
     await legacy.db.commit()
@@ -989,7 +1035,15 @@ async def test_schema_v7_clears_retired_history_but_preserves_learning_and_ephem
         assert len(await migrated.ai_learning_memory(-100)) == 1
         assert await migrated.active_ai_signatures(-100) == {"guaranteed profit"}
         assert len(await migrated.due_ephemeral("2100-01-01T00:00:00+00:00")) == 1
-        assert await migrated.warning_count(-100, 42) == 0
-        assert (await migrated.chat_stats(-100)).total_actions == 0
+        assert (await migrated.warning_stats(-100)).total == 0
+        stats = await migrated.chat_stats(-100)
+        assert (
+            stats.deleted,
+            stats.warned,
+            stats.banned,
+            stats.removed,
+            stats.cleanup_failures,
+            stats.history_purges,
+        ) == (0, 0, 0, 0, 0, 0)
     finally:
         await migrated.close()

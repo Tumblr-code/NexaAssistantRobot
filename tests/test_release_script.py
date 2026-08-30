@@ -11,9 +11,10 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     stop = script.index("for a final consistent database backup")
     raffle_check = script.index("checking raffle migration safety")
     backup = script.index("creating validated database backup")
+    session_backup = script.index("creating validated Telegram session backup")
     switch = script.index("switching current to")
     database_validation = script.index("production schema version mismatch")
-    verified_backup = script.index("running one verified database backup")
+    verified_backup = script.index("running one verified database and Telegram session backup")
     resume_timer = script.rindex('systemctl start "${BACKUP_TIMER_NAME}"')
 
     assert (
@@ -23,6 +24,7 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
         < stop
         < raffle_check
         < backup
+        < session_backup
         < switch
         < database_validation
         < verified_backup
@@ -43,6 +45,13 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     )
     assert "wait_for_backup_service_idle" in pause_block
     assert "an old-schema raffle is still running; release aborted" in script
+    assert 'readonly TELEGRAM_SESSION_PATH="/var/lib/nexa-guardian/mtproto/admin.session"' in script
+    assert "Telegram session permissions must not be wider than 0600" in script
+    assert "PRAGMA quick_check" in script[session_backup:switch]
+    assert "chmod(backup_path, 0o600)" in script[session_backup:switch]
+    assert 'sha256sum -- "${session_backup_path}"' in script[session_backup:switch]
+    assert "new backup did not create a matching database/session pair" in script
+    assert "backup permissions are not 0600" in script
 
     stop_block = script[script.index('log "stopping ${SERVICE_NAME}') : backup]
     assert stop_block.index("service_stopped=1") < stop_block.index(
@@ -81,3 +90,13 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
         script.index("switch_current_to()") : script.index("restore_previous_release()")
     ]
     assert switch_function.index("switched=1") < switch_function.index("mv -Tf")
+
+
+def test_runtime_paths_include_persistent_mtproto_session_and_backup() -> None:
+    root = Path(__file__).parents[1]
+    compose = (root / "compose.yaml").read_text(encoding="utf-8")
+    backup_unit = (root / "deploy/systemd/nexa-guardian-backup.service").read_text(encoding="utf-8")
+
+    assert "TELEGRAM_SESSION_PATH: /data/mtproto/admin" in compose
+    assert "Environment=TELEGRAM_SESSION_PATH=/var/lib/nexa-guardian/mtproto/admin" in backup_unit
+    assert "--session-path /var/lib/nexa-guardian/mtproto/admin" in backup_unit

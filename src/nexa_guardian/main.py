@@ -97,7 +97,7 @@ async def run() -> None:
             settings.dry_run,
         )
         if not settings.allowed_chat_ids:
-            logger.warning("ALLOWED_CHAT_IDS 为空：自动群管保持停用，仅可用 /chatid 和 /status")
+            logger.warning("ALLOWED_CHAT_IDS 为空：自动群管保持停用，仅可查看 /status")
         await controller.admins.warm(settings.allowed_chat_ids)
         await ephemeral.start()
         await controller.startup()

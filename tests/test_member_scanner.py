@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from telethon import types
@@ -188,3 +189,126 @@ async def test_long_flood_wait_aborts_member_scan_without_recursive_retry() -> N
 
     with pytest.raises(MemberScanError, match="超过 30 秒"):
         await scanner.scan(-100, cutoff=datetime.now(UTC) - timedelta(days=30))
+
+
+async def test_transport_failures_are_wrapped_without_private_details() -> None:
+    class BrokenSession:
+        @asynccontextmanager
+        async def connect(self, _chat_id: int):  # type: ignore[no-untyped-def]
+            raise OSError("private socket endpoint")
+            yield None, None
+
+    scanner = MemberScanner(  # type: ignore[arg-type]
+        BrokenSession(),
+        authorized_user_ids=frozenset(),
+    )
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+
+    with pytest.raises(MemberScanError, match="成员列表读取失败") as scan_error:
+        await scanner.scan(-100, cutoff=cutoff)
+    assert "private socket endpoint" not in str(scan_error.value)
+
+    with pytest.raises(MemberScanError, match="成员复核失败") as confirm_error:
+        await scanner.current_members(
+            -100,
+            cutoff=cutoff,
+            activity_since=cutoff,
+            user_ids=frozenset({1}),
+        )
+    assert "private socket endpoint" not in str(confirm_error.value)
+
+
+async def test_member_pages_share_one_flood_wait_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PagedFloodClient(FakeClient):
+        def __init__(self, users: list[Any], participants: list[Any]) -> None:
+            super().__init__(users, participants, [])
+            self.calls_by_offset: dict[int, int] = {}
+
+        async def __call__(self, request: Any) -> Any:
+            calls = self.calls_by_offset.get(request.offset, 0) + 1
+            self.calls_by_offset[request.offset] = calls
+            if (request.offset == 0 and calls == 1) or request.offset == 200:
+                raise FloodWaitError(request, capture=1)
+            start = request.offset
+            end = start + request.limit
+            return SimpleNamespace(
+                users=self.users[start:end],
+                participants=self.participants[start:end],
+                count=len(self.participants),
+            )
+
+    now = datetime.now(UTC)
+    users = [user(user_id, deleted=True) for user_id in range(1, 202)]
+    participants = [types.ChannelParticipant(item.id, now - timedelta(days=90)) for item in users]
+    client = PagedFloodClient(users, participants)
+    sleep = AsyncMock()
+    monkeypatch.setattr("nexa_guardian.member_cleanup.asyncio.sleep", sleep)
+    scanner = MemberScanner(FakeSession(client), authorized_user_ids=frozenset())  # type: ignore[arg-type]
+
+    with pytest.raises(MemberScanError, match="再次限流"):
+        await scanner.scan(-100, cutoff=now - timedelta(days=30))
+
+    sleep.assert_awaited_once_with(2)
+    assert client.calls_by_offset == {0: 2, 200: 1}
+
+
+async def test_preview_degrades_when_history_exhausts_shared_flood_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ParticipantThenHistoryFloodClient(FakeClient):
+        async def __call__(self, request: Any) -> Any:
+            self.page_calls += 1
+            if self.page_calls == 1:
+                raise FloodWaitError(request, capture=1)
+            return await super().__call__(request)
+
+        def iter_messages(self, entity: str):  # type: ignore[no-untyped-def]
+            async def iterator():  # type: ignore[no-untyped-def]
+                raise FloodWaitError(request=None, capture=1)
+                yield
+
+            return iterator()
+
+    now = datetime.now(UTC)
+    users = [user(10, deleted=True)]
+    participants = [types.ChannelParticipant(10, now - timedelta(days=90))]
+    sleep = AsyncMock()
+    monkeypatch.setattr("nexa_guardian.member_cleanup.asyncio.sleep", sleep)
+    scanner = MemberScanner(
+        FakeSession(ParticipantThenHistoryFloodClient(users, participants, [])),  # type: ignore[arg-type]
+        authorized_user_ids=frozenset(),
+    )
+
+    result = await scanner.scan(-100, cutoff=now - timedelta(days=30))
+
+    assert not result.history_complete
+    assert [(item.user_id, item.reasons) for item in result.candidates] == [(10, (REASON_DELETED,))]
+    sleep.assert_awaited_once_with(2)
+
+
+async def test_confirmation_fails_when_history_flood_wait_is_not_recoverable() -> None:
+    class FloodedHistoryClient(FakeClient):
+        def iter_messages(self, entity: str):  # type: ignore[no-untyped-def]
+            async def iterator():  # type: ignore[no-untyped-def]
+                raise FloodWaitError(request=None, capture=31)
+                yield
+
+            return iterator()
+
+    now = datetime.now(UTC)
+    users = [user(10, deleted=True)]
+    participants = [types.ChannelParticipant(10, now - timedelta(days=90))]
+    scanner = MemberScanner(
+        FakeSession(FloodedHistoryClient(users, participants, [])),  # type: ignore[arg-type]
+        authorized_user_ids=frozenset(),
+    )
+
+    with pytest.raises(MemberScanError, match="超过 30 秒"):
+        await scanner.current_members(
+            -100,
+            cutoff=now - timedelta(days=30),
+            activity_since=now - timedelta(minutes=5),
+            user_ids=frozenset({10}),
+        )

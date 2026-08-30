@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import unicodedata
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Collection, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -285,24 +285,16 @@ def _metadata_token(name: str, value: str, *, allow_empty: bool) -> str:
 class ChatStats:
     deleted: int
     warned: int
-    muted: int
     banned: int
-    total_actions: int
+    removed: int
+    cleanup_failures: int
+    history_purges: int
 
 
 @dataclass(frozen=True, slots=True)
 class WarningStats:
     users: int
     total: int
-
-
-@dataclass(frozen=True, slots=True)
-class RecentAction:
-    action: str
-    actor_id: int | None
-    target_id: int | None
-    message_id: int | None
-    created_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,28 +312,6 @@ class AIStats:
     gateway_latency_p95_ms: int = 0
     total_latency_p50_ms: int = 0
     total_latency_p95_ms: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class AIDecision:
-    is_ad: bool | None
-    confidence: float | None
-    category: str
-    model: str
-    latency_ms: int
-    cached: bool
-    enforced: bool
-    error_type: str
-    reasoning_effort: str
-    service_tier: str
-    review_path: str
-    media_latency_ms: int
-    queue_latency_ms: int
-    request_latency_ms: int
-    action_latency_ms: int
-    total_latency_ms: int
-    attempt_count: int
-    created_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,14 +359,12 @@ class LogOutboxRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class MemberActivity:
-    chat_id: int
-    user_id: int
-    first_observed_at: str
-    last_message_at: str | None
-    last_membership_at: str | None
-    last_status: str
-    message_count: int
+class QueueHealth:
+    ephemeral_total: int
+    ephemeral_due: int
+    log_outbox_total: int
+    log_outbox_due: int
+    log_outbox_retrying: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,6 +382,13 @@ class Raffle:
     publication_state: str
     created_at: str
     finished_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingRaffleResult:
+    raffle: Raffle
+    round_number: int
+    stage: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -627,28 +602,6 @@ class Storage:
             await self._db.close()
             self._db = None
 
-    async def add_warning(self, chat_id: int, user_id: int) -> int:
-        async with self._write_transaction() as db:
-            await db.execute(
-                """
-                INSERT INTO warnings (chat_id, user_id, count, last_reason, updated_at)
-                VALUES (?, ?, 1, ?, ?)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                    count = warnings.count + 1,
-                    last_reason = excluded.last_reason,
-                    updated_at = excluded.updated_at
-                """,
-                (chat_id, user_id, "", utc_now()),
-            )
-            cursor = await db.execute(
-                "SELECT count FROM warnings WHERE chat_id = ? AND user_id = ?",
-                (chat_id, user_id),
-            )
-            row = await cursor.fetchone()
-        if row is None:
-            raise RuntimeError("警告写入后读取失败")
-        return int(row["count"])
-
     async def add_warning_and_record_action(
         self,
         chat_id: int,
@@ -700,14 +653,6 @@ class Storage:
             raise RuntimeError("警告写入后读取失败")
         return int(row["count"])
 
-    async def warning_count(self, chat_id: int, user_id: int) -> int:
-        cursor = await self.db.execute(
-            "SELECT count FROM warnings WHERE chat_id = ? AND user_id = ?",
-            (chat_id, user_id),
-        )
-        row = await cursor.fetchone()
-        return int(row["count"]) if row else 0
-
     async def clear_warnings(self, chat_id: int, user_id: int) -> None:
         async with self._write_transaction() as db:
             await db.execute(
@@ -722,30 +667,12 @@ class Storage:
         )
         return await cursor.fetchone() is not None
 
-    async def add_trusted_user(self, chat_id: int, user_id: int, actor_id: int) -> None:
-        await self._upsert_pair("trusted_users", chat_id, user_id, actor_id)
-
-    async def remove_trusted_user(self, chat_id: int, user_id: int) -> None:
-        async with self._write_transaction() as db:
-            await db.execute(
-                "DELETE FROM trusted_users WHERE chat_id = ? AND user_id = ?",
-                (chat_id, user_id),
-            )
-
-    async def _upsert_pair(self, table: str, chat_id: int, user_id: int, actor_id: int) -> None:
-        if table != "trusted_users":
-            raise ValueError("unsupported table")
-        async with self._write_transaction() as db:
-            await db.execute(
-                """
-                INSERT INTO trusted_users (chat_id, user_id, added_by, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                    added_by = excluded.added_by,
-                    created_at = excluded.created_at
-                """,
-                (chat_id, user_id, actor_id, utc_now()),
-            )
+    async def trusted_user_ids(self, chat_id: int) -> frozenset[int]:
+        cursor = await self.db.execute(
+            "SELECT user_id FROM trusted_users WHERE chat_id = ? ORDER BY user_id",
+            (chat_id,),
+        )
+        return frozenset(int(row["user_id"]) for row in await cursor.fetchall())
 
     async def allowed_domains(self, chat_id: int) -> set[str]:
         cursor = await self.db.execute(
@@ -754,59 +681,12 @@ class Storage:
         )
         return {str(row["domain"]) for row in await cursor.fetchall()}
 
-    async def add_allowed_domain(self, chat_id: int, domain: str, actor_id: int) -> None:
-        async with self._write_transaction() as db:
-            await db.execute(
-                """
-                INSERT INTO allowed_domains (chat_id, domain, added_by, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(chat_id, domain) DO UPDATE SET
-                    added_by = excluded.added_by,
-                    created_at = excluded.created_at
-                """,
-                (chat_id, domain, actor_id, utc_now()),
-            )
-
-    async def remove_allowed_domain(self, chat_id: int, domain: str) -> None:
-        async with self._write_transaction() as db:
-            await db.execute(
-                "DELETE FROM allowed_domains WHERE chat_id = ? AND domain = ?",
-                (chat_id, domain),
-            )
-
     async def blocked_words(self, chat_id: int) -> set[str]:
         cursor = await self.db.execute(
             "SELECT word FROM blocked_words WHERE chat_id = ? ORDER BY word",
             (chat_id,),
         )
         return {str(row["word"]) for row in await cursor.fetchall()}
-
-    async def add_blocked_word(self, chat_id: int, word: str, actor_id: int) -> None:
-        await self.add_blocked_words(chat_id, (word,), actor_id)
-
-    async def add_blocked_words(self, chat_id: int, words: tuple[str, ...], actor_id: int) -> None:
-        timestamp = utc_now()
-        async with self._write_transaction() as db:
-            await db.executemany(
-                """
-                INSERT INTO blocked_words (chat_id, word, added_by, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(chat_id, word) DO UPDATE SET
-                    added_by = excluded.added_by,
-                    created_at = excluded.created_at
-                """,
-                ((chat_id, word, actor_id, timestamp) for word in words),
-            )
-
-    async def remove_blocked_word(self, chat_id: int, word: str) -> None:
-        await self.remove_blocked_words(chat_id, (word,))
-
-    async def remove_blocked_words(self, chat_id: int, words: tuple[str, ...]) -> None:
-        async with self._write_transaction() as db:
-            await db.executemany(
-                "DELETE FROM blocked_words WHERE chat_id = ? AND word = ?",
-                ((chat_id, word) for word in words),
-            )
 
     async def record_action(
         self,
@@ -889,9 +769,16 @@ class Storage:
             SELECT
                 SUM(CASE WHEN action = 'delete' THEN 1 ELSE 0 END) AS deleted,
                 SUM(CASE WHEN action = 'warn' THEN 1 ELSE 0 END) AS warned,
-                SUM(CASE WHEN action IN ('mute', 'auto_mute') THEN 1 ELSE 0 END) AS muted,
                 SUM(CASE WHEN action IN ('ban', 'auto_ban') THEN 1 ELSE 0 END) AS banned,
-                COUNT(*) AS total_actions
+                SUM(CASE WHEN action IN (
+                    'member_cleanup', 'cleanup_inactive', 'kick'
+                ) THEN 1 ELSE 0 END) AS removed,
+                SUM(CASE WHEN action IN (
+                    'member_cleanup_unban_failed',
+                    'cleanup_inactive_unban_failed',
+                    'kick_unban_failed'
+                ) THEN 1 ELSE 0 END) AS cleanup_failures,
+                SUM(CASE WHEN action = 'history_purge' THEN 1 ELSE 0 END) AS history_purges
             FROM moderation_log
             WHERE chat_id = ?
         """
@@ -905,13 +792,14 @@ class Storage:
         )
         row = await cursor.fetchone()
         if row is None:
-            return ChatStats(0, 0, 0, 0, 0)
+            return ChatStats(0, 0, 0, 0, 0, 0)
         return ChatStats(
             deleted=int(row["deleted"] or 0),
             warned=int(row["warned"] or 0),
-            muted=int(row["muted"] or 0),
             banned=int(row["banned"] or 0),
-            total_actions=int(row["total_actions"] or 0),
+            removed=int(row["removed"] or 0),
+            cleanup_failures=int(row["cleanup_failures"] or 0),
+            history_purges=int(row["history_purges"] or 0),
         )
 
     async def warning_stats(self, chat_id: int) -> WarningStats:
@@ -919,7 +807,7 @@ class Storage:
             """
             SELECT COUNT(*) AS users, COALESCE(SUM(count), 0) AS total
             FROM warnings
-            WHERE chat_id = ?
+            WHERE chat_id = ? AND count > 0
             """,
             (chat_id,),
         )
@@ -927,28 +815,6 @@ class Storage:
         if row is None:
             return WarningStats(0, 0)
         return WarningStats(users=int(row["users"]), total=int(row["total"]))
-
-    async def recent_actions(self, chat_id: int, *, limit: int) -> tuple[RecentAction, ...]:
-        cursor = await self.db.execute(
-            """
-            SELECT action, actor_id, target_id, message_id, created_at
-            FROM moderation_log
-            WHERE chat_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (chat_id, limit),
-        )
-        return tuple(
-            RecentAction(
-                action=str(row["action"]),
-                actor_id=int(row["actor_id"]) if row["actor_id"] is not None else None,
-                target_id=int(row["target_id"]) if row["target_id"] is not None else None,
-                message_id=int(row["message_id"]) if row["message_id"] is not None else None,
-                created_at=str(row["created_at"]),
-            )
-            for row in await cursor.fetchall()
-        )
 
     async def record_ai_decision(
         self,
@@ -1234,45 +1100,6 @@ class Storage:
             return 0, 0
         return int(row["p50"] or 0), int(row["p95"] or 0)
 
-    async def recent_ai_decisions(self, chat_id: int, *, limit: int) -> tuple[AIDecision, ...]:
-        cursor = await self.db.execute(
-            """
-            SELECT is_ad, confidence, category, model, latency_ms, cached,
-                   enforced, error_type, reasoning_effort, service_tier,
-                   review_path, media_latency_ms, queue_latency_ms,
-                   request_latency_ms, action_latency_ms, total_latency_ms,
-                   attempt_count, created_at
-            FROM ai_decisions
-            WHERE chat_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (chat_id, limit),
-        )
-        return tuple(
-            AIDecision(
-                is_ad=None if row["is_ad"] is None else bool(row["is_ad"]),
-                confidence=(float(row["confidence"]) if row["confidence"] is not None else None),
-                category=str(row["category"]),
-                model=str(row["model"]),
-                latency_ms=int(row["latency_ms"]),
-                cached=bool(row["cached"]),
-                enforced=bool(row["enforced"]),
-                error_type=str(row["error_type"]),
-                reasoning_effort=str(row["reasoning_effort"]),
-                service_tier=str(row["service_tier"]),
-                review_path=str(row["review_path"]),
-                media_latency_ms=int(row["media_latency_ms"]),
-                queue_latency_ms=int(row["queue_latency_ms"]),
-                request_latency_ms=int(row["request_latency_ms"]),
-                action_latency_ms=int(row["action_latency_ms"]),
-                total_latency_ms=int(row["total_latency_ms"]),
-                attempt_count=int(row["attempt_count"]),
-                created_at=str(row["created_at"]),
-            )
-            for row in await cursor.fetchall()
-        )
-
     async def prune_ai_decisions(self, *, retention_days: int) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat(timespec="seconds")
         async with self._write_transaction() as db:
@@ -1541,6 +1368,13 @@ class Storage:
         row = await cursor.fetchone()
         return str(row["value"]) if row is not None else None
 
+    async def delete_runtime_setting(self, chat_id: int, key: str) -> None:
+        async with self._write_transaction() as db:
+            await db.execute(
+                "DELETE FROM runtime_settings WHERE chat_id = ? AND key = ?",
+                (chat_id, key),
+            )
+
     async def enqueue_ephemeral(self, chat_id: int, message_id: int, delete_at: str) -> None:
         async with self._write_transaction() as db:
             await db.execute(
@@ -1572,20 +1406,38 @@ class Storage:
             for row in await cursor.fetchall()
         )
 
+    async def queue_health(self, now: str) -> QueueHealth:
+        cursor = await self.db.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM ephemeral_bot_messages) AS ephemeral_total,
+                (SELECT COUNT(*) FROM ephemeral_bot_messages
+                 WHERE delete_at <= ?) AS ephemeral_due,
+                (SELECT COUNT(*) FROM log_outbox) AS log_outbox_total,
+                (SELECT COUNT(*) FROM log_outbox
+                 WHERE due_at <= ?
+                   AND (claimed_until IS NULL OR claimed_until <= ?)) AS log_outbox_due,
+                (SELECT COUNT(*) FROM log_outbox
+                 WHERE attempt_count > 0) AS log_outbox_retrying
+            """,
+            (now, now, now),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return QueueHealth(0, 0, 0, 0, 0)
+        return QueueHealth(
+            ephemeral_total=int(row["ephemeral_total"]),
+            ephemeral_due=int(row["ephemeral_due"]),
+            log_outbox_total=int(row["log_outbox_total"]),
+            log_outbox_due=int(row["log_outbox_due"]),
+            log_outbox_retrying=int(row["log_outbox_retrying"]),
+        )
+
     async def ack_ephemeral(self, chat_id: int, message_id: int) -> None:
         async with self._write_transaction() as db:
             await db.execute(
                 "DELETE FROM ephemeral_bot_messages WHERE chat_id = ? AND message_id = ?",
                 (chat_id, message_id),
-            )
-
-    async def ack_ephemeral_many(self, records: Sequence[tuple[int, int]]) -> None:
-        if not records:
-            return
-        async with self._write_transaction() as db:
-            await db.executemany(
-                "DELETE FROM ephemeral_bot_messages WHERE chat_id = ? AND message_id = ?",
-                records,
             )
 
     async def reschedule_ephemeral(self, chat_id: int, message_id: int, delete_at: str) -> None:
@@ -1597,22 +1449,6 @@ class Storage:
                 WHERE chat_id = ? AND message_id = ?
                 """,
                 (delete_at, chat_id, message_id),
-            )
-
-    async def reschedule_ephemeral_many(
-        self,
-        records: Sequence[tuple[int, int, str]],
-    ) -> None:
-        if not records:
-            return
-        async with self._write_transaction() as db:
-            await db.executemany(
-                """
-                UPDATE ephemeral_bot_messages
-                SET delete_at = ?
-                WHERE chat_id = ? AND message_id = ?
-                """,
-                ((delete_at, chat_id, message_id) for chat_id, message_id, delete_at in records),
             )
 
     async def claim_due_log_outbox(
@@ -1690,134 +1526,6 @@ class Storage:
             created_at=str(row["created_at"]),
         )
 
-    async def record_member_message(
-        self,
-        chat_id: int,
-        user_id: int,
-        *,
-        observed_at: str | None = None,
-    ) -> None:
-        timestamp = observed_at or utc_now()
-        async with self._write_transaction() as db:
-            await db.execute(
-                """
-                INSERT INTO member_activity (
-                    chat_id, user_id, first_observed_at, last_message_at,
-                    last_membership_at, last_status, message_count
-                ) VALUES (?, ?, ?, ?, NULL, '', 1)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                    first_observed_at = MIN(
-                        member_activity.first_observed_at,
-                        excluded.first_observed_at
-                    ),
-                    last_message_at = CASE
-                        WHEN member_activity.last_message_at IS NULL
-                             OR member_activity.last_message_at < excluded.last_message_at
-                        THEN excluded.last_message_at
-                        ELSE member_activity.last_message_at
-                    END,
-                    message_count = member_activity.message_count + 1
-                """,
-                (chat_id, user_id, timestamp, timestamp),
-            )
-
-    async def record_member_status(
-        self,
-        chat_id: int,
-        user_id: int,
-        status: str,
-        *,
-        observed_at: str | None = None,
-    ) -> None:
-        normalized_status = _metadata_token("status", status, allow_empty=False)
-        timestamp = observed_at or utc_now()
-        async with self._write_transaction() as db:
-            await db.execute(
-                """
-                INSERT INTO member_activity (
-                    chat_id, user_id, first_observed_at, last_message_at,
-                    last_membership_at, last_status, message_count
-                ) VALUES (?, ?, ?, NULL, ?, ?, 0)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                    first_observed_at = MIN(
-                        member_activity.first_observed_at,
-                        excluded.first_observed_at
-                    ),
-                    last_membership_at = CASE
-                        WHEN member_activity.last_membership_at IS NULL
-                             OR member_activity.last_membership_at < excluded.last_membership_at
-                        THEN excluded.last_membership_at
-                        ELSE member_activity.last_membership_at
-                    END,
-                    last_status = CASE
-                        WHEN member_activity.last_membership_at IS NULL
-                             OR member_activity.last_membership_at <= excluded.last_membership_at
-                        THEN excluded.last_status
-                        ELSE member_activity.last_status
-                    END
-                """,
-                (chat_id, user_id, timestamp, timestamp, normalized_status),
-            )
-
-    async def member_activity(self, chat_id: int, user_id: int) -> MemberActivity | None:
-        cursor = await self.db.execute(
-            """
-            SELECT chat_id, user_id, first_observed_at, last_message_at,
-                   last_membership_at, last_status, message_count
-            FROM member_activity
-            WHERE chat_id = ? AND user_id = ?
-            """,
-            (chat_id, user_id),
-        )
-        row = await cursor.fetchone()
-        return self._member_activity_from_row(row) if row is not None else None
-
-    async def inactive_member_candidates(
-        self,
-        chat_id: int,
-        *,
-        cutoff: str,
-        limit: int,
-    ) -> tuple[MemberActivity, ...]:
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-            raise ValueError("limit 必须是正整数")
-        cursor = await self.db.execute(
-            """
-            SELECT chat_id, user_id, first_observed_at, last_message_at,
-                   last_membership_at, last_status, message_count
-            FROM member_activity
-            WHERE chat_id = ?
-              AND MAX(
-                  COALESCE(last_message_at, first_observed_at),
-                  COALESCE(last_membership_at, first_observed_at)
-              ) < ?
-              AND last_status NOT IN ('left', 'kicked')
-            ORDER BY MAX(
-                COALESCE(last_message_at, first_observed_at),
-                COALESCE(last_membership_at, first_observed_at)
-            ), user_id
-            LIMIT ?
-            """,
-            (chat_id, cutoff, limit),
-        )
-        return tuple(self._member_activity_from_row(row) for row in await cursor.fetchall())
-
-    @staticmethod
-    def _member_activity_from_row(row: aiosqlite.Row) -> MemberActivity:
-        return MemberActivity(
-            chat_id=int(row["chat_id"]),
-            user_id=int(row["user_id"]),
-            first_observed_at=str(row["first_observed_at"]),
-            last_message_at=(
-                str(row["last_message_at"]) if row["last_message_at"] is not None else None
-            ),
-            last_membership_at=(
-                str(row["last_membership_at"]) if row["last_membership_at"] is not None else None
-            ),
-            last_status=str(row["last_status"]),
-            message_count=int(row["message_count"]),
-        )
-
     async def create_raffle(
         self,
         *,
@@ -1878,6 +1586,25 @@ class Storage:
             )
         return cursor.rowcount == 1
 
+    async def replace_active_raffle_message(
+        self,
+        raffle_id: int,
+        expected_message_id: int,
+        new_message_id: int,
+    ) -> bool:
+        """Atomically replace the card for the same still-running raffle."""
+
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                UPDATE raffles SET message_id = ?
+                WHERE id = ? AND message_id = ?
+                  AND status = 'running' AND publication_state = 'active'
+                """,
+                (new_message_id, raffle_id, expected_message_id),
+            )
+        return cursor.rowcount == 1
+
     async def activate_raffle(self, raffle_id: int) -> bool:
         async with self._write_transaction() as db:
             cursor = await db.execute(
@@ -1901,14 +1628,21 @@ class Storage:
             )
         return cursor.rowcount == 1
 
-    async def pending_raffles(self) -> tuple[Raffle, ...]:
-        cursor = await self.db.execute(
-            """
-            SELECT * FROM raffles
-            WHERE status = 'running' AND publication_state = 'pending'
-            ORDER BY id
-            """
-        )
+    async def pending_raffles(
+        self,
+        *,
+        chat_ids: Collection[int] | None = None,
+    ) -> tuple[Raffle, ...]:
+        query = "SELECT * FROM raffles WHERE status = 'running' AND publication_state = 'pending'"
+        parameters: tuple[int, ...] = ()
+        if chat_ids is not None:
+            parameters = tuple(sorted(set(chat_ids)))
+            if not parameters:
+                return ()
+            placeholders = ",".join("?" for _ in parameters)
+            query += f" AND chat_id IN ({placeholders})"  # noqa: S608
+        query += " ORDER BY id"
+        cursor = await self.db.execute(query, parameters)
         return tuple(self._raffle_from_row(row) for row in await cursor.fetchall())
 
     async def raffle(self, raffle_id: int) -> Raffle | None:
@@ -1924,21 +1658,6 @@ class Storage:
             LIMIT 1
             """,
             (chat_id,),
-        )
-        row = await cursor.fetchone()
-        return self._raffle_from_row(row) if row is not None else None
-
-    async def active_raffle_for_keyword(
-        self, chat_id: int, normalized_keyword: str
-    ) -> Raffle | None:
-        cursor = await self.db.execute(
-            """
-            SELECT * FROM raffles
-            WHERE chat_id = ? AND status = 'running' AND publication_state = 'active'
-              AND normalized_keyword = ? AND ends_at > ?
-            LIMIT 1
-            """,
-            (chat_id, normalized_keyword, utc_now()),
         )
         row = await cursor.fetchone()
         return self._raffle_from_row(row) if row is not None else None
@@ -1967,15 +1686,28 @@ class Storage:
         row = await cursor.fetchone()
         return self._raffle_from_row(row) if row is not None else None
 
-    async def due_raffles(self, now: str, *, limit: int = 20) -> tuple[Raffle, ...]:
-        cursor = await self.db.execute(
-            """
-            SELECT * FROM raffles
-            WHERE status = 'running' AND publication_state = 'active' AND ends_at <= ?
-            ORDER BY ends_at, id LIMIT ?
-            """,
-            (now, limit),
+    async def due_raffles(
+        self,
+        now: str,
+        *,
+        limit: int = 20,
+        chat_ids: Collection[int] | None = None,
+    ) -> tuple[Raffle, ...]:
+        query = (
+            "SELECT * FROM raffles "
+            "WHERE status = 'running' AND publication_state = 'active' AND ends_at <= ?"
         )
+        parameters: list[int | str] = [now]
+        if chat_ids is not None:
+            allowed = tuple(sorted(set(chat_ids)))
+            if not allowed:
+                return ()
+            placeholders = ",".join("?" for _ in allowed)
+            query += f" AND chat_id IN ({placeholders})"  # noqa: S608
+            parameters.extend(allowed)
+        query += " ORDER BY ends_at, id LIMIT ?"
+        parameters.append(limit)
+        cursor = await self.db.execute(query, tuple(parameters))
         return tuple(self._raffle_from_row(row) for row in await cursor.fetchall())
 
     async def join_raffle(self, raffle_id: int, user_id: int) -> tuple[bool, int]:
@@ -2021,7 +1753,15 @@ class Storage:
         )
         return tuple(int(row["user_id"]) for row in await cursor.fetchall())
 
-    async def finish_raffle(self, raffle_id: int, winners: Sequence[int]) -> bool:
+    async def finish_raffle(
+        self,
+        raffle_id: int,
+        winners: Sequence[int],
+        *,
+        result_delivery_stage: str | None = None,
+    ) -> bool:
+        if result_delivery_stage not in {None, "group_only", "group_and_admin"}:
+            raise ValueError("invalid raffle result delivery stage")
         timestamp = utc_now()
         async with self._write_transaction() as db:
             cursor = await db.execute(
@@ -2044,7 +1784,81 @@ class Storage:
                     for position, user_id in enumerate(winners, start=1)
                 ),
             )
+            if result_delivery_stage is not None:
+                await db.execute(
+                    """
+                    INSERT INTO runtime_settings (chat_id, key, value, updated_at)
+                    SELECT chat_id, ?, ?, ? FROM raffles WHERE id = ?
+                    ON CONFLICT(chat_id, key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        f"raffle_result_pending:{raffle_id}:1",
+                        result_delivery_stage,
+                        timestamp,
+                        raffle_id,
+                    ),
+                )
         return True
+
+    async def pending_raffle_results(
+        self,
+        *,
+        chat_ids: Collection[int] | None = None,
+        raffle_id: int | None = None,
+        updated_before: str | None = None,
+        limit: int = 20,
+    ) -> tuple[PendingRaffleResult, ...]:
+        query = """
+            SELECT r.*, rs.value AS result_delivery_stage,
+                   CAST(
+                       substr(
+                           rs.key,
+                           length(
+                               'raffle_result_pending:' || CAST(r.id AS TEXT) || ':'
+                           ) + 1
+                       ) AS INTEGER
+                   ) AS result_round
+            FROM raffles AS r
+            JOIN runtime_settings AS rs
+              ON rs.chat_id = r.chat_id
+             AND rs.key LIKE (
+                 'raffle_result_pending:' || CAST(r.id AS TEXT) || ':%'
+             )
+            WHERE r.status = 'finished'
+              AND rs.value IN ('group_only', 'group_and_admin', 'admin_only')
+        """
+        parameters: list[int | str] = []
+        if updated_before is not None:
+            query += " AND rs.updated_at <= ?"
+            parameters.append(updated_before)
+        if raffle_id is not None:
+            query += " AND r.id = ?"
+            parameters.append(raffle_id)
+        if chat_ids is not None:
+            allowed = tuple(sorted(set(chat_ids)))
+            if not allowed:
+                return ()
+            placeholders = ",".join("?" for _ in allowed)
+            query += f" AND r.chat_id IN ({placeholders})"  # noqa: S608
+            parameters.extend(allowed)
+        query += " ORDER BY r.finished_at, r.id, result_round LIMIT ?"
+        parameters.append(limit)
+        cursor = await self.db.execute(query, tuple(parameters))
+        pending: list[PendingRaffleResult] = []
+        for row in await cursor.fetchall():
+            round_number = int(row["result_round"])
+            if round_number < 1:
+                continue
+            pending.append(
+                PendingRaffleResult(
+                    raffle=self._raffle_from_row(row),
+                    round_number=round_number,
+                    stage=str(row["result_delivery_stage"]),
+                )
+            )
+        return tuple(pending)
 
     async def cancel_raffle(self, raffle_id: int) -> bool:
         async with self._write_transaction() as db:
@@ -2057,7 +1871,15 @@ class Storage:
             )
         return cursor.rowcount == 1
 
-    async def add_reroll(self, raffle_id: int, winners: Sequence[int]) -> int:
+    async def add_reroll(
+        self,
+        raffle_id: int,
+        winners: Sequence[int],
+        *,
+        result_delivery_stage: str | None = None,
+    ) -> int:
+        if result_delivery_stage not in {None, "group_only", "group_and_admin"}:
+            raise ValueError("invalid raffle result delivery stage")
         timestamp = utc_now()
         async with self._write_transaction() as db:
             cursor = await db.execute(
@@ -2080,6 +1902,22 @@ class Storage:
                     for position, user_id in enumerate(winners, start=1)
                 ),
             )
+            if result_delivery_stage is not None:
+                await db.execute(
+                    """
+                    INSERT INTO runtime_settings (chat_id, key, value, updated_at)
+                    SELECT chat_id, ?, ?, ? FROM raffles WHERE id = ?
+                    ON CONFLICT(chat_id, key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        f"raffle_result_pending:{raffle_id}:{next_round}",
+                        result_delivery_stage,
+                        timestamp,
+                        raffle_id,
+                    ),
+                )
         return next_round
 
     async def raffle_winners(
