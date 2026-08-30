@@ -471,7 +471,9 @@ async def test_lottery_creation_pins_keyword_card_and_activates(
     assert raffle.publication_state == "active"
     assert bot.pinned == [(-100, raffle.message_id, True)]
     assert "参与关键词：<code>NEXA</code>" in bot.sent[0][1]
-    message.answer.assert_awaited_once_with(f"抽奖 #{raffle.id} 已创建并置顶。")
+    message.answer.assert_awaited_once_with(
+        "🎉 <b>抽奖已发布并置顶</b>\n发送关键词 <code>NEXA</code> 即可参与。"
+    )
 
 
 async def test_lottery_pin_failure_deletes_card_and_rolls_back(
@@ -520,14 +522,26 @@ async def test_raffle_keyword_join_is_exact_deletes_source_and_confirms(
 
     assert await storage.raffle_entry_ids(raffle.id) == (42,)
     assert bot.deleted == [(-100, 5)]
-    assert bot.sent[-1] == (-100, "已参加抽奖，当前 1 人。")
+    assert bot.sent[-1] == (
+        -100,
+        '<a href="tg://user?id=42">Member</a>，已成功参与抽奖！🎉\n当前共有 1 人参与。',
+    )
     assert bot.edited[-1][1] == 88
 
     duplicate = group_message(42, "nexa", message_id=7)
     await controller.join_lottery_keyword(duplicate)
     assert await storage.raffle_entry_ids(raffle.id) == (42,)
     assert bot.deleted[-1] == (-100, 7)
-    assert bot.sent[-1] == (-100, "你已参加过，本次不重复登记。")
+    assert bot.sent[-1] == (
+        -100,
+        '<a href="tg://user?id=42">Member</a>，你已经参与过啦，本次不会重复登记。',
+    )
+
+
+def test_raffle_participant_mention_prefers_public_username() -> None:
+    user = User(id=42, is_bot=False, first_name="Member", username="nexa_member")
+
+    assert ModerationController._raffle_participant_mention(user, 42) == "@nexa_member"
 
 
 async def test_unique_authorized_anonymous_admin_can_join_keyword_raffle(
@@ -563,7 +577,10 @@ async def test_unique_authorized_anonymous_admin_can_join_keyword_raffle(
 
     assert await storage.raffle_entry_ids(raffle.id) == (7,)
     assert bot.deleted == [(-100, 9)]
-    assert bot.sent[-1] == (-100, "已参加抽奖，当前 1 人。")
+    assert bot.sent[-1] == (
+        -100,
+        '<a href="tg://user?id=7">用户</a>，已成功参与抽奖！🎉\n当前共有 1 人参与。',
+    )
 
 
 @pytest.mark.parametrize("operation", ("end", "cancel"))

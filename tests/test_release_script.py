@@ -9,7 +9,7 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     pause_timer = script.index("pausing ${BACKUP_TIMER_NAME}")
     backup_inactive = script.index("database backup service did not become idle")
     stop = script.index("for a final consistent database backup")
-    raffle_check = script.index("checking that no raffle is still running")
+    raffle_check = script.index("checking raffle migration safety")
     backup = script.index("creating validated database backup")
     switch = script.index("switching current to")
     database_validation = script.index("production schema version mismatch")
@@ -42,7 +42,7 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
         'systemctl stop "${BACKUP_TIMER_NAME}"'
     )
     assert "wait_for_backup_service_idle" in pause_block
-    assert "a raffle is still running; release aborted" in script
+    assert "an old-schema raffle is still running; release aborted" in script
 
     stop_block = script[script.index('log "stopping ${SERVICE_NAME}') : backup]
     assert stop_block.index("service_stopped=1") < stop_block.index(

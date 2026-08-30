@@ -697,13 +697,14 @@ systemctl stop "${SERVICE_NAME}" || die "failed to stop service before database 
 systemctl is-active --quiet "${SERVICE_NAME}" \
   && die "service is still active after stop"
 
-log "checking that no raffle is still running"
-"${PYTHON_BIN}" - "${DATABASE_PATH}" <<'PY'
+log "checking raffle migration safety"
+"${PYTHON_BIN}" - "${DATABASE_PATH}" "${schema_version}" <<'PY'
 import sqlite3
 import sys
 from pathlib import Path
 
 database_uri = f"{Path(sys.argv[1]).resolve().as_uri()}?mode=ro"
+target_schema = int(sys.argv[2])
 connection = sqlite3.connect(database_uri, uri=True, timeout=15)
 try:
     table = connection.execute(
@@ -713,8 +714,14 @@ try:
         running = connection.execute(
             "SELECT COUNT(*) FROM raffles WHERE status = 'running'"
         ).fetchone()
-        if running is not None and int(running[0]) != 0:
-            raise RuntimeError("a raffle is still running; release aborted")
+        current_schema = connection.execute("PRAGMA user_version").fetchone()
+        if (
+            running is not None
+            and int(running[0]) != 0
+            and current_schema is not None
+            and int(current_schema[0]) < target_schema
+        ):
+            raise RuntimeError("an old-schema raffle is still running; release aborted")
 finally:
     connection.close()
 PY

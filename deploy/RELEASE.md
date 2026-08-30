@@ -39,7 +39,7 @@
 
 ```bash
 sudo /path/to/repository/deploy/release.sh \
-  --wheel /root/releases/nexa_guardian-0.4.2-py3-none-any.whl \
+  --wheel /root/releases/nexa_guardian-0.4.3-py3-none-any.whl \
   --git-sha 0123456789abcdef0123456789abcdef01234567 \
   --schema-version 8
 ```
@@ -68,6 +68,8 @@ sudo /path/to/repository/deploy/release.sh \
    `low/high` 自适应推理契约及服务端实际采用 `gpt-5.6-sol`、`default`；同时验证机器人身份、
    更新并发与媒体预览生产配置。任一能力或响应契约失败即停止，不切换生产。
 5. 写入 `release.json` 并完成候选 release 后，停止服务并确认它不再写库。
+   若数据库需要升级且仍有进行中的旧版抽奖，发布会停止并恢复原服务；同一 schema 的
+   文案或代码补丁会保留活动抽奖并在新进程中继续。
 6. 使用 SQLite 在线备份 API 创建最终一致的
    `/var/backups/nexa-guardian/manual/pre-release-<release-id>.db`，运行
    `PRAGMA quick_check`、`PRAGMA foreign_key_check` 并记录 SHA256。
