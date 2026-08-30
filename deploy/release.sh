@@ -17,7 +17,7 @@ readonly BACKUP_ROOT="/var/backups/nexa-guardian"
 readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
 readonly PYTHON_BIN="/usr/bin/python3"
-readonly CODE_SCHEMA_VERSION="5"
+readonly CODE_SCHEMA_VERSION="6"
 
 artifact_mode=""
 artifact_path=""
@@ -672,7 +672,7 @@ log "creating isolated virtual environment"
 "${final_release}/.venv/bin/python" -m pip install \
   --disable-pip-version-check --no-cache-dir "${copied_wheel}"
 "${final_release}/.venv/bin/python" -c 'import nexa_guardian'
-log "probing GPT-5.6 Sol high-reasoning low-output capabilities and production settings"
+log "probing GPT-5.6 Sol adaptive-reasoning capabilities and production settings"
 "${final_release}/.venv/bin/nexa-guardian-probe" \
   --env-file "${CONFIG_PATH}" --require-production-settings \
   || die "gateway capability probe failed; production was not switched"

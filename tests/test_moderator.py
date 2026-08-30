@@ -8,8 +8,8 @@ from unittest.mock import ANY, AsyncMock
 import pytest
 from aiogram.enums import ChatMemberStatus, ChatType, MessageEntityType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import BanChatMember
-from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User
+from aiogram.methods import BanChatMember, DeleteMessage
+from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User, Video
 from aiohttp import ClientPayloadError
 
 from nexa_guardian.ai_contract import AI_MODEL
@@ -18,8 +18,12 @@ from nexa_guardian.config import Settings
 from nexa_guardian.detection import Violation
 from nexa_guardian.moderator import (
     AUTO_BAN_MEMORY_MAX,
+    BOT_PROFILE_DESCRIPTION,
+    BOT_PROFILE_NAME,
+    BOT_PROFILE_SHORT_DESCRIPTION,
     ModerationController,
     muted_permissions,
+    select_photo_preview,
     stats_cutoffs,
 )
 from nexa_guardian.storage import Storage
@@ -59,7 +63,14 @@ class FakeBot:
         self.restricted.append((chat_id, user_id))
         return True
 
-    async def ban_chat_member(self, chat_id: int, user_id: int, *, revoke_messages: bool) -> bool:
+    async def ban_chat_member(
+        self,
+        chat_id: int,
+        user_id: int,
+        *,
+        until_date: datetime | None = None,
+        revoke_messages: bool,
+    ) -> bool:
         self.banned.append((chat_id, user_id, revoke_messages))
         return True
 
@@ -360,6 +371,40 @@ async def test_private_admin_command_targets_the_only_allowed_group(
     assert stats.total_actions == 1
 
 
+async def test_set_commands_syncs_default_and_chinese_profile(
+    tmp_path: Path, storage: Storage
+) -> None:
+    bot = SimpleNamespace(
+        set_my_commands=AsyncMock(),
+        set_my_name=AsyncMock(),
+        set_my_short_description=AsyncMock(),
+        set_my_description=AsyncMock(),
+    )
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+
+    await controller.set_commands()
+
+    assert [call.kwargs["language_code"] for call in bot.set_my_commands.await_args_list] == [
+        None,
+        "zh",
+    ]
+    commands = bot.set_my_commands.await_args_list[0].args[0]
+    assert {command.command for command in commands} >= {
+        "help",
+        "recent",
+        "aistats",
+        "inactive",
+        "cleanupinactive",
+    }
+    assert bot.set_my_name.await_args_list[0].args == (BOT_PROFILE_NAME,)
+    assert bot.set_my_name.await_args_list[1].kwargs["language_code"] == "zh"
+    assert bot.set_my_short_description.await_args_list[0].args == (BOT_PROFILE_SHORT_DESCRIPTION,)
+    assert bot.set_my_description.await_args_list[0].args == (BOT_PROFILE_DESCRIPTION,)
+    assert len(BOT_PROFILE_NAME) <= 64
+    assert len(BOT_PROFILE_SHORT_DESCRIPTION) <= 120
+    assert len(BOT_PROFILE_DESCRIPTION) <= 512
+
+
 async def test_private_command_rejects_unlisted_user(tmp_path: Path, storage: Storage) -> None:
     controller = ModerationController(
         FakeBot(admin_ids={42}),
@@ -630,6 +675,12 @@ async def test_reporter_log_message_contains_no_reason(
         actor_id=7,
         target_id=42,
     )
+    await controller.reporter.start()
+    for _ in range(50):
+        if bot.sent:
+            break
+        await asyncio.sleep(0.001)
+    await controller.reporter.shutdown()
 
     assert len(bot.sent) == 1
     assert "原因" not in bot.sent[0][1]
@@ -1276,13 +1327,104 @@ async def test_video_uses_thumbnail_without_downloading_video(
     controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
     message = SimpleNamespace(
         photo=None,
-        video=SimpleNamespace(thumbnail=thumbnail, file_size=50_000_000),
+        video=SimpleNamespace(cover=None, thumbnail=thumbnail, file_size=50_000_000),
     )
 
     result = await controller._message_image_data_url(message)  # type: ignore[arg-type]
 
     assert result == "data:image/jpeg;base64,dGh1bWJuYWls"
     bot.download.assert_awaited_once_with(thumbnail, destination=ANY)  # type: ignore[attr-defined]
+
+
+async def test_video_prefers_sized_cover_over_legacy_thumbnail(
+    tmp_path: Path, storage: Storage
+) -> None:
+    bot = FakeBot()
+
+    async def download(file: object, *, destination: object) -> None:
+        assert file is target_cover
+        destination.write(b"cover")
+
+    small_cover = SimpleNamespace(file_size=5, width=640, height=360)
+    target_cover = SimpleNamespace(file_size=10, width=1280, height=720)
+    large_cover = SimpleNamespace(file_size=20, width=1920, height=1080)
+    thumbnail = SimpleNamespace(file_size=9)
+    bot.download = AsyncMock(side_effect=download)  # type: ignore[attr-defined]
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    message = SimpleNamespace(
+        photo=None,
+        video=SimpleNamespace(
+            cover=[small_cover, target_cover, large_cover],
+            thumbnail=thumbnail,
+            file_size=50_000_000,
+        ),
+    )
+
+    result = await controller._message_image_data_url(message)  # type: ignore[arg-type]
+
+    assert result == "data:image/jpeg;base64,Y292ZXI="
+    bot.download.assert_awaited_once_with(target_cover, destination=ANY)  # type: ignore[attr-defined]
+
+
+async def test_cover_only_video_is_reviewed_with_high_reasoning(
+    tmp_path: Path, storage: Storage
+) -> None:
+    bot = FakeBot()
+
+    async def download(_file: object, *, destination: object) -> None:
+        destination.write(b"cover")
+
+    bot.download = AsyncMock(side_effect=download)  # type: ignore[attr-defined]
+    reviewer = SimpleNamespace(
+        review=AsyncMock(
+            return_value=AIReviewResult(
+                is_ad=False,
+                confidence=0.99,
+                category="normal",
+                signatures=(),
+                cached=False,
+                latency_ms=10,
+                reasoning_effort="high",
+            )
+        )
+    )
+    controller = ModerationController(
+        bot,
+        settings(tmp_path, ai_enabled=True),  # type: ignore[arg-type]
+        storage,
+        ai_reviewer=reviewer,  # type: ignore[arg-type]
+    )
+    controller._processing_notice = AsyncMock(return_value=None)
+    message = Message(
+        message_id=1,
+        date=datetime.now(UTC),
+        chat=Chat(id=-100, type=ChatType.SUPERGROUP, title="Test"),
+        from_user=User(id=42, is_bot=False, first_name="Member"),
+        video=Video(
+            file_id="video",
+            file_unique_id="video-unique",
+            width=1280,
+            height=720,
+            duration=5,
+            cover=[
+                PhotoSize(
+                    file_id="cover",
+                    file_unique_id="cover-unique",
+                    width=1280,
+                    height=720,
+                    file_size=10,
+                )
+            ],
+        ),
+    )
+
+    await controller.moderate_message(message)
+
+    assert reviewer.review.await_args.kwargs["image_data_url"] == (
+        "data:image/jpeg;base64,Y292ZXI="
+    )
+    assert reviewer.review.await_args.kwargs["reasoning_effort"] == "high"
+    controller._processing_notice.assert_not_awaited()
 
 
 async def test_ai_mode_sends_flood_signal_to_gateway_without_local_enforcement(
@@ -1710,3 +1852,195 @@ async def test_dry_run_ai_failure_reports_retention_not_delete_failure(
         ANY,
         "审核服务异常，观察模式下消息已保留。",
     )
+
+
+async def test_normal_text_uses_low_reasoning_without_a_visible_notice(
+    tmp_path: Path, storage: Storage
+) -> None:
+    reviewer = SimpleNamespace(
+        review=AsyncMock(
+            return_value=AIReviewResult(
+                is_ad=False,
+                confidence=0.99,
+                category="normal",
+                signatures=(),
+                cached=False,
+                latency_ms=20,
+                reasoning_effort="low",
+            )
+        )
+    )
+    bot = FakeBot()
+    controller = ModerationController(
+        bot,
+        settings(
+            tmp_path,
+            ai_enabled=True,
+            ai_normal_reasoning_effort="low",
+            ai_suspicious_reasoning_effort="high",
+        ),  # type: ignore[arg-type]
+        storage,
+        ai_reviewer=reviewer,  # type: ignore[arg-type]
+    )
+    controller._processing_notice = AsyncMock(return_value=None)
+
+    await controller.moderate_message(group_message(42, "正常咨询"))
+
+    assert reviewer.review.await_count == 1
+    assert reviewer.review.await_args.kwargs["reasoning_effort"] == "low"
+    controller._processing_notice.assert_not_awaited()
+    assert bot.deleted == []
+
+
+async def test_uncertain_low_reasoning_result_is_confirmed_with_high_reasoning(
+    tmp_path: Path, storage: Storage
+) -> None:
+    reviewer = SimpleNamespace(
+        review=AsyncMock(
+            side_effect=(
+                AIReviewResult(
+                    True,
+                    0.70,
+                    "promotion",
+                    (),
+                    False,
+                    15,
+                    reasoning_effort="low",
+                ),
+                AIReviewResult(
+                    False,
+                    0.99,
+                    "normal",
+                    (),
+                    False,
+                    25,
+                    reasoning_effort="high",
+                ),
+            )
+        )
+    )
+    controller = ModerationController(
+        FakeBot(),
+        settings(
+            tmp_path,
+            ai_enabled=True,
+            ai_normal_reasoning_effort="low",
+            ai_suspicious_reasoning_effort="high",
+        ),  # type: ignore[arg-type]
+        storage,
+        ai_reviewer=reviewer,  # type: ignore[arg-type]
+    )
+
+    await controller.moderate_message(group_message(42, "帮我看看价格"))
+
+    assert [call.kwargs["reasoning_effort"] for call in reviewer.review.await_args_list] == [
+        "low",
+        "high",
+    ]
+    decision = (await storage.recent_ai_decisions(-100, limit=1))[0]
+    assert decision.review_path == "low_to_high"
+    assert decision.latency_ms == 40
+
+
+async def test_suspicious_text_starts_directly_with_high_reasoning(
+    tmp_path: Path, storage: Storage
+) -> None:
+    reviewer = SimpleNamespace(
+        review=AsyncMock(
+            return_value=AIReviewResult(
+                False,
+                0.99,
+                "normal",
+                (),
+                False,
+                20,
+                reasoning_effort="high",
+            )
+        )
+    )
+    controller = ModerationController(
+        FakeBot(),
+        settings(
+            tmp_path,
+            ai_enabled=True,
+            ai_normal_reasoning_effort="low",
+            ai_suspicious_reasoning_effort="high",
+        ),  # type: ignore[arg-type]
+        storage,
+        ai_reviewer=reviewer,  # type: ignore[arg-type]
+    )
+    controller._processing_notice = AsyncMock(return_value=None)
+
+    await controller.moderate_message(group_message(42, "https://external.example"))
+
+    assert reviewer.review.await_count == 1
+    assert reviewer.review.await_args.kwargs["reasoning_effort"] == "high"
+    controller._processing_notice.assert_awaited_once()
+
+
+async def test_already_deleted_ad_still_receives_warning(tmp_path: Path, storage: Storage) -> None:
+    bot = FakeBot()
+    bot.delete_message = AsyncMock(  # type: ignore[method-assign]
+        side_effect=TelegramBadRequest(
+            method=DeleteMessage(chat_id=-100, message_id=1),
+            message="message to delete not found",
+        )
+    )
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    controller._notice = AsyncMock()
+
+    enforced = await controller._handle_violation(
+        group_message(42, "广告"),
+        42,
+        Violation("test", ""),
+    )
+
+    assert enforced is True
+    assert await storage.warning_count(-100, 42) == 1
+    stats = await storage.chat_stats(-100)
+    assert stats.deleted == 1
+    assert stats.warned == 1
+
+
+async def test_learning_write_failure_does_not_undo_ad_enforcement(
+    tmp_path: Path, storage: Storage
+) -> None:
+    reviewer = SimpleNamespace(
+        review=AsyncMock(
+            return_value=AIReviewResult(
+                True,
+                0.99,
+                "promotion",
+                ("免费领取 usdt",),
+                False,
+                20,
+            )
+        )
+    )
+    bot = FakeBot()
+    controller = ModerationController(
+        bot,
+        settings(tmp_path, ai_enabled=True),  # type: ignore[arg-type]
+        storage,
+        ai_reviewer=reviewer,  # type: ignore[arg-type]
+    )
+    storage.record_ai_learning = AsyncMock(side_effect=RuntimeError("database unavailable"))  # type: ignore[method-assign]
+    controller._processing_notice = AsyncMock(return_value=None)
+    controller._notice = AsyncMock()
+
+    await controller.moderate_message(group_message(42, "免费领取 USDT"))
+
+    assert bot.deleted == [(-100, 1)]
+    assert await storage.warning_count(-100, 42) == 1
+
+
+def test_photo_preview_uses_smallest_safe_size_at_target() -> None:
+    photos = [
+        PhotoSize(file_id="a", file_unique_id="a", width=320, height=320, file_size=10),
+        PhotoSize(file_id="b", file_unique_id="b", width=1280, height=720, file_size=100),
+        PhotoSize(file_id="c", file_unique_id="c", width=1920, height=1080, file_size=200),
+    ]
+
+    selected = select_photo_preview(photos, target_long_edge=1280, maximum_bytes=150)
+
+    assert selected is photos[1]

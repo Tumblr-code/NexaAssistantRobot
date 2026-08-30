@@ -1,5 +1,6 @@
 AI_MODEL = "gpt-5.6-sol"
 AI_REASONING_EFFORT = "high"
+AI_REASONING_EFFORTS = frozenset({"low", AI_REASONING_EFFORT})
 AI_SERVICE_TIER = "default"
 
 # Preserve pre-release and historical alias rows in cumulative AI statistics.

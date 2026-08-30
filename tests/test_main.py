@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -39,12 +39,21 @@ class FakeSession:
 
 
 class FakeBot:
-    def __init__(self, webhook_url: str = "", session: FakeSession | None = None) -> None:
+    def __init__(
+        self,
+        webhook_url: str = "",
+        session: FakeSession | None = None,
+        *,
+        identity_id: int = 1,
+        username: str = "NexaAdminRobot",
+    ) -> None:
         self.session = session or FakeSession()
         self.webhook_url = webhook_url
+        self.identity_id = identity_id
+        self.username = username
 
     async def get_me(self) -> SimpleNamespace:
-        return SimpleNamespace(id=1, username="NexaAdminRobot")
+        return SimpleNamespace(id=self.identity_id, username=self.username)
 
     async def get_webhook_info(self) -> SimpleNamespace:
         return SimpleNamespace(url=self.webhook_url)
@@ -65,8 +74,13 @@ class FakeEphemeral:
 class FakeController:
     def __init__(self) -> None:
         self.router = object()
+        self.admins = SimpleNamespace(warm=AsyncMock())
+        self.started = False
         self.commands_set = False
         self.stopped = False
+
+    async def startup(self) -> None:
+        self.started = True
 
     async def set_commands(self) -> None:
         self.commands_set = True
@@ -92,9 +106,11 @@ class FakeDispatcher:
         *,
         allowed_updates: list[str],
         close_bot_session: bool,
+        tasks_concurrency_limit: int,
     ) -> None:
         assert allowed_updates == ["message"]
         assert close_bot_session is False
+        assert tasks_concurrency_limit == 12
         self.polled = True
 
 
@@ -107,6 +123,9 @@ def _settings() -> SimpleNamespace:
         ai_decision_retention_days=30,
         allowed_chat_ids=frozenset({-100}),
         dry_run=False,
+        expected_bot_id=1,
+        expected_bot_username="NexaAdminRobot",
+        update_concurrency_limit=12,
     )
 
 
@@ -149,7 +168,8 @@ async def test_run_starts_and_closes_every_component(
     assert storage.opened and storage.closed
     assert storage.pruned == [30]
     assert ephemeral.started and ephemeral.stopped
-    assert controller.commands_set and controller.stopped
+    assert controller.started and controller.commands_set and controller.stopped
+    controller.admins.warm.assert_awaited_once_with(frozenset({-100}))
     assert dispatcher.router is controller.router
     assert dispatcher.polled
     assert bot.session.registered == [ephemeral]
@@ -164,35 +184,71 @@ async def test_run_rejects_existing_webhook_and_still_closes(
     settings = _settings()
     storage = FakeStorage()
     bot = FakeBot("https://example.invalid/hook")
-    delete_session = FakeSession()
-    delete_bot = FakeBot(session=delete_session)
-    ephemeral = FakeEphemeral()
-    controller = FakeController()
+    background_started = False
 
     monkeypatch.setattr(main_module, "Settings", SimpleNamespace(from_env=lambda: settings))
     monkeypatch.setattr(main_module, "configure_logging", Mock())
     monkeypatch.setattr(main_module, "Storage", lambda path: storage)
 
     def make_bot(*args: object, **kwargs: object) -> FakeBot:
-        if kwargs.get("session") is delete_session:
-            return delete_bot
         return bot
 
-    monkeypatch.setattr(main_module, "AiohttpSession", lambda: delete_session)
+    def reject_background(*args: object, **kwargs: object) -> object:
+        nonlocal background_started
+        background_started = True
+        raise AssertionError("background components must not start before webhook validation")
+
+    monkeypatch.setattr(main_module, "AiohttpSession", reject_background)
     monkeypatch.setattr(main_module, "Bot", make_bot)
-    monkeypatch.setattr(main_module, "EphemeralMessenger", lambda *args, **kwargs: ephemeral)
+    monkeypatch.setattr(main_module, "EphemeralMessenger", reject_background)
     monkeypatch.setattr(main_module, "EphemeralRequestMiddleware", lambda value: value)
     monkeypatch.setattr(main_module, "Dispatcher", FakeDispatcher)
-    monkeypatch.setattr(main_module, "ModerationController", lambda *args: controller)
+    monkeypatch.setattr(main_module, "ModerationController", reject_background)
 
     with pytest.raises(RuntimeError, match="webhook"):
         await main_module.run()
 
     assert storage.closed
-    assert ephemeral.stopped
-    assert controller.stopped
     assert bot.session.closed
-    assert delete_bot.session.closed
+    assert not background_started
+
+
+@pytest.mark.parametrize(
+    ("bot", "error"),
+    [
+        (FakeBot(identity_id=2), "EXPECTED_BOT_ID"),
+        (FakeBot(username="OtherBot"), "EXPECTED_BOT_USERNAME"),
+    ],
+)
+async def test_identity_mismatch_never_starts_historical_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+    bot: FakeBot,
+    error: str,
+) -> None:
+    settings = _settings()
+    storage = FakeStorage()
+    background_started = False
+
+    monkeypatch.setattr(main_module, "Settings", SimpleNamespace(from_env=lambda: settings))
+    monkeypatch.setattr(main_module, "configure_logging", Mock())
+    monkeypatch.setattr(main_module, "Storage", lambda path: storage)
+    monkeypatch.setattr(main_module, "Bot", lambda *args, **kwargs: bot)
+
+    def reject_background(*args: object, **kwargs: object) -> object:
+        nonlocal background_started
+        background_started = True
+        raise AssertionError("historical deletion must not start before identity validation")
+
+    monkeypatch.setattr(main_module, "AiohttpSession", reject_background)
+    monkeypatch.setattr(main_module, "EphemeralMessenger", reject_background)
+    monkeypatch.setattr(main_module, "ModerationController", reject_background)
+
+    with pytest.raises(RuntimeError, match=error):
+        await main_module.run()
+
+    assert storage.opened and storage.closed
+    assert bot.session.closed
+    assert not background_started
 
 
 async def test_ai_decision_retention_runs_periodically(

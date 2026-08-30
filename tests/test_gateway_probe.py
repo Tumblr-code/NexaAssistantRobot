@@ -10,7 +10,44 @@ from nexa_guardian.ai_review import AIReviewResult, HTTPResponse
 from nexa_guardian.gateway_probe import PROBE_IMAGE_DATA_URL, PROBE_TEXT, probe_gateway
 
 
-async def test_gateway_probe_uses_fixed_model_structured_output_and_image() -> None:
+def production_env(**overrides: str) -> str:
+    values = {
+        "OPENAI_BASE_URL": "https://protected.example/v1",
+        "OPENAI_API_KEY": "protected-placeholder",
+        "EXPECTED_BOT_ID": "123456789",
+        "EXPECTED_BOT_USERNAME": "NexaAdminRobot",
+        "UPDATE_CONCURRENCY_LIMIT": "32",
+        "AI_MODEL": AI_MODEL,
+        "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
+        "AI_NORMAL_REASONING_EFFORT": "low",
+        "AI_SUSPICIOUS_REASONING_EFFORT": "high",
+        "AI_SERVICE_TIER": AI_SERVICE_TIER,
+        "AI_ENABLED": "true",
+        "AI_FAILURE_DELETE": "true",
+        "DRY_RUN": "false",
+        "WARN_LIMIT": "3",
+        "NOTICE_TTL_SECONDS": "30",
+        "AI_CONCURRENCY": "8",
+        "AI_CACHE_TTL_SECONDS": "600",
+        "AI_CACHE_MAX_ENTRIES": "1000",
+        "AI_DECISION_RETENTION_DAYS": "30",
+        "AI_IMAGE_MAX_BYTES": "1572864",
+        "AI_IMAGE_TARGET_LONG_EDGE": "1280",
+        "AI_MEDIA_CONCURRENCY": "4",
+        "AI_AD_THRESHOLD": "0.92",
+        "AI_LEARN_THRESHOLD": "0.97",
+        "AI_TIMEOUT_SECONDS": "8",
+        "AI_NORMAL_ACCEPT_CONFIDENCE": "0.90",
+        "AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS": "2",
+    }
+    values.update(overrides)
+    return "".join(f"{name}={value}\n" for name, value in values.items())
+
+
+@pytest.mark.parametrize("reasoning_effort", ("low", "high"))
+async def test_gateway_probe_uses_fixed_model_structured_output_and_image(
+    reasoning_effort: str,
+) -> None:
     calls: list[dict[str, object]] = []
 
     async def requester(**kwargs: object) -> HTTPResponse:
@@ -20,7 +57,7 @@ async def test_gateway_probe_uses_fixed_model_structured_output_and_image() -> N
             {
                 "status": "completed",
                 "model": AI_MODEL,
-                "reasoning": {"effort": AI_REASONING_EFFORT},
+                "reasoning": {"effort": reasoning_effort},
                 "service_tier": AI_SERVICE_TIER,
                 "output_text": json.dumps(
                     {
@@ -37,6 +74,7 @@ async def test_gateway_probe_uses_fixed_model_structured_output_and_image() -> N
         base_url="https://gateway.example/v1",
         api_key="placeholder-credential",
         model=AI_MODEL,
+        reasoning_effort=reasoning_effort,
         requester=requester,
     )
 
@@ -44,9 +82,11 @@ async def test_gateway_probe_uses_fixed_model_structured_output_and_image() -> N
     payload = calls[0]["payload"]
     assert isinstance(payload, dict)
     assert payload["model"] == AI_MODEL
-    assert payload["reasoning"] == {"effort": AI_REASONING_EFFORT}
+    assert payload["reasoning"] == {"effort": reasoning_effort}
     assert payload["service_tier"] == AI_SERVICE_TIER
     assert payload["store"] is False
+    assert result.reasoning_effort == reasoning_effort
+    assert result.actual_service_tier == AI_SERVICE_TIER
     user_content = payload["input"][1]["content"]  # type: ignore[index]
     assert {item["type"] for item in user_content} == {"input_text", "input_image"}
     assert PROBE_TEXT in {item.get("text") for item in user_content}
@@ -57,7 +97,7 @@ async def test_gateway_probe_uses_fixed_model_structured_output_and_image() -> N
     ("overrides", "message"),
     (
         ({"model": "gpt-5.6"}, "AI_MODEL"),
-        ({"reasoning_effort": "low"}, "AI_REASONING_EFFORT"),
+        ({"reasoning_effort": "medium"}, "AI_REASONING_EFFORT"),
         ({"service_tier": "priority"}, "AI_SERVICE_TIER"),
     ),
 )
@@ -132,22 +172,26 @@ def test_probe_cli_accepts_explicit_required_production_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     env_file = tmp_path / "guardian.env"
-    env_file.write_text(
-        "OPENAI_BASE_URL=https://protected.example/v1\n"
-        "OPENAI_API_KEY=protected-placeholder\n"
-        f"AI_MODEL={AI_MODEL}\n"
-        f"AI_REASONING_EFFORT={AI_REASONING_EFFORT}\n"
-        f"AI_SERVICE_TIER={AI_SERVICE_TIER}\n"
-        "AI_ENABLED=true\n",
-        encoding="utf-8",
-    )
+    env_file.write_text(production_env(), encoding="utf-8")
+    efforts: list[str] = []
 
-    async def fake_probe_gateway(**_kwargs: object) -> AIReviewResult:
-        return AIReviewResult(False, 1.0, "normal", (), False, 12)
+    async def fake_probe_gateway(**kwargs: object) -> AIReviewResult:
+        effort = str(kwargs["reasoning_effort"])
+        efforts.append(effort)
+        return AIReviewResult(
+            False,
+            1.0,
+            "normal",
+            (),
+            False,
+            12,
+            reasoning_effort=effort,
+        )
 
     monkeypatch.setattr(gateway_probe, "probe_gateway", fake_probe_gateway)
 
     assert gateway_probe.main(["--env-file", str(env_file), "--require-production-settings"]) == 0
+    assert efforts == ["low", "high"]
 
 
 def test_probe_cli_does_not_accept_credentials_from_ambient_environment(
@@ -173,7 +217,12 @@ def test_probe_cli_does_not_accept_credentials_from_ambient_environment(
     (
         ("AI_MODEL", "gpt-5.6"),
         ("AI_REASONING_EFFORT", "low"),
+        ("AI_NORMAL_REASONING_EFFORT", "high"),
+        ("AI_SUSPICIOUS_REASONING_EFFORT", "low"),
         ("AI_SERVICE_TIER", "priority"),
+        ("EXPECTED_BOT_ID", "0"),
+        ("EXPECTED_BOT_USERNAME", ""),
+        ("UPDATE_CONCURRENCY_LIMIT", "31"),
         ("DRY_RUN", "true"),
         ("AI_FAILURE_DELETE", "false"),
         ("WARN_LIMIT", "4"),
@@ -185,7 +234,11 @@ def test_probe_cli_does_not_accept_credentials_from_ambient_environment(
         ("AI_CACHE_TTL_SECONDS", "601"),
         ("AI_CACHE_MAX_ENTRIES", "999"),
         ("AI_DECISION_RETENTION_DAYS", "31"),
-        ("AI_IMAGE_MAX_BYTES", "1024"),
+        ("AI_IMAGE_MAX_BYTES", "5242880"),
+        ("AI_IMAGE_TARGET_LONG_EDGE", "1024"),
+        ("AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "3"),
+        ("AI_MEDIA_CONCURRENCY", "3"),
+        ("AI_NORMAL_ACCEPT_CONFIDENCE", "0.91"),
     ),
 )
 def test_probe_cli_rejects_non_release_policy(
@@ -195,16 +248,7 @@ def test_probe_cli_rejects_non_release_policy(
     value: str,
 ) -> None:
     env_file = tmp_path / "guardian.env"
-    env_file.write_text(
-        "OPENAI_BASE_URL=https://protected.example/v1\n"
-        "OPENAI_API_KEY=protected-placeholder\n"
-        f"AI_MODEL={AI_MODEL}\n"
-        f"AI_REASONING_EFFORT={AI_REASONING_EFFORT}\n"
-        f"AI_SERVICE_TIER={AI_SERVICE_TIER}\n"
-        "AI_ENABLED=true\n"
-        f"{setting}={value}\n",
-        encoding="utf-8",
-    )
+    env_file.write_text(production_env(**{setting: value}), encoding="utf-8")
     probe = AsyncMock()
     monkeypatch.setattr(gateway_probe, "probe_gateway", probe)
 
@@ -222,19 +266,17 @@ def test_probe_cli_requires_explicit_model_contract_for_production(
     missing_setting: str,
 ) -> None:
     env_file = tmp_path / "guardian.env"
-    values = {
-        "OPENAI_BASE_URL": "https://protected.example/v1",
-        "OPENAI_API_KEY": "protected-placeholder",
-        "AI_MODEL": AI_MODEL,
-        "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
-        "AI_SERVICE_TIER": AI_SERVICE_TIER,
-        "AI_ENABLED": "true",
-    }
-    del values[missing_setting]
-    env_file.write_text(
-        "".join(f"{name}={value}\n" for name, value in values.items()),
-        encoding="utf-8",
+    values = production_env().replace(
+        f"{missing_setting}="
+        + {
+            "AI_MODEL": AI_MODEL,
+            "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
+            "AI_SERVICE_TIER": AI_SERVICE_TIER,
+        }[missing_setting]
+        + "\n",
+        "",
     )
+    env_file.write_text(values, encoding="utf-8")
     probe = AsyncMock()
     monkeypatch.setattr(gateway_probe, "probe_gateway", probe)
 

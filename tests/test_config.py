@@ -16,10 +16,19 @@ def _base_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "OPENAI_API_KEY",
         "AI_MODEL",
         "AI_REASONING_EFFORT",
+        "AI_NORMAL_REASONING_EFFORT",
+        "AI_SUSPICIOUS_REASONING_EFFORT",
+        "AI_NORMAL_ACCEPT_CONFIDENCE",
         "AI_SERVICE_TIER",
         "AI_AD_THRESHOLD",
         "AI_LEARN_THRESHOLD",
         "NOTICE_TTL_SECONDS",
+        "EXPECTED_BOT_ID",
+        "EXPECTED_BOT_USERNAME",
+        "UPDATE_CONCURRENCY_LIMIT",
+        "AI_IMAGE_TARGET_LONG_EDGE",
+        "AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS",
+        "AI_MEDIA_CONCURRENCY",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -30,9 +39,72 @@ def test_ai_is_disabled_safely_without_credentials(monkeypatch: pytest.MonkeyPat
     assert settings.ai_enabled is False
     assert settings.ai_model == AI_MODEL
     assert settings.ai_reasoning_effort == AI_REASONING_EFFORT
+    assert settings.ai_normal_reasoning_effort == AI_REASONING_EFFORT
+    assert settings.ai_suspicious_reasoning_effort == AI_REASONING_EFFORT
     assert settings.ai_service_tier == AI_SERVICE_TIER
     assert settings.notice_ttl_seconds == 30
     assert settings.database_path == Path("data/test.db")
+
+
+def test_adaptive_reasoning_and_runtime_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("EXPECTED_BOT_ID", "8476280054")
+    monkeypatch.setenv("EXPECTED_BOT_USERNAME", "@NexaAdminRobot")
+    monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "low")
+    monkeypatch.setenv("AI_SUSPICIOUS_REASONING_EFFORT", "high")
+    monkeypatch.setenv("AI_NORMAL_ACCEPT_CONFIDENCE", "0.9")
+    monkeypatch.setenv("UPDATE_CONCURRENCY_LIMIT", "32")
+    monkeypatch.setenv("AI_IMAGE_MAX_BYTES", "1572864")
+    monkeypatch.setenv("AI_IMAGE_TARGET_LONG_EDGE", "1280")
+    monkeypatch.setenv("AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "2")
+    monkeypatch.setenv("AI_MEDIA_CONCURRENCY", "4")
+
+    settings = Settings.from_env()
+
+    assert settings.expected_bot_id == 8476280054
+    assert settings.expected_bot_username == "NexaAdminRobot"
+    assert settings.ai_normal_reasoning_effort == "low"
+    assert settings.ai_suspicious_reasoning_effort == "high"
+    assert settings.ai_normal_accept_confidence == 0.9
+    assert settings.update_concurrency_limit == 32
+    assert settings.ai_image_max_bytes == 1572864
+    assert settings.ai_image_target_long_edge == 1280
+    assert settings.ai_image_download_timeout_seconds == 2
+    assert settings.ai_media_concurrency == 4
+
+
+def test_adaptive_reasoning_must_be_configured_as_a_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "low")
+
+    with pytest.raises(ValueError, match="必须同时配置"):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    ("setting", "value", "message"),
+    (
+        ("EXPECTED_BOT_ID", "0", "正整数"),
+        ("AI_NORMAL_REASONING_EFFORT", "medium", "只能是 low 或 high"),
+        ("AI_SUSPICIOUS_REASONING_EFFORT", "low", "必须是 high"),
+    ),
+)
+def test_runtime_safety_configuration_is_validated(
+    monkeypatch: pytest.MonkeyPatch,
+    setting: str,
+    value: str,
+    message: str,
+) -> None:
+    _base_env(monkeypatch)
+    if setting.startswith("AI_") and "REASONING" in setting:
+        monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "low")
+        monkeypatch.setenv("AI_SUSPICIOUS_REASONING_EFFORT", "high")
+    monkeypatch.setenv(setting, value)
+
+    with pytest.raises(ValueError, match=message):
+        Settings.from_env()
 
 
 def test_ai_requires_gateway_credentials(monkeypatch: pytest.MonkeyPatch) -> None:

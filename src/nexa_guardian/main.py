@@ -53,40 +53,42 @@ async def run() -> None:
         link_preview_is_disabled=True,
     )
     bot = Bot(settings.bot_token, default=bot_defaults)
-    delete_bot = Bot(
-        settings.bot_token,
-        session=AiohttpSession(),
-        default=bot_defaults,
-    )
-    ephemeral = EphemeralMessenger(
-        bot,
-        storage,
-        delete_bot=delete_bot,
-        ttl_seconds=settings.notice_ttl_seconds,
-    )
-    bot.session.middleware(EphemeralRequestMiddleware(ephemeral))
-    dispatcher = Dispatcher()
-    controller = ModerationController(bot, settings, storage)
-    dispatcher.include_router(controller.router)
+    delete_bot: Bot | None = None
+    ephemeral: EphemeralMessenger | None = None
+    controller: ModerationController | None = None
     retention_task: asyncio.Task[None] | None = None
 
     try:
-        await ephemeral.start()
-        await storage.prune_ai_decisions(retention_days=settings.ai_decision_retention_days)
-        retention_task = asyncio.create_task(
-            prune_ai_decisions_periodically(
-                storage,
-                retention_days=settings.ai_decision_retention_days,
-            ),
-            name="nexa-ai-decision-retention",
-        )
         identity = await bot.get_me()
         webhook = await bot.get_webhook_info()
+        if settings.expected_bot_id is not None and identity.id != settings.expected_bot_id:
+            raise RuntimeError("BOT 身份与 EXPECTED_BOT_ID 不一致，拒绝启动。")
+        expected_username = settings.expected_bot_username.casefold()
+        actual_username = (identity.username or "").casefold()
+        if expected_username and actual_username != expected_username:
+            raise RuntimeError("BOT 身份与 EXPECTED_BOT_USERNAME 不一致，拒绝启动。")
         if webhook.url:
             raise RuntimeError(
                 "这个 BOT_TOKEN 当前已配置 webhook；为防止误切换现有机器人，本服务不会自动删除。"
                 "请先确认 Token 归属，再调用 deleteWebhook 或换用新 Token。"
             )
+
+        delete_bot = Bot(
+            settings.bot_token,
+            session=AiohttpSession(),
+            default=bot_defaults,
+        )
+        ephemeral = EphemeralMessenger(
+            bot,
+            storage,
+            delete_bot=delete_bot,
+            ttl_seconds=settings.notice_ttl_seconds,
+        )
+        bot.session.middleware(EphemeralRequestMiddleware(ephemeral))
+        dispatcher = Dispatcher()
+        controller = ModerationController(bot, settings, storage)
+        dispatcher.include_router(controller.router)
+
         logger.info(
             "bot verified id=%s username=@%s allowed_chats=%s dry_run=%s",
             identity.id,
@@ -96,6 +98,17 @@ async def run() -> None:
         )
         if not settings.allowed_chat_ids:
             logger.warning("ALLOWED_CHAT_IDS 为空：自动群管保持停用，仅可用 /chatid 和 /status")
+        await controller.admins.warm(settings.allowed_chat_ids)
+        await ephemeral.start()
+        await controller.startup()
+        await storage.prune_ai_decisions(retention_days=settings.ai_decision_retention_days)
+        retention_task = asyncio.create_task(
+            prune_ai_decisions_periodically(
+                storage,
+                retention_days=settings.ai_decision_retention_days,
+            ),
+            name="nexa-ai-decision-retention",
+        )
         try:
             await controller.set_commands()
         except TelegramAPIError:
@@ -104,19 +117,23 @@ async def run() -> None:
             bot,
             allowed_updates=dispatcher.resolve_used_update_types(),
             close_bot_session=False,
+            tasks_concurrency_limit=settings.update_concurrency_limit,
         )
     finally:
-        await controller.shutdown()
+        if controller is not None:
+            await controller.shutdown()
         if retention_task is not None:
             retention_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await retention_task
-        await ephemeral.shutdown()
+        if ephemeral is not None:
+            await ephemeral.shutdown()
         await storage.close()
         try:
             await bot.session.close()
         finally:
-            await delete_bot.session.close()
+            if delete_bot is not None:
+                await delete_bot.session.close()
 
 
 def main() -> None:

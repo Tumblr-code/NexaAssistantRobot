@@ -22,9 +22,11 @@ from nexa_guardian.ai_review import (
     AIReviewer,
     AIReviewHTTPError,
     AIReviewResponseError,
+    AIReviewResult,
     AIReviewTimeout,
     HTTPResponse,
     _aiohttp_request,
+    _content_digest,
     normalize_signature,
     safe_rejected_signature,
     suspicious_precheck,
@@ -59,11 +61,13 @@ class FakeRequester:
         return outcome
 
 
-def contract_body(**overrides: object) -> dict[str, object]:
+def contract_body(
+    *, reasoning_effort: str = AI_REASONING_EFFORT, **overrides: object
+) -> dict[str, object]:
     body: dict[str, object] = {
         "status": "completed",
         "model": AI_MODEL,
-        "reasoning": {"effort": AI_REASONING_EFFORT},
+        "reasoning": {"effort": reasoning_effort},
         "service_tier": AI_SERVICE_TIER,
     }
     body.update(overrides)
@@ -77,6 +81,7 @@ def response(
     category: str | None = None,
     signatures: list[str] | None = None,
     status: int = 200,
+    reasoning_effort: str = AI_REASONING_EFFORT,
 ) -> HTTPResponse:
     decision = {
         "is_ad": is_ad,
@@ -87,17 +92,18 @@ def response(
     return HTTPResponse(
         status=status,
         body=contract_body(
+            reasoning_effort=reasoning_effort,
             output=[
                 {
                     "type": "message",
                     "content": [{"type": "output_text", "text": json.dumps(decision)}],
                 }
-            ]
+            ],
         ),
     )
 
 
-def reviewer(requester: object, **overrides: object) -> AIReviewer:
+def reviewer(requester: object | None = None, **overrides: object) -> AIReviewer:
     credentials = "".join(("placeholder", "-", "credential"))
     values: dict[str, object] = {
         "base_url": "https://gateway.example/openai/v1",
@@ -126,7 +132,7 @@ async def test_responses_payload_is_strict_private_and_multimodal() -> None:
     assert not result.cached
     call = requester.calls[0]
     assert call["url"] == "https://gateway.example/openai/v1/responses"
-    assert call["timeout"] == 8.0
+    assert 0 < call["timeout"] <= 8.0
     payload = call["payload"]
     assert isinstance(payload, dict)
     assert payload["model"] == AI_MODEL
@@ -197,6 +203,57 @@ async def test_direct_output_text_is_supported() -> None:
     assert result.category == "normal"
 
 
+@pytest.mark.parametrize("reasoning_effort", ("low", "high"))
+async def test_per_review_reasoning_effort_is_sent_and_validated(
+    reasoning_effort: str,
+) -> None:
+    requester = FakeRequester(
+        response(is_ad=False, reasoning_effort=reasoning_effort),
+    )
+    service = reviewer(requester)
+
+    result = await service.review(
+        text=f"ordinary {reasoning_effort} review",
+        safety_identifier="opaque",
+        reasoning_effort=reasoning_effort,
+    )
+
+    payload = requester.calls[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["model"] == AI_MODEL
+    assert payload["reasoning"] == {"effort": reasoning_effort}
+    assert payload["service_tier"] == AI_SERVICE_TIER
+    assert payload["store"] is False
+    assert payload["max_output_tokens"] == 1000
+    assert result.reasoning_effort == reasoning_effort
+    assert result.actual_service_tier == AI_SERVICE_TIER
+    assert result.service_tier == AI_SERVICE_TIER
+    assert result.review_path == "gateway"
+    assert result.queue_latency_ms >= 0
+    assert result.request_latency_ms >= 0
+    assert result.attempt_count == 1
+
+
+async def test_per_review_reasoning_effort_rejects_unsupported_value_and_mismatch() -> None:
+    requester = FakeRequester(response(is_ad=False, reasoning_effort="high"))
+    service = reviewer(requester)
+
+    with pytest.raises(ValueError, match="low or high"):
+        await service.review(
+            text="ordinary message",
+            safety_identifier="opaque",
+            reasoning_effort="medium",
+        )
+    assert requester.calls == []
+
+    with pytest.raises(AIReviewResponseError, match="reasoning effort"):
+        await service.review(
+            text="ordinary message",
+            safety_identifier="opaque",
+            reasoning_effort="low",
+        )
+
+
 async def test_cache_uses_hash_and_expires_after_ttl() -> None:
     now = [100.0]
     requester = FakeRequester(response(is_ad=False), response(is_ad=True))
@@ -213,6 +270,49 @@ async def test_cache_uses_hash_and_expires_after_ttl() -> None:
     assert refreshed.is_ad
     assert len(requester.calls) == 2
     assert "ordinary message" not in repr(service._cache)
+
+
+async def test_cache_isolated_by_reasoning_effort_and_reports_cache_path() -> None:
+    requester = FakeRequester(
+        response(is_ad=False, reasoning_effort="low"),
+        response(is_ad=True, reasoning_effort="high"),
+    )
+    service = reviewer(requester)
+
+    low = await service.review(
+        text="same message",
+        safety_identifier="one",
+        reasoning_effort="low",
+    )
+    high = await service.review(
+        text="same message",
+        safety_identifier="one",
+        reasoning_effort="high",
+    )
+    cached_low = await service.review(
+        text="same message",
+        safety_identifier="two",
+        reasoning_effort="low",
+    )
+
+    assert not low.is_ad
+    assert high.is_ad
+    assert cached_low.reasoning_effort == "low"
+    assert cached_low.cached
+    assert cached_low.review_path == "cache"
+    assert cached_low.attempt_count == 0
+    assert len(requester.calls) == 2
+
+
+def test_cache_digest_includes_reasoning_effort_and_service_tier() -> None:
+    shared = (AI_MODEL, "high", AI_SERVICE_TIER, "same", None, (), ())
+
+    baseline = _content_digest(*shared)
+    low = _content_digest(AI_MODEL, "low", AI_SERVICE_TIER, "same", None, (), ())
+    other_tier = _content_digest(AI_MODEL, "high", "priority", "same", None, (), ())
+
+    assert baseline != low
+    assert baseline != other_tier
 
 
 async def test_cache_is_bounded_lru() -> None:
@@ -329,6 +429,156 @@ async def test_concurrency_limit_is_enforced() -> None:
     )
 
     assert maximum == 2
+
+
+async def test_twenty_concurrent_identical_reviews_share_one_gateway_request() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    participants_ready = 0
+    all_participants_ready = asyncio.Event()
+
+    async def blocking_requester(**_: object) -> HTTPResponse:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return response(is_ad=False)
+
+    service = reviewer(blocking_requester)
+
+    async def participant() -> AIReviewResult:
+        nonlocal participants_ready
+        participants_ready += 1
+        if participants_ready == 20:
+            all_participants_ready.set()
+        await all_participants_ready.wait()
+        return await service.review(text="same message", safety_identifier="opaque")
+
+    tasks = [asyncio.create_task(participant()) for _ in range(20)]
+    await started.wait()
+    await asyncio.sleep(0)
+    release.set()
+    results = await asyncio.gather(*tasks)
+
+    assert calls == 1
+    paths = [result.review_path for result in results]
+    assert paths.count("gateway") == 1
+    assert set(paths).issubset({"gateway", "singleflight", "cache"})
+    assert "singleflight" in paths
+
+
+async def test_cancelled_waiter_does_not_cancel_shared_review() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def blocking_requester(**_: object) -> HTTPResponse:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return response(is_ad=False)
+
+    service = reviewer(blocking_requester)
+    owner = asyncio.create_task(service.review(text="same message", safety_identifier="owner"))
+    await started.wait()
+    waiter = asyncio.create_task(service.review(text="same message", safety_identifier="waiter"))
+    await asyncio.sleep(0)
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert not owner.done()
+
+    release.set()
+    result = await owner
+    assert not result.is_ad
+    assert result.review_path == "gateway"
+    assert calls == 1
+
+
+async def test_singleflight_failure_is_shared_and_not_cached() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def failing_once_requester(**_: object) -> HTTPResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+            return HTTPResponse(400, {})
+        return response(is_ad=False)
+
+    service = reviewer(failing_once_requester)
+    owner = asyncio.create_task(service.review(text="same message", safety_identifier="owner"))
+    await started.wait()
+    waiter = asyncio.create_task(service.review(text="same message", safety_identifier="waiter"))
+    await asyncio.sleep(0)
+    release.set()
+
+    failures = await asyncio.gather(owner, waiter, return_exceptions=True)
+    assert all(isinstance(item, AIReviewHTTPError) for item in failures)
+    assert calls == 1
+
+    result = await service.review(text="same message", safety_identifier="retry")
+    assert not result.is_ad
+    assert result.review_path == "gateway"
+    assert calls == 2
+
+
+async def test_total_deadline_includes_queue_wait() -> None:
+    requester = FakeRequester(response(is_ad=False))
+    service = reviewer(requester, concurrency=1, timeout=0.01)
+    await service._semaphore.acquire()
+    try:
+        with pytest.raises(AIReviewTimeout):
+            await service.review(text="queued message", safety_identifier="opaque")
+    finally:
+        service._semaphore.release()
+        await service.close()
+
+    assert requester.calls == []
+
+
+async def test_retry_requires_three_seconds_remaining_in_total_deadline() -> None:
+    now = [100.0]
+    calls: list[float] = []
+
+    async def requester_without_retry(*, timeout: float, **_: object) -> HTTPResponse:
+        calls.append(timeout)
+        now[0] += 5.1
+        return HTTPResponse(503, {})
+
+    service = reviewer(requester_without_retry, clock=lambda: now[0])
+    with pytest.raises(AIReviewHTTPError) as caught:
+        await service.review(text="message", safety_identifier="opaque")
+
+    assert caught.value.status == 503
+    assert calls == [8.0]
+
+
+async def test_retry_uses_only_remaining_deadline_and_reports_attempts() -> None:
+    now = [100.0]
+    calls: list[float] = []
+
+    async def requester_with_retry(*, timeout: float, **_: object) -> HTTPResponse:
+        calls.append(timeout)
+        if len(calls) == 1:
+            now[0] += 4.9
+            return HTTPResponse(503, {})
+        return response(is_ad=False)
+
+    service = reviewer(requester_with_retry, clock=lambda: now[0])
+    result = await service.review(text="message", safety_identifier="opaque")
+
+    assert calls[0] == 8.0
+    assert calls[1] == pytest.approx(3.1)
+    assert result.attempt_count == 2
+    assert result.request_latency_ms == 4900
+    assert result.latency_ms == 4900
 
 
 @pytest.mark.parametrize(
@@ -667,6 +917,7 @@ async def test_review_requires_content_image_data_url_and_identifier() -> None:
 class RaisingClientSession:
     def __init__(self, error: BaseException) -> None:
         self.error = error
+        self.closed = False
 
     async def __aenter__(self) -> RaisingClientSession:
         return self
@@ -676,6 +927,111 @@ class RaisingClientSession:
 
     def post(self, *_: object, **__: object) -> object:
         raise self.error
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class ReusableResponse:
+    def __init__(self, body: object) -> None:
+        self.status = 200
+        self.body = body
+
+    async def __aenter__(self) -> ReusableResponse:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    async def json(self, *, content_type: object = None) -> object:
+        del content_type
+        return self.body
+
+
+class ReusableClientSession:
+    def __init__(self, *, connector: object) -> None:
+        self.connector = connector
+        self.closed = False
+        self.close_calls = 0
+        self.posts: list[dict[str, object]] = []
+
+    def post(self, _url: str, **kwargs: object) -> ReusableResponse:
+        self.posts.append(kwargs)
+        payload = kwargs["json"]
+        assert isinstance(payload, Mapping)
+        reasoning = payload["reasoning"]
+        assert isinstance(reasoning, Mapping)
+        effort = reasoning["effort"]
+        assert isinstance(effort, str)
+        return ReusableResponse(
+            contract_body(
+                reasoning_effort=effort,
+                output_text=json.dumps(
+                    {
+                        "is_ad": False,
+                        "confidence": 0.01,
+                        "category": "normal",
+                        "signatures": [],
+                    }
+                ),
+            )
+        )
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self.closed = True
+
+
+async def test_default_http_session_is_lazy_reused_and_closed_idempotently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connectors: list[dict[str, int]] = []
+    sessions: list[ReusableClientSession] = []
+
+    def fake_connector(*, limit: int) -> object:
+        connector = {"limit": limit}
+        connectors.append(connector)
+        return connector
+
+    def fake_session(*, connector: object) -> ReusableClientSession:
+        session = ReusableClientSession(connector=connector)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(aiohttp, "TCPConnector", fake_connector)
+    monkeypatch.setattr(aiohttp, "ClientSession", fake_session)
+    service = reviewer(concurrency=3)
+
+    assert sessions == []
+    await service.review(text="first", safety_identifier="one", reasoning_effort="low")
+    await service.review(text="second", safety_identifier="two", reasoning_effort="high")
+
+    assert connectors == [{"limit": 3}]
+    assert len(sessions) == 1
+    assert len(sessions[0].posts) == 2
+    assert not sessions[0].closed
+
+    await service.close()
+    await service.close()
+    assert sessions[0].closed
+    assert sessions[0].close_calls == 1
+
+
+async def test_injected_requester_never_creates_default_http_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_session(**_: object) -> object:
+        raise AssertionError("default ClientSession must not be created")
+
+    monkeypatch.setattr(aiohttp, "ClientSession", unexpected_session)
+    requester = FakeRequester(response(is_ad=False))
+    service = reviewer(requester)
+
+    result = await service.review(text="message", safety_identifier="opaque")
+    await service.close()
+
+    assert not result.is_ad
+    assert len(requester.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -689,6 +1045,7 @@ class RaisingClientSession:
 async def test_aiohttp_client_errors_are_wrapped(
     monkeypatch: pytest.MonkeyPatch, error: aiohttp.ClientError
 ) -> None:
+    monkeypatch.setattr(aiohttp, "TCPConnector", lambda **_: object())
     monkeypatch.setattr(
         aiohttp,
         "ClientSession",
@@ -705,6 +1062,7 @@ async def test_aiohttp_client_errors_are_wrapped(
 
 
 async def test_aiohttp_timeout_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(aiohttp, "TCPConnector", lambda **_: object())
     monkeypatch.setattr(
         aiohttp,
         "ClientSession",

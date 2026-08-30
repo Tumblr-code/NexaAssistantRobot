@@ -18,13 +18,19 @@
 - 使用 `--source` 时，还需安装 Python `build`、`uv` 或可用的 `python3 -m pip`；生产发布优先使用 CI 构建的 wheel。
 - 在运行脚本前，将仓库或 wheel 放到 VM 上的明确绝对路径；不要把 API Key 写入 wheel、源码或命令行。
 - `/etc/nexa-guardian/guardian.env` 必须配置兼容网关的 `OPENAI_BASE_URL`、
-  `OPENAI_API_KEY`、`AI_MODEL=gpt-5.6-sol`、`AI_REASONING_EFFORT=high` 和
-  `AI_SERVICE_TIER=default`；三项模型契约必须显式存在，不接受默认补齐、家族别名或静默改写。
+  `OPENAI_API_KEY`、`AI_MODEL=gpt-5.6-sol`、`AI_REASONING_EFFORT=high`、
+  `AI_NORMAL_REASONING_EFFORT=low`、`AI_SUSPICIOUS_REASONING_EFFORT=high` 和
+  `AI_SERVICE_TIER=default`；模型与自适应推理契约必须显式存在，不接受默认补齐、家族别名或静默改写。
+  还必须显式配置正确的 `EXPECTED_BOT_ID`、`EXPECTED_BOT_USERNAME`，以及
+  `UPDATE_CONCURRENCY_LIMIT=32`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、
+  `AI_IMAGE_MAX_BYTES=1572864`、`AI_IMAGE_TARGET_LONG_EDGE=1280`、
+  `AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2`、`AI_MEDIA_CONCURRENCY=4`。
   发布脚本会用候选虚拟环境的 `nexa-guardian-probe --require-production-settings` 验证
   Responses、严格结构化输出和图片输入，并要求响应明确返回 `status=completed`、
-  `model=gpt-5.6-sol`、`reasoning.effort=high`、`service_tier=default`。探针还会拒绝未启用
-  AI、警告阈值不是 3、消息保留时间不是 30 秒或关闭故障删除的配置，同时核对发布计划固定
-  的阈值、超时、并发、缓存、保留期及图片大小。探测只发送固定的无害文本及 1×1 测试图片，
+  `model=gpt-5.6-sol`、本次请求对应的 `reasoning.effort=low/high`、
+  `service_tier=default`。探针还会拒绝未启用 AI、警告阈值不是 3、消息保留时间不是 30 秒、
+  机器人身份未固定或关闭故障删除的配置，同时核对发布计划固定的阈值、超时、更新/AI/媒体
+  并发、缓存、保留期及图片预览限制。探测只发送固定的无害文本及 1×1 测试图片，
   不读取群消息，也不会输出密钥或响应正文。
 
 ## 发布命令
@@ -33,9 +39,9 @@
 
 ```bash
 sudo /path/to/repository/deploy/release.sh \
-  --wheel /root/releases/nexa_guardian-0.2.0-py3-none-any.whl \
+  --wheel /root/releases/nexa_guardian-0.3.0-py3-none-any.whl \
   --git-sha 0123456789abcdef0123456789abcdef01234567 \
-  --schema-version 5
+  --schema-version 6
 ```
 
 直接从已检出的源码构建：
@@ -43,11 +49,11 @@ sudo /path/to/repository/deploy/release.sh \
 ```bash
 sudo /path/to/repository/deploy/release.sh \
   --source /root/NexaAssistantRobot \
-  --schema-version 5
+  --schema-version 6
 ```
 
-当前版本的 `--schema-version` 必须明确传入 `5`，脚本会在启动后核对数据库的
-`PRAGMA user_version=5`。wheel 模式必须显式提供
+当前版本的 `--schema-version` 必须明确传入 `6`，脚本会在启动后核对数据库的
+`PRAGMA user_version=6`。wheel 模式必须显式提供
 完整 Git SHA；源码模式只接受无未提交或未跟踪文件的干净 Git worktree，默认读取 `HEAD`，
 也可通过 `--git-sha` 固定指定且必须与 `HEAD` 完全一致。
 
@@ -58,14 +64,15 @@ sudo /path/to/repository/deploy/release.sh \
    `/var/backups/nexa-guardian/manual/pre-release-<release-id>.env`，校验内容一致并固定为
    `root:root 0600`；日志只显示备份路径，不输出配置内容。
 3. 校验或构建 wheel，计算并复核 SHA256，创建服务组只读的独立虚拟环境。
-4. 使用候选版本对兼容网关执行固定无害请求，验证 Responses、严格结构化输出、图片输入及
-   服务端实际采用 `gpt-5.6-sol`、`high`、`default`；任一能力或响应契约失败即停止，不切换生产。
+4. 使用候选版本对兼容网关执行固定无害请求，验证 Responses、严格结构化输出、图片输入、
+   `low/high` 自适应推理契约及服务端实际采用 `gpt-5.6-sol`、`default`；同时验证机器人身份、
+   更新并发与媒体预览生产配置。任一能力或响应契约失败即停止，不切换生产。
 5. 写入 `release.json` 并完成候选 release 后，停止服务并确认它不再写库。
 6. 使用 SQLite 在线备份 API 创建最终一致的
    `/var/backups/nexa-guardian/manual/pre-release-<release-id>.db`，运行
    `PRAGMA quick_check`、`PRAGMA foreign_key_check` 并记录 SHA256。
 7. 将 `current` 软链接原子切换到 `<UTC timestamp>-<short SHA>` release，启动服务。
-8. 检查 systemd 启用/运行状态、主进程、退出状态、自动重启次数、数据库完整性和 schema 5；失败时执行下述数据库与代码回滚。
+8. 检查 systemd 启用/运行状态、主进程、退出状态、自动重启次数、数据库完整性和 schema 6；失败时执行下述数据库与代码回滚。
 9. 验证成功后，仅清理标准命名的旧代码 release，固定保留 `current` 和最近两个旧版本；
    备份目录、非标准目录及 `current` 指向的 release 不会被清理。
 
@@ -100,5 +107,19 @@ systemctl status nexa-guardian-backup.timer --no-pager
 ```
 
 脚本只验证服务和 SQLite 的基础健康状态。Telegram 权限、管理员私聊、Nexa Guardian 官方
-群管理审核员身份、三个一方站点的精确域名行为、AI 网关 Sol/high/default 响应契约、群内
-30 秒消息清理、授权管理员私聊保留及真实群组审核行为仍需按照发布验收清单逐项检查。
+群管理审核员身份、三个一方站点的精确域名行为、AI 网关 Sol/low-high/default 响应契约、
+群内与日志群 30 秒消息清理、授权管理员私聊永久保留、日志 outbox 重试及真实群组审核行为
+仍需按照发布验收清单逐项检查。
+
+启动时会按 `deploy/telegram-profile.md` 同步默认和 `zh` 的机器人名称、简短介绍、详细说明
+与命令菜单。上线后应通过 Telegram API 回读两套资料，确认成员筛选、群内 30 秒清理及唯一
+管理员私聊永久保留的说明均已生效；头像不由服务自动覆盖。
+
+v0.3.0 的成员筛选只从新版本上线后记录首次观察、最后群内发言和成员状态元数据。Telegram
+Bot API 不能读取可靠的“最后上线”，也不能枚举接入前的全部历史成员或完整识别已注销账号；
+因此最早也要在上线观察满 30 天后才可能出现候选。上线验收只检查 `/inactive` 的私聊权限和
+空候选说明，不要为验证而执行 `/cleanupinactive` 清理真实成员。实际使用清理命令时仍需唯一
+管理员私聊、限制成员权限和 10 分钟内二次确认，且执行前会再次排除管理员、机器人、可信用户、
+已离群成员和出现新活动的成员。逐成员操作与发言、可信状态和其他封禁动作共用互斥锁；遇到
+Telegram 限流会有界重试。若移出后的解除封禁最终失败，批次会立即停止，并由 5 分钟临时
+封禁兜底，避免后续成员被连续误留在永久封禁名单。
