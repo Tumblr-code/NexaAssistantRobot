@@ -903,10 +903,12 @@ class ModerationController:
                 await self.bot.send_message(message.chat.id, "无法唯一核验匿名管理员，本次未登记。")
                 return
             participant_id = actor[0]
+            participant_user = None
         else:
             if message.from_user is None or message.from_user.is_bot:
                 return
             participant_id = message.from_user.id
+            participant_user = message.from_user
             try:
                 member = await self.bot.get_chat_member(message.chat.id, participant_id)
             except TelegramAPIError:
@@ -936,8 +938,20 @@ class ModerationController:
                 await self.storage.ack_ephemeral(raffle.chat_id, raffle.message_id)
             except TelegramAPIError:
                 logger.debug("更新抽奖人数失败 raffle_id=%s", raffle.id)
-        text = f"已参加抽奖，当前 {count} 人。" if joined else "你已参加过，本次不重复登记。"
+        mention = self._raffle_participant_mention(participant_user, participant_id)
+        text = (
+            f"{mention}，已成功参与抽奖！🎉\n当前共有 {count} 人参与。"
+            if joined
+            else f"{mention}，你已经参与过啦，本次不会重复登记。"
+        )
         await self.bot.send_message(message.chat.id, text)
+
+    @staticmethod
+    def _raffle_participant_mention(user: User | None, user_id: int) -> str:
+        if user is not None and user.username:
+            return f"@{html.escape(user.username)}"
+        label = html.escape(user.full_name) if user is not None else "用户"
+        return f'<a href="tg://user?id={user_id}">{label}</a>'
 
     async def _delete_raffle_keyword_message(self, message: Message) -> None:
         try:
@@ -1033,7 +1047,10 @@ class ModerationController:
             logger.exception("发布抽奖卡片失败 chat_id=%s raffle_id=%s", actor[2], raffle.id)
             await message.answer("抽奖发布失败，已安全取消。")
             return
-        await message.answer(f"抽奖 #{raffle.id} 已创建并置顶。")
+        await message.answer(
+            "🎉 <b>抽奖已发布并置顶</b>\n"
+            f"发送关键词 <code>{html.escape(raffle.keyword or '')}</code> 即可参与。"
+        )
 
     async def _unpin_raffle_message(self, raffle: Raffle) -> bool:
         if raffle.message_id is None:
