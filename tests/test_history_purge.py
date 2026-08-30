@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import pytest
 
 from nexa_guardian import history_purge as purge_module
-from nexa_guardian.history_purge import HistoryPurgeError, HistoryPurger
+from nexa_guardian.history_purge import (
+    HistoryPurgeError,
+    HistoryPurger,
+    TelegramAdminSession,
+    TelegramAdminSessionError,
+)
 
 
 async def test_history_purge_requires_configuration(tmp_path: Path) -> None:
@@ -18,13 +23,37 @@ async def test_history_purge_requires_configuration(tmp_path: Path) -> None:
         await purger.purge(-100)
 
 
+async def test_shared_admin_session_rejects_concurrent_mtproto_work(tmp_path: Path) -> None:
+    session = TelegramAdminSession(
+        api_id=12345,
+        api_hash="test-hash",
+        session_path=tmp_path / "admin",
+        authorized_user_ids=frozenset({7}),
+    )
+    await session._lock.acquire()
+    try:
+        with pytest.raises(TelegramAdminSessionError, match="已有 MTProto"):
+            async with session.connect(-100):
+                raise AssertionError("unreachable")
+    finally:
+        session._lock.release()
+
+
 async def test_history_purge_scans_three_times_and_verifies_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class FakeClient:
         instances: list["FakeClient"] = []
 
-        def __init__(self, session: str, api_id: int, api_hash: str) -> None:
+        def __init__(
+            self,
+            session: str,
+            api_id: int,
+            api_hash: str,
+            *,
+            flood_sleep_threshold: int,
+        ) -> None:
+            assert flood_sleep_threshold == 30
             self.deleted: list[tuple[int, ...]] = []
             self.scans = 0
             self.disconnected = False

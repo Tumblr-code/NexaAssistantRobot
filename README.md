@@ -10,7 +10,7 @@ Nexa Guardian 的身份是 Nexa 官方群管理审核员。固定的一方站点
 
 上述精确域名本身不会被当作外部链接信号；相似域名、伪造后缀、钓鱼、冒充和附带其他广告证据的内容仍会进入审核。
 
-生产服务位于 VM `192.168.0.35`，由 `nexa-guardian.service` 持久运行，目标为 `@NexaStoreGroup`。v0.4.4 使用五个极简命令，提供持久化关键词抽奖、审核策略短时缓存、幂等资料同步和可选的管理员 MTProto 全历史清理。
+生产服务位于 VM `192.168.0.35`，由 `nexa-guardian.service` 持久运行，目标为 `@NexaStoreGroup`。v0.5.0 使用五个极简命令，提供持久化关键词抽奖、审核策略短时缓存、幂等资料同步，以及管理员 MTProto 全历史与成员清理。
 
 ## 已实现
 
@@ -26,7 +26,7 @@ Nexa Guardian 的身份是 Nexa 官方群管理审核员。固定的一方站点
 - 关键词参与只执行一次抽奖查询，不额外核验发言成员；参与人数按 2 秒合并更新置顶卡，开奖时仍重新核验候选人是否在群。
 - 机器人命令和公开资料仅在内容变化时写入，单项限流不会阻断其他资料同步或服务启动。
 - 唯一管理员权限使用 5 分钟有效缓存，过期后的在线核验最多等待 5 秒并在失败时拒绝执行。
-- `/del all` 可选使用唯一管理员的 Telegram 用户会话分批清理群历史；部署验收不会自动执行。
+- `/del all` 使用唯一管理员的 Telegram 用户会话分批清理群历史；`/del members` 在私聊中筛选已注销、长期离线或 30 天无发言成员，生成确认码后才允许移出。部署验收不会自动执行任何真实清理。
 - 可选独立日志群；管理动作先与本地记录原子写入持久 outbox，再异步发送和失败重试，不阻塞删消息、警告或封禁。
 - AI 判断不保存消息正文、图片、处罚原因或模型推理。
 - `DRY_RUN` 观察模式、群 ID 白名单、在线 SQLite 备份、持久化临时消息删除队列、独立 Telegram 删除连接、systemd/Docker 非 root 运行。
@@ -35,7 +35,8 @@ Nexa Guardian 的身份是 Nexa 官方群管理审核员。固定的一方站点
 
 - [GroupButler](https://github.com/group-butler/GroupButler) 的规则、反洪水和管理员缓存思路成熟，但主体是较旧的 Lua/Redis 技术栈。
 - [Guardian 示例项目](https://github.com/RakinSV/Telegram-admin-app-project) 展示了现代 aiogram 3 的 CAPTCHA、链接白名单、反洪水和分级处置，但整个仓库远大于本项目所需范围。
-- 本项目使用 [aiogram](https://github.com/aiogram/aiogram) 3.x，从零实现所需的小型功能集，没有复制上述项目代码。
+- [TeleBox clean_member](https://github.com/TeleBoxOrg/TeleBox-Plugins/blob/main/clean_member/clean_member.ts) 提供了 MTProto 成员分页和状态分类参考，[clean](https://github.com/TeleBoxOrg/TeleBox-Plugins/blob/main/clean/clean.ts) 提供了已注销账号识别参考；本项目没有复制其许可证不明确的源码，也没有采用逐成员历史搜索或无确认直接清理。
+- 本项目使用 [aiogram](https://github.com/aiogram/aiogram) 3.x 和 Telethon，从零实现所需的小型功能集，没有复制上述项目代码。
 
 Telegram 官方说明：群管理员机器人可以接收普通群消息；删除和限制成员仍要求对应管理员权限。参见 [Bots FAQ](https://core.telegram.org/bots/faq) 和 [Bot API](https://core.telegram.org/bots/api)。
 
@@ -105,8 +106,8 @@ ALLOWED_CHAT_IDS=-1001234567890,-1009876543210
 | `DEFAULT_MUTE_SECONDS` | `3600` | 手动 `/mute` 的默认禁言秒数 |
 | `DRY_RUN` | `false` | 只记录自动命中，不删除/警告/禁言；手动管理员命令仍执行 |
 | `LOG_CHAT_ID` | 空 | 可选的集中管理日志群/频道 |
-| `TELEGRAM_API_ID` | 空 | `/del all` 使用的 Telegram API ID；必须与 Hash 同时配置 |
-| `TELEGRAM_API_HASH` | 空 | `/del all` 使用的 Telegram API Hash；仅存于 VM 受保护环境文件 |
+| `TELEGRAM_API_ID` | 空 | `/del all` 和 `/del members` 使用的 Telegram API ID；必须与 Hash 同时配置 |
+| `TELEGRAM_API_HASH` | 空 | MTProto 管理会话使用的 Telegram API Hash；仅存于 VM 受保护环境文件 |
 | `TELEGRAM_SESSION_PATH` | `/var/lib/nexa-guardian/mtproto/admin` | 已交互登录的唯一管理员用户会话路径 |
 
 兼容网关必须同时支持 Responses API、严格 JSON Schema、图片输入、`reasoning.effort=low/high` 和可核验的服务层。当前生产网关会把 `priority` 请求降为 `default`，因此程序明确固定并校验 `service_tier=default`，不会把降级伪装成 Priority。快速响应由连接复用、相同内容 singleflight、普通文字 `low`、8 秒端到端总超时、10 分钟缓存和已学习特征本地直拦实现。程序只接受响应中明确返回 `status=completed`、`model=gpt-5.6-sol`、本次请求对应的推理强度及 `service_tier=default` 的结果，缺失或不匹配均按审核服务故障处理。请求设置 `store=false`，只发送待判断文本或图片，不发送用户名、用户 ID、群名和聊天历史。普通文件和无预览贴纸不送入 AI。
@@ -187,10 +188,12 @@ uv run pytest --cov=src/nexa_guardian --cov-fail-under=75
 
 ```text
 /help                         极简说明
-/status                       权限、AI、抽奖及全群清理状态
+/status                       权限、AI、抽奖及 MTProto 管理状态
 /ban                          回复成员消息或私聊填写用户 ID
 /del                          删除回复的群消息；私聊可填写消息 ID
 /del all                      立即清理群历史，不锁群、不二次确认
+/del members                  私聊预览已注销或长期不活跃成员
+/del members CODE confirm     10 分钟内确认移出本次候选
 /lottery 30m 1 参与 奖品      创建关键词抽奖并置顶
 /lottery end|cancel|reroll    立即开奖、取消或重抽
 ```
@@ -199,7 +202,9 @@ uv run pytest --cov=src/nexa_guardian --cov-fail-under=75
 
 机器人在群聊和日志群发送的消息会在首次发送成功约 30 秒后删除；编辑“正在审核…”不会重置时间。删除队列只保存 Telegram 消息标识和到期时间，服务重启后会继续补删。删除使用独立于长轮询的 Telegram 连接，单次请求超时后保留队列并退避重试。唯一授权管理员的私聊回复永久保留，不进入删除队列。
 
-`/del all` 依赖在 VM 上预先登录的 `@China_OpenAi` 用户会话；未配置时 `/status` 明确显示待配置并拒绝执行。任务按最多 100 条分批删除，限流不超过 300 秒时等待一次，批量失败退回逐条删除，最后追加两轮扫描。
+`/del all` 与 `/del members` 共用 VM 上预先登录的 `@China_OpenAi` 用户会话和互斥锁；未配置时 `/status` 明确显示待配置并拒绝执行。`/del all` 按最多 100 条分批删除，限流不超过 300 秒时等待一次，批量失败退回逐条删除，最后追加两轮扫描。
+
+`/del members` 固定使用 30 天阈值：先按每页 200 人读取成员，并只遍历一次最近 30 天群历史；已注销、精确离线超过 30 天、Telegram 当前可提供的最模糊状态 `LastMonth`，或入群满 30 天且期间无发言，任一命中即进入候选。`LastMonth` 可能受 Telegram 隐私设置影响，因此预览会单独标识；官方 API 没有独立的 `LongAgo` 类型，`UserStatusEmpty` 也不会被当作长期离线。群历史未明确跨过 30 天边界时关闭“无发言”条件。每次最多纳入 50 人，确认前重新扫描预览后的群消息，并再次排除管理员、机器人、可信用户、已离群成员和新增活动者；实际移出使用带 5 分钟兜底的临时封禁后立即解封。
 
 机器人会核验命令发起者在 Telegram 中的实际管理员权限：没有“限制成员”权限的管理员不能借机器人禁言或封禁，没有“删除消息”权限的管理员不能借机器人删除消息。群主和管理员不会被自动过滤，也不能成为禁言/封禁目标。
 
@@ -220,7 +225,7 @@ uv run pytest --cov=src/nexa_guardian --cov-fail-under=75
 3. 上线后验证服务、唯一管理员私聊权限、群内临时消息补删队列，并确认私聊回复不入队。
 4. 用非管理员测试账号验证正常聊天静默、可疑提示、广告删除和第三次警告封禁。
 5. 验证 AI 超时时只删除消息、不增加警告，并确认连续失败告警与 `/aipause` 可用。
-6. 验证 `/inactive` 只显示 v0.3.0 上线后观察到的活动元数据；不要为验收而实际清理生产成员。
+6. 私聊执行 `/del members` 验证 MTProto 成员预览、分类和确认码；不要发送 `confirm`，也不要为验收清理生产成员。
 
 网关凭据写入受保护环境文件后，可在候选 release 的虚拟环境中执行：
 
