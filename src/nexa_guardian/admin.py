@@ -26,20 +26,29 @@ class _AdminCacheEntry:
     user_ids: frozenset[int]
 
 
+@dataclass(frozen=True, slots=True)
+class _RightsCacheEntry:
+    expires_at: float
+    rights: AdminRights
+
+
 class AdminService:
     def __init__(
         self,
         bot: Bot,
         *,
         cache_seconds: int = 300,
+        rights_timeout_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if cache_seconds <= 0:
-            raise ValueError("cache_seconds must be positive")
+        if cache_seconds <= 0 or rights_timeout_seconds <= 0:
+            raise ValueError("cache_seconds and rights_timeout_seconds must be positive")
         self.bot = bot
         self.cache_seconds = cache_seconds
+        self.rights_timeout_seconds = rights_timeout_seconds
         self._clock = clock
         self._cache: dict[int, _AdminCacheEntry] = {}
+        self._rights_cache: dict[tuple[int, int], _RightsCacheEntry] = {}
         self._refresh_tasks: dict[int, asyncio.Task[frozenset[int] | None]] = {}
         self._refresh_overrides: dict[int, dict[int, bool]] = {}
 
@@ -67,6 +76,7 @@ class AdminService:
         Authorization configured outside this service must remain an independent
         exemption; this cache only reflects Telegram's current administrator set.
         """
+        self._rights_cache.pop((chat_id, user_id), None)
         cached = self._cache.get(chat_id)
         refresh_task = self._refresh_tasks.get(chat_id)
         if cached is None or (refresh_task is not None and not refresh_task.done()):
@@ -110,6 +120,17 @@ class AdminService:
             return latest.user_ids if latest is not None else None
 
         user_ids = {item.user.id for item in members}
+        for key in tuple(self._rights_cache):
+            if key[0] == chat_id:
+                self._rights_cache.pop(key, None)
+        expires_at = self._clock() + self.cache_seconds
+        for member in members:
+            rights = self._rights_from_member(member)
+            if rights is not None:
+                self._rights_cache[(chat_id, member.user.id)] = _RightsCacheEntry(
+                    expires_at=expires_at,
+                    rights=rights,
+                )
         for user_id, is_admin in self._refresh_overrides.pop(chat_id, {}).items():
             if is_admin:
                 user_ids.add(user_id)
@@ -117,7 +138,7 @@ class AdminService:
                 user_ids.discard(user_id)
         result = frozenset(user_ids)
         self._cache[chat_id] = _AdminCacheEntry(
-            expires_at=self._clock() + self.cache_seconds,
+            expires_at=expires_at,
             user_ids=result,
         )
         return result
@@ -141,8 +162,24 @@ class AdminService:
             )
 
     async def rights(self, chat_id: int, user_id: int) -> AdminRights:
-        member = await self.bot.get_chat_member(chat_id, user_id)
-        if isinstance(member, ChatMemberOwner) or member.status == ChatMemberStatus.CREATOR:
+        cached = self._rights_cache.get((chat_id, user_id))
+        if cached is not None and cached.expires_at > self._clock():
+            return cached.rights
+        member = await asyncio.wait_for(
+            self.bot.get_chat_member(chat_id, user_id),
+            timeout=self.rights_timeout_seconds,
+        )
+        rights = self._rights_from_member(member) or AdminRights(False, False, False)
+        self._rights_cache[(chat_id, user_id)] = _RightsCacheEntry(
+            expires_at=self._clock() + self.cache_seconds,
+            rights=rights,
+        )
+        return rights
+
+    @staticmethod
+    def _rights_from_member(member: object) -> AdminRights | None:
+        status = getattr(member, "status", None)
+        if isinstance(member, ChatMemberOwner) or status == ChatMemberStatus.CREATOR:
             return AdminRights(True, True, True)
         if isinstance(member, ChatMemberAdministrator):
             return AdminRights(
@@ -150,7 +187,7 @@ class AdminService:
                 can_delete_messages=member.can_delete_messages,
                 can_restrict_members=member.can_restrict_members,
             )
-        return AdminRights(False, False, False)
+        return None
 
     async def unique_anonymous_actor(
         self, chat_id: int, authorized_admin_ids: frozenset[int]
@@ -184,3 +221,6 @@ class AdminService:
 
     def invalidate(self, chat_id: int) -> None:
         self._cache.pop(chat_id, None)
+        for key in tuple(self._rights_cache):
+            if key[0] == chat_id:
+                self._rights_cache.pop(key, None)
