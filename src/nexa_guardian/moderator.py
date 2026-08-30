@@ -84,6 +84,10 @@ INACTIVE_RETRY_AFTER_MAX_SECONDS = 15
 RAFFLE_MIN_SECONDS = 60
 RAFFLE_MAX_SECONDS = 30 * 24 * 60 * 60
 RAFFLE_WORKER_INTERVAL_SECONDS = 2
+RAFFLE_CARD_DEBOUNCE_SECONDS = 2
+MODERATION_POLICY_CACHE_SECONDS = 5
+TRUST_CACHE_SECONDS = 60
+TRUST_CACHE_MAX = 4096
 BOT_PROFILE_NAME = "Nexa 群管助手"
 BOT_PROFILE_SHORT_DESCRIPTION = (
     "Nexa 官方群管理审核员：GPT-5.6 Sol 智能识别广告与刷屏，自动删除并警告；"
@@ -168,6 +172,14 @@ class PendingInactiveCleanup:
     cutoff: str
     members: tuple[tuple[int, str], ...]
     expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class ModerationPolicySnapshot:
+    expires_at: float
+    paused: bool
+    active_signatures: frozenset[str]
+    allowed_domains: frozenset[str]
 
 
 class AIDecisionMetrics(TypedDict):
@@ -455,7 +467,13 @@ class ModerationController:
         )
         self._auto_banned_members: OrderedDict[tuple[int, int], float] = OrderedDict()
         self._inactive_cleanup_plans: dict[tuple[int, str], PendingInactiveCleanup] = {}
+        self._policy_cache: dict[int, ModerationPolicySnapshot] = {}
+        self._policy_locks: dict[int, asyncio.Lock] = {}
+        self._policy_versions: dict[int, int] = {}
+        self._trusted_cache: OrderedDict[tuple[int, int], tuple[float, bool]] = OrderedDict()
         self._raffle_locks: dict[int, asyncio.Lock] = {}
+        self._raffle_card_updates: dict[int, tuple[Raffle, int]] = {}
+        self._raffle_card_tasks: dict[int, asyncio.Task[None]] = {}
         self._raffle_worker_task: asyncio.Task[None] | None = None
         self._stopping = False
         self.history_purger = HistoryPurger(
@@ -526,7 +544,7 @@ class ModerationController:
             admin_state = await self.admins.cached_is_admin(message.chat.id, user_id)
             if admin_state is not False:
                 return False
-            if await self.storage.is_trusted(message.chat.id, user_id):
+            if await self._is_trusted(message.chat.id, user_id):
                 return False
             return True
         return message.sender_chat is not None
@@ -540,21 +558,86 @@ class ModerationController:
             BotCommand(command="lottery", description="创建或管理群抽奖"),
         ]
         for language_code in (None, "zh"):
-            await self.bot.set_my_commands(commands, language_code=language_code)
-            await self.bot.set_my_name(BOT_PROFILE_NAME, language_code=language_code)
-            await self.bot.set_my_short_description(
-                BOT_PROFILE_SHORT_DESCRIPTION,
+            await self._sync_bot_value(
+                label="commands",
                 language_code=language_code,
+                expected=tuple((item.command, item.description) for item in commands),
+                read=lambda code=language_code: self.bot.get_my_commands(language_code=code),
+                current_value=lambda items: tuple(
+                    (item.command, item.description) for item in items
+                ),
+                write=lambda code=language_code: self.bot.set_my_commands(
+                    commands, language_code=code
+                ),
             )
-            await self.bot.set_my_description(
-                BOT_PROFILE_DESCRIPTION,
+            await self._sync_bot_value(
+                label="name",
                 language_code=language_code,
+                expected=BOT_PROFILE_NAME,
+                read=lambda code=language_code: self.bot.get_my_name(language_code=code),
+                current_value=lambda item: item.name,
+                write=lambda code=language_code: self.bot.set_my_name(
+                    BOT_PROFILE_NAME, language_code=code
+                ),
             )
+            await self._sync_bot_value(
+                label="short_description",
+                language_code=language_code,
+                expected=BOT_PROFILE_SHORT_DESCRIPTION,
+                read=lambda code=language_code: self.bot.get_my_short_description(
+                    language_code=code
+                ),
+                current_value=lambda item: item.short_description,
+                write=lambda code=language_code: self.bot.set_my_short_description(
+                    BOT_PROFILE_SHORT_DESCRIPTION, language_code=code
+                ),
+            )
+            await self._sync_bot_value(
+                label="description",
+                language_code=language_code,
+                expected=BOT_PROFILE_DESCRIPTION,
+                read=lambda code=language_code: self.bot.get_my_description(language_code=code),
+                current_value=lambda item: item.description,
+                write=lambda code=language_code: self.bot.set_my_description(
+                    BOT_PROFILE_DESCRIPTION, language_code=code
+                ),
+            )
+
+    async def _sync_bot_value(
+        self,
+        *,
+        label: str,
+        language_code: str | None,
+        expected: object,
+        read: Callable[[], Awaitable[Any]],
+        current_value: Callable[[Any], object],
+        write: Callable[[], Awaitable[Any]],
+    ) -> None:
+        language = language_code or "default"
+        try:
+            current = current_value(await read())
+        except TelegramAPIError:
+            logger.exception("读取机器人资料失败 field=%s language=%s", label, language)
+            return
+        if current == expected:
+            return
+        try:
+            await write()
+        except TelegramRetryAfter as exc:
+            logger.warning(
+                "机器人资料同步受限 field=%s language=%s retry_after=%s",
+                label,
+                language,
+                exc.retry_after,
+            )
+        except TelegramAPIError:
+            logger.exception("同步机器人资料失败 field=%s language=%s", label, language)
 
     async def startup(self) -> None:
         self._stopping = False
         await self.reporter.start()
         await self._clean_pending_raffles()
+        await self._sync_active_raffle_cards()
         self._raffle_worker_task = asyncio.create_task(
             self._raffle_worker(), name="nexa-raffle-worker"
         )
@@ -566,10 +649,60 @@ class ModerationController:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._raffle_worker_task
             self._raffle_worker_task = None
+        await self._flush_raffle_card_updates()
         await self.reporter.shutdown()
         close_reviewer = getattr(self.ai_reviewer, "close", None)
         if close_reviewer is not None:
             await close_reviewer()
+
+    async def _moderation_policy(self, chat_id: int) -> ModerationPolicySnapshot:
+        now = time.monotonic()
+        cached = self._policy_cache.get(chat_id)
+        if cached is not None and cached.expires_at > now:
+            return cached
+        lock = self._policy_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            while True:
+                now = time.monotonic()
+                cached = self._policy_cache.get(chat_id)
+                if cached is not None and cached.expires_at > now:
+                    return cached
+                version = self._policy_versions.get(chat_id, 0)
+                paused, signatures, domains = await asyncio.gather(
+                    self.storage.runtime_setting(chat_id, "ai_paused"),
+                    self.storage.active_ai_signatures(chat_id),
+                    self.storage.allowed_domains(chat_id),
+                )
+                if self._policy_versions.get(chat_id, 0) != version:
+                    continue
+                snapshot = ModerationPolicySnapshot(
+                    expires_at=now + MODERATION_POLICY_CACHE_SECONDS,
+                    paused=paused == "1",
+                    active_signatures=frozenset(signatures),
+                    allowed_domains=frozenset(domains),
+                )
+                self._policy_cache[chat_id] = snapshot
+                return snapshot
+
+    def _invalidate_policy(self, chat_id: int) -> None:
+        self._policy_cache.pop(chat_id, None)
+        self._policy_versions[chat_id] = self._policy_versions.get(chat_id, 0) + 1
+
+    async def _is_trusted(self, chat_id: int, user_id: int) -> bool:
+        key = (chat_id, user_id)
+        now = time.monotonic()
+        cached = self._trusted_cache.pop(key, None)
+        if cached is not None and cached[0] > now:
+            self._trusted_cache[key] = cached
+            return cached[1]
+        result = await self.storage.is_trusted(chat_id, user_id)
+        self._trusted_cache[key] = (now + TRUST_CACHE_SECONDS, result)
+        while len(self._trusted_cache) > TRUST_CACHE_MAX:
+            self._trusted_cache.popitem(last=False)
+        return result
+
+    def _invalidate_trusted(self, chat_id: int, user_id: int) -> None:
+        self._trusted_cache.pop((chat_id, user_id), None)
 
     def is_allowed_chat(self, chat_id: int) -> bool:
         return chat_id in self.settings.allowed_chat_ids
@@ -599,7 +732,7 @@ class ModerationController:
             target_chat_id = next(iter(self.settings.allowed_chat_ids))
             try:
                 rights = await self.admins.rights(target_chat_id, message.from_user.id)
-            except TelegramAPIError:
+            except (TelegramAPIError, asyncio.TimeoutError):
                 logger.exception(
                     "检查私聊管理员权限失败 chat_id=%s user_id=%s",
                     target_chat_id,
@@ -655,7 +788,7 @@ class ModerationController:
             return None
         try:
             rights = await self.admins.rights(message.chat.id, message.from_user.id)
-        except TelegramAPIError:
+        except (TelegramAPIError, asyncio.TimeoutError):
             logger.exception("检查管理员权限失败 chat_id=%s", message.chat.id)
             await message.answer("暂时无法向 Telegram 核验管理员权限，请稍后再试。")
             return None
@@ -813,6 +946,18 @@ class ModerationController:
             if raffle is not None
             else "无进行中抽奖"
         )
+        health_warnings: list[str] = []
+        if self._ai_failure_streak:
+            health_warnings.append(f"AI 连续失败 {self._ai_failure_streak} 次")
+        overdue = await self.storage.due_ephemeral(
+            datetime.now(UTC).isoformat(timespec="seconds"),
+            limit=1,
+        )
+        if overdue:
+            health_warnings.append("临时消息清理存在积压")
+        health_line = (
+            f"\n运行告警：{html.escape('；'.join(health_warnings))}" if health_warnings else ""
+        )
         await message.answer(
             f"<b>运行状态</b>\n"
             f"机器人：@{html.escape(me.username or str(me.id))}\n"
@@ -826,6 +971,7 @@ class ModerationController:
             f"AI 审核：{'开' if self.settings.ai_enabled else '关'}\n"
             f"抽奖：{raffle_status}\n"
             f"全群清理：{'已配置' if self.settings.mtproto_ready else '待配置 Telegram API 凭据'}"
+            f"{health_line}"
         )
 
     @staticmethod
@@ -840,7 +986,7 @@ class ModerationController:
             f"开奖时间：{ends}（北京时间）"
         )
 
-    async def _raffle_keyword_message(self, message: Message) -> bool:
+    async def _raffle_keyword_message(self, message: Message) -> bool | dict[str, Raffle]:
         anonymous_admin = (
             message.sender_chat is not None and message.sender_chat.id == message.chat.id
         )
@@ -859,7 +1005,8 @@ class ModerationController:
             normalized = normalize_raffle_keyword(message.text)
         except ValueError:
             return False
-        return await self.storage.active_raffle_for_keyword(message.chat.id, normalized) is not None
+        raffle = await self.storage.active_raffle_for_keyword(message.chat.id, normalized)
+        return {"raffle": raffle} if raffle is not None else False
 
     async def _raffle_pin_service_message(self, message: Message) -> bool:
         pinned = message.pinned_message
@@ -877,16 +1024,7 @@ class ModerationController:
         except TelegramAPIError:
             logger.debug("删除抽奖置顶服务消息失败 chat_id=%s", message.chat.id)
 
-    async def join_lottery_keyword(self, message: Message) -> None:
-        if message.text is None:
-            return
-        try:
-            normalized = normalize_raffle_keyword(message.text)
-        except ValueError:
-            return
-        raffle = await self.storage.active_raffle_for_keyword(message.chat.id, normalized)
-        if raffle is None:
-            return
+    async def join_lottery_keyword(self, message: Message, raffle: Raffle) -> None:
         anonymous_admin = (
             message.sender_chat is not None and message.sender_chat.id == message.chat.id
         )
@@ -909,19 +1047,6 @@ class ModerationController:
                 return
             participant_id = message.from_user.id
             participant_user = message.from_user
-            try:
-                member = await self.bot.get_chat_member(message.chat.id, participant_id)
-            except TelegramAPIError:
-                await self._delete_raffle_keyword_message(message)
-                await self.bot.send_message(message.chat.id, "暂时无法核验群成员身份，请稍后重试。")
-                return
-            if member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} or (
-                member.status == ChatMemberStatus.RESTRICTED
-                and not bool(getattr(member, "is_member", False))
-            ):
-                await self._delete_raffle_keyword_message(message)
-                await self.bot.send_message(message.chat.id, "只有当前群成员可以参加抽奖。")
-                return
 
         joined, count = await self.storage.join_raffle(raffle.id, participant_id)
         await self._delete_raffle_keyword_message(message)
@@ -929,15 +1054,7 @@ class ModerationController:
             await self.bot.send_message(message.chat.id, "该抽奖已结束。")
             return
         if joined and raffle.message_id is not None:
-            try:
-                await self.bot.edit_message_text(
-                    self._raffle_card(raffle, count),
-                    chat_id=raffle.chat_id,
-                    message_id=raffle.message_id,
-                )
-                await self.storage.ack_ephemeral(raffle.chat_id, raffle.message_id)
-            except TelegramAPIError:
-                logger.debug("更新抽奖人数失败 raffle_id=%s", raffle.id)
+            self._schedule_raffle_card_update(raffle, count)
         mention = self._raffle_participant_mention(participant_user, participant_id)
         text = (
             f"{mention}，已成功参与抽奖！🎉\n当前共有 {count} 人参与。"
@@ -945,6 +1062,90 @@ class ModerationController:
             else f"{mention}，你已经参与过啦，本次不会重复登记。"
         )
         await self.bot.send_message(message.chat.id, text)
+
+    def _schedule_raffle_card_update(self, raffle: Raffle, count: int) -> None:
+        previous = self._raffle_card_updates.get(raffle.id)
+        if previous is None or count >= previous[1]:
+            self._raffle_card_updates[raffle.id] = (raffle, count)
+        task = self._raffle_card_tasks.get(raffle.id)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._debounced_raffle_card_update(raffle.id),
+                name=f"nexa-raffle-card-{raffle.id}",
+            )
+            self._raffle_card_tasks[raffle.id] = task
+            task.add_done_callback(
+                lambda completed, raffle_id=raffle.id: self._raffle_card_update_done(
+                    raffle_id, completed
+                )
+            )
+
+    async def _debounced_raffle_card_update(self, raffle_id: int) -> None:
+        await asyncio.sleep(RAFFLE_CARD_DEBOUNCE_SECONDS)
+        update = self._raffle_card_updates.pop(raffle_id, None)
+        if update is not None:
+            await self._edit_raffle_card(*update)
+
+    def _raffle_card_update_done(self, raffle_id: int, task: asyncio.Task[None]) -> None:
+        if self._raffle_card_tasks.get(raffle_id) is task:
+            self._raffle_card_tasks.pop(raffle_id, None)
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            logger.error(
+                "抽奖人数更新任务失败 raffle_id=%s",
+                raffle_id,
+                exc_info=(type(exception), exception, exception.__traceback__),
+            )
+        pending = self._raffle_card_updates.get(raffle_id)
+        if pending is not None and not self._stopping:
+            self._schedule_raffle_card_update(*pending)
+
+    async def _edit_raffle_card(self, raffle: Raffle, count: int) -> None:
+        if raffle.message_id is None:
+            return
+        try:
+            await self.bot.edit_message_text(
+                self._raffle_card(raffle, count),
+                chat_id=raffle.chat_id,
+                message_id=raffle.message_id,
+            )
+            await self.storage.ack_ephemeral(raffle.chat_id, raffle.message_id)
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).casefold():
+                logger.debug("更新抽奖人数失败 raffle_id=%s", raffle.id)
+        except TelegramAPIError:
+            logger.debug("更新抽奖人数失败 raffle_id=%s", raffle.id)
+
+    async def _sync_active_raffle_cards(self) -> None:
+        for chat_id in self.settings.allowed_chat_ids:
+            raffle = await self.storage.active_raffle(chat_id)
+            if raffle is not None:
+                await self._edit_raffle_card(
+                    raffle,
+                    await self.storage.raffle_entry_count(raffle.id),
+                )
+
+    async def _flush_raffle_card_updates(self) -> None:
+        tasks = tuple(self._raffle_card_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._raffle_card_tasks.clear()
+        updates = tuple(self._raffle_card_updates.values())
+        self._raffle_card_updates.clear()
+        for raffle, count in updates:
+            await self._edit_raffle_card(raffle, count)
+
+    async def _cancel_raffle_card_update(self, raffle_id: int) -> None:
+        self._raffle_card_updates.pop(raffle_id, None)
+        task = self._raffle_card_tasks.pop(raffle_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     @staticmethod
     def _raffle_participant_mention(user: User | None, user_id: int) -> str:
@@ -1148,6 +1349,7 @@ class ModerationController:
     async def _publish_raffle_result(
         self, raffle: Raffle, winners: tuple[int, ...], *, round_number: int
     ) -> None:
+        await self._cancel_raffle_card_update(raffle.id)
         if winners:
             lines = [
                 f'{position}. <a href="tg://user?id={user_id}">中奖成员</a>'
@@ -1197,6 +1399,7 @@ class ModerationController:
             return
         if not await self.storage.cancel_raffle(raffle.id):
             return
+        await self._cancel_raffle_card_update(raffle.id)
         text = f"<b>抽奖已取消</b>\n\n奖品：{html.escape(raffle.prize)}"
         await self._schedule_raffle_card_cleanup(raffle)
         await self._unpin_raffle_message(raffle)
@@ -1555,6 +1758,7 @@ class ModerationController:
             return
         async with self._member_action_lock(chat_id, target.user_id):
             await self.storage.add_trusted_user(chat_id, target.user_id, actor[0])
+        self._invalidate_trusted(chat_id, target.user_id)
         await self.reporter.record(
             chat_id=chat_id,
             action="trust",
@@ -1575,6 +1779,7 @@ class ModerationController:
             return
         async with self._member_action_lock(chat_id, target.user_id):
             await self.storage.remove_trusted_user(chat_id, target.user_id)
+        self._invalidate_trusted(chat_id, target.user_id)
         await self.reporter.record(
             chat_id=chat_id,
             action="untrust",
@@ -1594,6 +1799,7 @@ class ModerationController:
             await message.answer("用法：<code>/addomain example.com</code>")
             return
         await self.storage.add_allowed_domain(chat_id, domain, actor[0])
+        self._invalidate_policy(chat_id)
         await self.reporter.record(
             chat_id=chat_id,
             action="add_domain",
@@ -1615,6 +1821,7 @@ class ModerationController:
             await message.answer("这是环境变量中的全局白名单，请修改 .env 并重启。")
             return
         await self.storage.remove_allowed_domain(chat_id, domain)
+        self._invalidate_policy(chat_id)
         await self.reporter.record(
             chat_id=chat_id,
             action="delete_domain",
@@ -1650,6 +1857,7 @@ class ModerationController:
         if not await self.storage.disable_ai_signature(actor[2], identifier):
             await message.answer("未找到可停用的 AI 特征。")
             return
+        self._invalidate_policy(actor[2])
         await self.reporter.record(chat_id=actor[2], action="delete_words", actor_id=actor[0])
         await message.answer("已停用该 AI 特征。")
 
@@ -1743,6 +1951,7 @@ class ModerationController:
         if actor is None:
             return
         await self.storage.set_runtime_setting(actor[2], "ai_paused", "1")
+        self._invalidate_policy(actor[2])
         await message.answer("AI 审核已暂停；暂停期间普通成员消息将保留。")
 
     async def ai_resume(self, message: Message) -> None:
@@ -1750,6 +1959,7 @@ class ModerationController:
         if actor is None:
             return
         await self.storage.set_runtime_setting(actor[2], "ai_paused", "0")
+        self._invalidate_policy(actor[2])
         await message.answer("AI 审核已恢复。")
 
     async def _private_ai_admin(self, message: Message) -> tuple[int, AdminRights, int] | None:
@@ -2071,7 +2281,7 @@ class ModerationController:
             admin_state = await self.admins.cached_is_admin(message.chat.id, user_id)
             if admin_state is not False:
                 return
-            if await self.storage.is_trusted(message.chat.id, user_id):
+            if await self._is_trusted(message.chat.id, user_id):
                 return
         elif message.sender_chat is None:
             return
@@ -2083,19 +2293,16 @@ class ModerationController:
         if not self.settings.ai_enabled or self.ai_reviewer is None:
             await self._moderate_legacy(message, user_id, text, entity_urls)
             return
-        if await self.storage.runtime_setting(message.chat.id, "ai_paused") == "1":
+        policy = await self._moderation_policy(message.chat.id)
+        if policy.paused:
             return
 
-        active_signatures, stored_allowed_domains = await asyncio.gather(
-            self.storage.active_ai_signatures(message.chat.id),
-            self.storage.allowed_domains(message.chat.id),
-        )
         suspicion = suspicious_precheck(
             text,
             entity_urls=entity_urls,
             is_forwarded=message.forward_origin is not None,
-            active_signatures=active_signatures,
-            allowed_domains=set(self.settings.allowed_domains) | stored_allowed_domains,
+            active_signatures=set(policy.active_signatures),
+            allowed_domains=set(self.settings.allowed_domains) | set(policy.allowed_domains),
         )
         flood_violation = (
             self.flood.check(message.chat.id, user_id, text)
@@ -2428,6 +2635,9 @@ class ModerationController:
                     and learned_signature.max_confidence >= self.settings.ai_ad_threshold
                 ):
                     await self.storage.activate_ai_signature(chat_id, learned_signature.id)
+                    self._invalidate_policy(chat_id)
+                if learned_signature.status == "active" or signature_status == "active":
+                    self._invalidate_policy(chat_id)
             for signature in result.rejected_signatures:
                 await self.storage.upsert_ai_signature(
                     chat_id=chat_id,

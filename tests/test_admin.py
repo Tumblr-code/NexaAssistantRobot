@@ -112,3 +112,42 @@ async def test_member_updates_are_applied_during_and_after_refresh() -> None:
     service.update_member(-100, 7, is_admin=False)
     assert await service.cached_is_admin(-100, 7) is False
     assert await service.cached_is_admin(-100, 8) is True
+
+
+async def test_rights_are_cached_and_online_refresh_is_bounded() -> None:
+    clock = MutableClock()
+
+    class Bot:
+        calls = 0
+
+        async def get_chat_member(self, chat_id: int, user_id: int) -> SimpleNamespace:
+            self.calls += 1
+            return SimpleNamespace(status="creator")
+
+    bot = Bot()
+    service = AdminService(bot, cache_seconds=10, clock=clock)  # type: ignore[arg-type]
+
+    first = await service.rights(-100, 7)
+    second = await service.rights(-100, 7)
+
+    assert first.is_admin and second.can_delete_messages and second.can_restrict_members
+    assert bot.calls == 1
+    clock.advance(11)
+    assert (await service.rights(-100, 7)).is_admin
+    assert bot.calls == 2
+
+
+async def test_rights_timeout_fails_instead_of_using_expired_cache() -> None:
+    class Bot:
+        async def get_chat_member(self, chat_id: int, user_id: int) -> SimpleNamespace:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    service = AdminService(Bot(), rights_timeout_seconds=0.01)  # type: ignore[arg-type]
+
+    try:
+        await service.rights(-100, 7)
+    except asyncio.TimeoutError:
+        pass
+    else:
+        raise AssertionError("rights lookup must time out")

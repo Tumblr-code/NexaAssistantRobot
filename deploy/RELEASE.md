@@ -39,7 +39,7 @@
 
 ```bash
 sudo /path/to/repository/deploy/release.sh \
-  --wheel /root/releases/nexa_guardian-0.4.3-py3-none-any.whl \
+  --wheel /root/releases/nexa_guardian-0.4.4-py3-none-any.whl \
   --git-sha 0123456789abcdef0123456789abcdef01234567 \
   --schema-version 8
 ```
