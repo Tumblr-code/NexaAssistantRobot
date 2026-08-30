@@ -2034,6 +2034,32 @@ async def test_learning_write_failure_does_not_undo_ad_enforcement(
     assert await storage.warning_count(-100, 42) == 1
 
 
+async def test_chat_member_status_accepts_telegram_string_value(
+    tmp_path: Path,
+    storage: Storage,
+) -> None:
+    controller = ModerationController(  # type: ignore[arg-type]
+        FakeBot(),
+        settings(tmp_path),
+        storage,
+    )
+    event = SimpleNamespace(
+        chat=SimpleNamespace(id=-100),
+        date=datetime(2026, 8, 30, 6, 38, 25, tzinfo=UTC),
+        new_chat_member=SimpleNamespace(
+            user=SimpleNamespace(id=42, is_bot=False),
+            status="restricted",
+        ),
+    )
+
+    await controller.chat_member_changed(event)  # type: ignore[arg-type]
+
+    activity = await storage.member_activity(-100, 42)
+    assert activity is not None
+    assert activity.last_status == "restricted"
+    assert activity.last_membership_at == "2026-08-30T06:38:25+00:00"
+
+
 def test_photo_preview_uses_smallest_safe_size_at_target() -> None:
     photos = [
         PhotoSize(file_id="a", file_unique_id="a", width=320, height=320, file_size=10),

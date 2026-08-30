@@ -10,7 +10,7 @@ Nexa Guardian 的身份是 Nexa 官方群管理审核员。固定的一方站点
 
 上述精确域名本身不会被当作外部链接信号；相似域名、伪造后缀、钓鱼、冒充和附带其他广告证据的内容仍会进入审核。
 
-生产服务位于 VM `SERVER-IP`，由 `nexa-guardian.service` 持久运行，目标为 `@ExampleGroup`。仓库中的 v0.3.0 AI 模式只有在兼容网关探测通过并配置 `AI_ENABLED=true` 后才会启用；未启用时继续运行旧规则兼容模式。
+生产服务位于 VM `SERVER-IP`，由 `nexa-guardian.service` 持久运行，目标为 `@ExampleGroup`。仓库中的 v0.3.1 AI 模式只有在兼容网关探测通过并配置 `AI_ENABLED=true` 后才会启用；未启用时继续运行旧规则兼容模式。
 
 ## 已实现
 
