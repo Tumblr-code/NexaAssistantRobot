@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from nexa_guardian.ai_contract import AI_MODEL
-from nexa_guardian.storage import SCHEMA_VERSION, Storage
+from nexa_guardian.storage import SCHEMA_VERSION, Storage, normalize_raffle_keyword
 
 
 @pytest.fixture
@@ -29,11 +29,13 @@ async def test_raffle_lifecycle_is_persistent_and_idempotent(storage: Storage) -
     raffle = await storage.create_raffle(
         chat_id=-100,
         creator_id=7,
+        keyword="参与",
         prize="GiftPass 月卡",
         winner_count=2,
         ends_at="2099-01-01T00:00:00+00:00",
     )
     assert await storage.set_raffle_message(raffle.id, 88)
+    assert await storage.activate_raffle(raffle.id)
     assert (await storage.active_raffle(-100)).message_id == 88  # type: ignore[union-attr]
 
     assert await storage.join_raffle(raffle.id, 41) == (True, 1)
@@ -54,6 +56,7 @@ async def test_raffle_allows_only_one_running_per_chat_and_supports_reroll(
     raffle = await storage.create_raffle(
         chat_id=-100,
         creator_id=7,
+        keyword="Nexa",
         prize="ModelPass",
         winner_count=1,
         ends_at="2099-01-01T00:00:00+00:00",
@@ -62,14 +65,109 @@ async def test_raffle_allows_only_one_running_per_chat_and_supports_reroll(
         await storage.create_raffle(
             chat_id=-100,
             creator_id=7,
+            keyword="第二场",
             prize="第二场",
             winner_count=1,
             ends_at="2099-01-01T00:00:00+00:00",
         )
+    assert await storage.set_raffle_message(raffle.id, 88)
+    assert await storage.activate_raffle(raffle.id)
     await storage.join_raffle(raffle.id, 41)
     assert await storage.finish_raffle(raffle.id, (41,))
     assert await storage.add_reroll(raffle.id, (41,)) == 2
     assert (await storage.raffle_winners(raffle.id))[0].round == 2
+
+
+def test_raffle_keyword_normalization_is_exact_and_rejects_unsafe_values() -> None:
+    assert normalize_raffle_keyword("  ＮＥＸＡ\u200b  ") == "nexa"
+    assert normalize_raffle_keyword("参与") == "参与"
+    with pytest.raises(ValueError, match="不能包含空格"):
+        normalize_raffle_keyword("Nexa 参与")
+    with pytest.raises(ValueError, match="命令、账号或链接"):
+        normalize_raffle_keyword("@Nexa")
+
+
+async def test_pending_raffle_is_not_joinable_until_activated(storage: Storage) -> None:
+    raffle = await storage.create_raffle(
+        chat_id=-100,
+        creator_id=7,
+        keyword="参与",
+        prize="GiftPass",
+        winner_count=1,
+        ends_at="2099-01-01T00:00:00+00:00",
+    )
+
+    assert raffle.publication_state == "pending"
+    assert await storage.active_raffle(-100) is None
+    assert await storage.active_raffle_for_keyword(-100, "参与") is None
+    assert await storage.join_raffle(raffle.id, 41) == (False, 0)
+    assert await storage.set_raffle_message(raffle.id, 88)
+    assert await storage.activate_raffle(raffle.id)
+    assert (await storage.active_raffle_for_keyword(-100, "参与")).id == raffle.id  # type: ignore[union-attr]
+
+
+async def test_schema_v8_migrates_finished_raffles_but_rejects_running_v7(
+    tmp_path: Path,
+) -> None:
+    def create_v7(path: Path, status: str) -> None:
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE raffles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER,
+                creator_id INTEGER NOT NULL,
+                prize TEXT NOT NULL,
+                winner_count INTEGER NOT NULL,
+                ends_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+            CREATE UNIQUE INDEX idx_raffles_one_running_per_chat
+            ON raffles (chat_id) WHERE status = 'running';
+            CREATE INDEX idx_raffles_due ON raffles (status, ends_at, id);
+            PRAGMA user_version=7;
+            """
+        )
+        connection.execute(
+            "INSERT INTO raffles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                1,
+                -100,
+                88,
+                7,
+                "GiftPass",
+                1,
+                "2099-01-01T00:00:00+00:00",
+                status,
+                "2026-08-30T00:00:00+00:00",
+                None if status == "running" else "2026-08-30T01:00:00+00:00",
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+    finished_path = tmp_path / "finished-v7.db"
+    create_v7(finished_path, "finished")
+    migrated = Storage(finished_path)
+    await migrated.open()
+    try:
+        raffle = await migrated.raffle(1)
+        assert raffle is not None
+        assert raffle.keyword is None
+        assert raffle.publication_state == "active"
+        assert (await migrated.db.execute_fetchall("PRAGMA user_version"))[0][0] == 8
+    finally:
+        await migrated.close()
+
+    running_path = tmp_path / "running-v7.db"
+    create_v7(running_path, "running")
+    blocked = Storage(running_path)
+    with pytest.raises(RuntimeError, match="旧版进行中抽奖"):
+        await blocked.open()
+    await blocked.close()
 
 
 async def test_trusted_users_are_scoped_per_chat(storage: Storage) -> None:

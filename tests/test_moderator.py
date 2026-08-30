@@ -90,6 +90,47 @@ class FakeBot:
         return SimpleNamespace(status=status)
 
 
+class RaffleBot(FakeBot):
+    def __init__(self, *, pin_result: bool = True) -> None:
+        super().__init__(admin_ids={7})
+        self.pin_result = pin_result
+        self.pinned: list[tuple[int, int, bool]] = []
+        self.unpinned: list[tuple[int, int]] = []
+        self.edited: list[tuple[int, int, str]] = []
+        self._next_message_id = 100
+
+    async def send_message(self, chat_id: int, text: str, **kwargs) -> Message:
+        self.sent.append((chat_id, text))
+        self._next_message_id += 1
+        return Message(
+            message_id=self._next_message_id,
+            date=datetime.now(UTC),
+            chat=Chat(id=chat_id, type=ChatType.SUPERGROUP, title="Test"),
+            text=text,
+        )
+
+    async def edit_message_text(
+        self, text: str, *, chat_id: int, message_id: int, **kwargs
+    ) -> Message:
+        self.edited.append((chat_id, message_id, text))
+        return Message(
+            message_id=message_id,
+            date=datetime.now(UTC),
+            chat=Chat(id=chat_id, type=ChatType.SUPERGROUP, title="Test"),
+            text=text,
+        )
+
+    async def pin_chat_message(
+        self, chat_id: int, message_id: int, *, disable_notification: bool
+    ) -> bool:
+        self.pinned.append((chat_id, message_id, disable_notification))
+        return self.pin_result
+
+    async def unpin_chat_message(self, chat_id: int, message_id: int) -> bool:
+        self.unpinned.append((chat_id, message_id))
+        return True
+
+
 def settings(tmp_path: Path, **overrides) -> Settings:
     values = {
         "bot_token": "123:ABC",
@@ -403,6 +444,116 @@ async def test_set_commands_syncs_default_and_chinese_profile(
     assert len(BOT_PROFILE_NAME) <= 64
     assert len(BOT_PROFILE_SHORT_DESCRIPTION) <= 120
     assert len(BOT_PROFILE_DESCRIPTION) <= 512
+
+
+async def test_lottery_creation_pins_keyword_card_and_activates(
+    tmp_path: Path, storage: Storage
+) -> None:
+    bot = RaffleBot()
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    controller._group_admin = AsyncMock(return_value=(7, SimpleNamespace(), -100))  # type: ignore[method-assign]
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type=ChatType.SUPERGROUP),
+        from_user=SimpleNamespace(id=7),
+        text="/lottery 30m 1 ＮＥＸＡ GiftPass 月卡",
+        answer=AsyncMock(),
+    )
+
+    await controller.lottery(message)  # type: ignore[arg-type]
+
+    raffle = await storage.active_raffle(-100)
+    assert raffle is not None
+    assert raffle.keyword == "NEXA"
+    assert raffle.normalized_keyword == "nexa"
+    assert raffle.publication_state == "active"
+    assert bot.pinned == [(-100, raffle.message_id, True)]
+    assert "参与关键词：<code>NEXA</code>" in bot.sent[0][1]
+    message.answer.assert_awaited_once_with(f"抽奖 #{raffle.id} 已创建并置顶。")
+
+
+async def test_lottery_pin_failure_deletes_card_and_rolls_back(
+    tmp_path: Path, storage: Storage
+) -> None:
+    bot = RaffleBot(pin_result=False)
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    controller._group_admin = AsyncMock(return_value=(7, SimpleNamespace(), -100))  # type: ignore[method-assign]
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type=ChatType.SUPERGROUP),
+        from_user=SimpleNamespace(id=7),
+        text="/lottery 30m 1 参与 GiftPass",
+        answer=AsyncMock(),
+    )
+
+    await controller.lottery(message)  # type: ignore[arg-type]
+
+    assert await storage.active_raffle(-100) is None
+    assert await storage.pending_raffles() == ()
+    assert bot.deleted == [(-100, 101)]
+    message.answer.assert_awaited_once_with("抽奖发布失败，已安全取消。")
+
+
+async def test_raffle_keyword_join_is_exact_deletes_source_and_confirms(
+    tmp_path: Path, storage: Storage
+) -> None:
+    bot = RaffleBot()
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    raffle = await storage.create_raffle(
+        chat_id=-100,
+        creator_id=7,
+        keyword="Nexa",
+        prize="GiftPass",
+        winner_count=1,
+        ends_at="2099-01-01T00:00:00+00:00",
+    )
+    assert await storage.set_raffle_message(raffle.id, 88)
+    assert await storage.activate_raffle(raffle.id)
+    exact = group_message(42, "  ＮＥＸＡ\u200b  ", message_id=5)
+
+    assert await controller._raffle_keyword_message(exact)
+    assert not await controller._raffle_keyword_message(
+        group_message(42, "Nexa 参加", message_id=6)
+    )
+    await controller.join_lottery_keyword(exact)
+
+    assert await storage.raffle_entry_ids(raffle.id) == (42,)
+    assert bot.deleted == [(-100, 5)]
+    assert bot.sent[-1] == (-100, "已参加抽奖，当前 1 人。")
+    assert bot.edited[-1][1] == 88
+
+    duplicate = group_message(42, "nexa", message_id=7)
+    await controller.join_lottery_keyword(duplicate)
+    assert await storage.raffle_entry_ids(raffle.id) == (42,)
+    assert bot.deleted[-1] == (-100, 7)
+    assert bot.sent[-1] == (-100, "你已参加过，本次不重复登记。")
+
+
+@pytest.mark.parametrize("operation", ("end", "cancel"))
+async def test_raffle_end_and_cancel_unpin_exact_card(
+    tmp_path: Path, storage: Storage, operation: str
+) -> None:
+    bot = RaffleBot()
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    raffle = await storage.create_raffle(
+        chat_id=-100,
+        creator_id=7,
+        keyword="参与",
+        prize="GiftPass",
+        winner_count=1,
+        ends_at="2099-01-01T00:00:00+00:00",
+    )
+    assert await storage.set_raffle_message(raffle.id, 88)
+    assert await storage.activate_raffle(raffle.id)
+
+    if operation == "end":
+        await controller._finalize_raffle(raffle, notify_admin=False)
+    else:
+        await controller._cancel_active_raffle(-100)
+
+    assert bot.unpinned == [(-100, 88)]
+    assert bot.edited[-1][1] == 88
+    assert await storage.active_raffle(-100) is None
+    queued = await storage.due_ephemeral("2100-01-01T00:00:00+00:00")
+    assert [(item.chat_id, item.message_id) for item in queued] == [(-100, 88)]
 
 
 async def test_private_command_rejects_unlisted_user(tmp_path: Path, storage: Storage) -> None:
@@ -744,7 +895,8 @@ async def test_member_command_is_moderated_before_command_handlers(
         ai_reviewer=reviewer,  # type: ignore[arg-type]
     )
 
-    private_guard, member_command_guard = controller.router.message.handlers[:2]
+    private_guard = controller.router.message.handlers[0]
+    member_command_guard = controller.router.message.handlers[3]
     assert private_guard.callback == controller._ignore_unauthorized_private
     assert member_command_guard.callback == controller.moderate_message
     await controller.router.propagate_event(
