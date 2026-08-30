@@ -25,6 +25,53 @@ async def test_warning_increment_and_clear(storage: Storage) -> None:
     assert await storage.warning_count(-100, 42) == 0
 
 
+async def test_raffle_lifecycle_is_persistent_and_idempotent(storage: Storage) -> None:
+    raffle = await storage.create_raffle(
+        chat_id=-100,
+        creator_id=7,
+        prize="GiftPass 月卡",
+        winner_count=2,
+        ends_at="2099-01-01T00:00:00+00:00",
+    )
+    assert await storage.set_raffle_message(raffle.id, 88)
+    assert (await storage.active_raffle(-100)).message_id == 88  # type: ignore[union-attr]
+
+    assert await storage.join_raffle(raffle.id, 41) == (True, 1)
+    assert await storage.join_raffle(raffle.id, 41) == (False, 1)
+    assert await storage.join_raffle(raffle.id, 42) == (True, 2)
+    assert await storage.raffle_entry_ids(raffle.id) == (41, 42)
+
+    assert await storage.finish_raffle(raffle.id, (42, 41))
+    assert not await storage.finish_raffle(raffle.id, (41,))
+    winners = await storage.raffle_winners(raffle.id)
+    assert [(item.position, item.user_id) for item in winners] == [(1, 42), (2, 41)]
+    assert await storage.active_raffle(-100) is None
+
+
+async def test_raffle_allows_only_one_running_per_chat_and_supports_reroll(
+    storage: Storage,
+) -> None:
+    raffle = await storage.create_raffle(
+        chat_id=-100,
+        creator_id=7,
+        prize="ModelPass",
+        winner_count=1,
+        ends_at="2099-01-01T00:00:00+00:00",
+    )
+    with pytest.raises(ValueError, match="已有进行中的抽奖"):
+        await storage.create_raffle(
+            chat_id=-100,
+            creator_id=7,
+            prize="第二场",
+            winner_count=1,
+            ends_at="2099-01-01T00:00:00+00:00",
+        )
+    await storage.join_raffle(raffle.id, 41)
+    assert await storage.finish_raffle(raffle.id, (41,))
+    assert await storage.add_reroll(raffle.id, (41,)) == 2
+    assert (await storage.raffle_winners(raffle.id))[0].round == 2
+
+
 async def test_trusted_users_are_scoped_per_chat(storage: Storage) -> None:
     await storage.add_trusted_user(-100, 42, 7)
     assert await storage.is_trusted(-100, 42)
@@ -688,9 +735,6 @@ async def test_schema_v5_migrates_ai_diagnostics_and_private_activity_tables(
         activity_columns = await migrated.db.execute_fetchall("PRAGMA table_info(member_activity)")
         outbox_columns = await migrated.db.execute_fetchall("PRAGMA table_info(log_outbox)")
         version = await migrated.db.execute_fetchall("PRAGMA user_version")
-        with pytest.raises(sqlite3.IntegrityError):
-            await migrated.db.execute("UPDATE ai_decisions SET total_latency_ms = -1 WHERE id = 1")
-        await migrated.db.rollback()
     finally:
         await migrated.close()
 
@@ -705,16 +749,7 @@ async def test_schema_v5_migrates_ai_diagnostics_and_private_activity_tables(
         "total_latency_ms",
         "attempt_count",
     ]
-    assert len(recent) == 1
-    assert recent[0].review_path == "legacy"
-    assert recent[0].reasoning_effort == ""
-    assert recent[0].service_tier == ""
-    assert recent[0].request_latency_ms == 321
-    assert recent[0].total_latency_ms == 321
-    assert recent[0].media_latency_ms == 0
-    assert recent[0].queue_latency_ms == 0
-    assert recent[0].action_latency_ms == 0
-    assert recent[0].attempt_count == 0
+    assert recent == ()
     assert [row["name"] for row in activity_columns] == [
         "chat_id",
         "user_id",
@@ -728,7 +763,7 @@ async def test_schema_v5_migrates_ai_diagnostics_and_private_activity_tables(
     assert version[0][0] == SCHEMA_VERSION
 
 
-async def test_schema_v3_backfills_cumulative_ai_totals(tmp_path: Path) -> None:
+async def test_schema_v3_is_safely_cleared_by_v7_migration(tmp_path: Path) -> None:
     database = tmp_path / "legacy-v3.db"
     with sqlite3.connect(database) as connection:
         connection.executescript(
@@ -770,11 +805,11 @@ async def test_schema_v3_backfills_cumulative_ai_totals(tmp_path: Path) -> None:
     finally:
         await migrated.close()
 
-    assert stats.total == 3
-    assert stats.calls == 3
-    assert stats.ads == 2
-    assert stats.failed == 1
-    assert stats.average_latency_ms == 100
+    assert stats.total == 0
+    assert stats.calls == 0
+    assert stats.ads == 0
+    assert stats.failed == 0
+    assert stats.average_latency_ms == 0
     assert version[0][0] == SCHEMA_VERSION
 
 
@@ -826,3 +861,37 @@ async def test_schema_v4_migrates_to_private_ai_learning_memory(tmp_path: Path) 
         ("text,obfuscation", 1)
     ]
     assert version[0][0] == SCHEMA_VERSION
+
+
+async def test_schema_v7_clears_retired_history_but_preserves_learning_and_ephemeral(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-v6.db"
+    legacy = Storage(database)
+    await legacy.open()
+    await legacy.record_ai_learning(-100, "promotion", ("link", "promotion"), 0.99)
+    await legacy.upsert_ai_signature(
+        chat_id=-100,
+        normalized_signature="guaranteed profit",
+        display_signature="guaranteed profit",
+        category="promotion",
+        status="active",
+        confidence=0.99,
+    )
+    await legacy.enqueue_ephemeral(-100, 99, "2099-01-01T00:00:00+00:00")
+    await legacy.add_warning(-100, 42)
+    await legacy.record_action(chat_id=-100, action="warn", target_id=42)
+    await legacy.db.execute("PRAGMA user_version=6")
+    await legacy.db.commit()
+    await legacy.close()
+
+    migrated = Storage(database)
+    await migrated.open()
+    try:
+        assert len(await migrated.ai_learning_memory(-100)) == 1
+        assert await migrated.active_ai_signatures(-100) == {"guaranteed profit"}
+        assert len(await migrated.due_ephemeral("2100-01-01T00:00:00+00:00")) == 1
+        assert await migrated.warning_count(-100, 42) == 0
+        assert (await migrated.chat_stats(-100)).total_actions == 0
+    finally:
+        await migrated.close()

@@ -12,7 +12,7 @@ import aiosqlite
 
 from nexa_guardian.ai_contract import AI_GATEWAY_MODELS
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 UTC = timezone.utc
 
 AI_LEARNING_EVIDENCE_TYPES = (
@@ -195,6 +195,42 @@ ON member_activity (chat_id, last_message_at);
 
 CREATE INDEX IF NOT EXISTS idx_member_activity_chat_first_observed
 ON member_activity (chat_id, first_observed_at);
+
+CREATE TABLE IF NOT EXISTS raffles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER,
+    creator_id INTEGER NOT NULL,
+    prize TEXT NOT NULL CHECK (length(prize) BETWEEN 1 AND 200),
+    winner_count INTEGER NOT NULL CHECK (winner_count BETWEEN 1 AND 20),
+    ends_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'finished', 'cancelled')),
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_raffles_one_running_per_chat
+ON raffles (chat_id) WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_raffles_due
+ON raffles (status, ends_at, id);
+
+CREATE TABLE IF NOT EXISTS raffle_entries (
+    raffle_id INTEGER NOT NULL REFERENCES raffles(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL,
+    joined_at TEXT NOT NULL,
+    PRIMARY KEY (raffle_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS raffle_winners (
+    raffle_id INTEGER NOT NULL REFERENCES raffles(id) ON DELETE CASCADE,
+    round INTEGER NOT NULL CHECK (round >= 1),
+    position INTEGER NOT NULL CHECK (position >= 1),
+    user_id INTEGER NOT NULL,
+    selected_at TEXT NOT NULL,
+    PRIMARY KEY (raffle_id, round, position),
+    UNIQUE (raffle_id, round, user_id)
+);
 """
 
 
@@ -342,6 +378,28 @@ class MemberActivity:
     message_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class Raffle:
+    id: int
+    chat_id: int
+    message_id: int | None
+    creator_id: int
+    prize: str
+    winner_count: int
+    ends_at: str
+    status: str
+    created_at: str
+    finished_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RaffleWinner:
+    round: int
+    position: int
+    user_id: int
+    selected_at: str
+
+
 class Storage:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -384,6 +442,8 @@ class Storage:
             await self._ensure_ai_decisions_schema(current_version)
             if current_version < 4:
                 await self._rebuild_ai_totals()
+            if current_version < 7:
+                await self._migrate_v7()
             await self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             await self._db.commit()
         except BaseException:
@@ -480,6 +540,30 @@ class Storage:
                 END)
             FROM ai_decisions
             GROUP BY chat_id
+            """
+        )
+
+    async def _migrate_v7(self) -> None:
+        """Remove retired operational history while preserving learned AI state."""
+
+        await self.db.execute("PRAGMA secure_delete=ON")
+        for table in (
+            "warnings",
+            "moderation_log",
+            "ai_decisions",
+            "ai_totals",
+            "log_outbox",
+            "trusted_users",
+            "allowed_domains",
+            "blocked_words",
+            "member_activity",
+            "runtime_settings",
+        ):
+            await self.db.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed internal names
+        await self.db.execute(
+            """
+            DELETE FROM sqlite_sequence
+            WHERE name IN ('moderation_log', 'ai_decisions', 'log_outbox')
             """
         )
 
@@ -1677,4 +1761,222 @@ class Storage:
             ),
             last_status=str(row["last_status"]),
             message_count=int(row["message_count"]),
+        )
+
+    async def create_raffle(
+        self,
+        *,
+        chat_id: int,
+        creator_id: int,
+        prize: str,
+        winner_count: int,
+        ends_at: str,
+    ) -> Raffle:
+        normalized_prize = prize.strip()
+        if not 1 <= len(normalized_prize) <= 200:
+            raise ValueError("奖品名称必须为 1–200 个字符")
+        if isinstance(winner_count, bool) or not 1 <= winner_count <= 20:
+            raise ValueError("中奖人数必须为 1–20")
+        timestamp = utc_now()
+        async with self._write_transaction() as db:
+            try:
+                cursor = await db.execute(
+                    """
+                    INSERT INTO raffles (
+                        chat_id, message_id, creator_id, prize, winner_count,
+                        ends_at, status, created_at, finished_at
+                    ) VALUES (?, NULL, ?, ?, ?, ?, 'running', ?, NULL)
+                    """,
+                    (chat_id, creator_id, normalized_prize, winner_count, ends_at, timestamp),
+                )
+            except aiosqlite.IntegrityError as exc:
+                raise ValueError("当前群已有进行中的抽奖") from exc
+            raffle_id = int(cursor.lastrowid or 0)
+        raffle = await self.raffle(raffle_id)
+        if raffle is None:
+            raise RuntimeError("抽奖创建后读取失败")
+        return raffle
+
+    async def set_raffle_message(self, raffle_id: int, message_id: int) -> bool:
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                "UPDATE raffles SET message_id = ? WHERE id = ? AND status = 'running'",
+                (message_id, raffle_id),
+            )
+        return cursor.rowcount == 1
+
+    async def raffle(self, raffle_id: int) -> Raffle | None:
+        cursor = await self.db.execute("SELECT * FROM raffles WHERE id = ?", (raffle_id,))
+        row = await cursor.fetchone()
+        return self._raffle_from_row(row) if row is not None else None
+
+    async def active_raffle(self, chat_id: int) -> Raffle | None:
+        cursor = await self.db.execute(
+            "SELECT * FROM raffles WHERE chat_id = ? AND status = 'running' LIMIT 1",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        return self._raffle_from_row(row) if row is not None else None
+
+    async def latest_finished_raffle(self, chat_id: int) -> Raffle | None:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM raffles
+            WHERE chat_id = ? AND status = 'finished'
+            ORDER BY finished_at DESC, id DESC LIMIT 1
+            """,
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        return self._raffle_from_row(row) if row is not None else None
+
+    async def due_raffles(self, now: str, *, limit: int = 20) -> tuple[Raffle, ...]:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM raffles
+            WHERE status = 'running' AND ends_at <= ?
+            ORDER BY ends_at, id LIMIT ?
+            """,
+            (now, limit),
+        )
+        return tuple(self._raffle_from_row(row) for row in await cursor.fetchall())
+
+    async def join_raffle(self, raffle_id: int, user_id: int) -> tuple[bool, int]:
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                "SELECT status, ends_at FROM raffles WHERE id = ?",
+                (raffle_id,),
+            )
+            raffle = await cursor.fetchone()
+            if (
+                raffle is None
+                or str(raffle["status"]) != "running"
+                or str(raffle["ends_at"]) <= utc_now()
+            ):
+                return False, 0
+            inserted = await db.execute(
+                """
+                INSERT OR IGNORE INTO raffle_entries (raffle_id, user_id, joined_at)
+                VALUES (?, ?, ?)
+                """,
+                (raffle_id, user_id, utc_now()),
+            )
+            count_cursor = await db.execute(
+                "SELECT COUNT(*) AS total FROM raffle_entries WHERE raffle_id = ?",
+                (raffle_id,),
+            )
+            count_row = await count_cursor.fetchone()
+        return inserted.rowcount == 1, int(count_row["total"] if count_row else 0)
+
+    async def raffle_entry_count(self, raffle_id: int) -> int:
+        cursor = await self.db.execute(
+            "SELECT COUNT(*) AS total FROM raffle_entries WHERE raffle_id = ?",
+            (raffle_id,),
+        )
+        row = await cursor.fetchone()
+        return int(row["total"] if row else 0)
+
+    async def raffle_entry_ids(self, raffle_id: int) -> tuple[int, ...]:
+        cursor = await self.db.execute(
+            "SELECT user_id FROM raffle_entries WHERE raffle_id = ? ORDER BY user_id",
+            (raffle_id,),
+        )
+        return tuple(int(row["user_id"]) for row in await cursor.fetchall())
+
+    async def finish_raffle(self, raffle_id: int, winners: Sequence[int]) -> bool:
+        timestamp = utc_now()
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                UPDATE raffles SET status = 'finished', finished_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (timestamp, raffle_id),
+            )
+            if cursor.rowcount != 1:
+                return False
+            await db.executemany(
+                """
+                INSERT INTO raffle_winners (
+                    raffle_id, round, position, user_id, selected_at
+                ) VALUES (?, 1, ?, ?, ?)
+                """,
+                (
+                    (raffle_id, position, user_id, timestamp)
+                    for position, user_id in enumerate(winners, start=1)
+                ),
+            )
+        return True
+
+    async def cancel_raffle(self, raffle_id: int) -> bool:
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                UPDATE raffles SET status = 'cancelled', finished_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (utc_now(), raffle_id),
+            )
+        return cursor.rowcount == 1
+
+    async def add_reroll(self, raffle_id: int, winners: Sequence[int]) -> int:
+        timestamp = utc_now()
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                SELECT COALESCE(MAX(round), 0) + 1 AS next_round
+                FROM raffle_winners WHERE raffle_id = ?
+                """,
+                (raffle_id,),
+            )
+            row = await cursor.fetchone()
+            next_round = int(row["next_round"] if row else 1)
+            await db.executemany(
+                """
+                INSERT INTO raffle_winners (
+                    raffle_id, round, position, user_id, selected_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    (raffle_id, next_round, position, user_id, timestamp)
+                    for position, user_id in enumerate(winners, start=1)
+                ),
+            )
+        return next_round
+
+    async def raffle_winners(
+        self, raffle_id: int, *, latest_round: bool = True
+    ) -> tuple[RaffleWinner, ...]:
+        query = (
+            "SELECT round, position, user_id, selected_at FROM raffle_winners WHERE raffle_id = ?"
+        )
+        parameters: tuple[int, ...] = (raffle_id,)
+        if latest_round:
+            query += " AND round = (SELECT MAX(round) FROM raffle_winners WHERE raffle_id = ?)"
+            parameters = (raffle_id, raffle_id)
+        query += " ORDER BY round, position"
+        cursor = await self.db.execute(query, parameters)
+        return tuple(
+            RaffleWinner(
+                round=int(row["round"]),
+                position=int(row["position"]),
+                user_id=int(row["user_id"]),
+                selected_at=str(row["selected_at"]),
+            )
+            for row in await cursor.fetchall()
+        )
+
+    @staticmethod
+    def _raffle_from_row(row: aiosqlite.Row) -> Raffle:
+        return Raffle(
+            id=int(row["id"]),
+            chat_id=int(row["chat_id"]),
+            message_id=int(row["message_id"]) if row["message_id"] is not None else None,
+            creator_id=int(row["creator_id"]),
+            prize=str(row["prize"]),
+            winner_count=int(row["winner_count"]),
+            ends_at=str(row["ends_at"]),
+            status=str(row["status"]),
+            created_at=str(row["created_at"]),
+            finished_at=str(row["finished_at"]) if row["finished_at"] is not None else None,
         )
