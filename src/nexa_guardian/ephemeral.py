@@ -82,6 +82,7 @@ class EphemeralMessenger:
         *,
         delete_bot: Bot | None = None,
         delete_timeout_seconds: float = 10,
+        delete_concurrency: int = 4,
         ttl_seconds: float = 30,
         poll_interval: float = 1,
         batch_size: int = 100,
@@ -94,6 +95,8 @@ class EphemeralMessenger:
             raise ValueError("ttl_seconds must not be negative")
         if not 0 < delete_timeout_seconds < float("inf"):
             raise ValueError("delete_timeout_seconds must be finite and positive")
+        if not 1 <= delete_concurrency <= 4:
+            raise ValueError("delete_concurrency must be between one and four")
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
         if batch_size <= 0:
@@ -107,6 +110,7 @@ class EphemeralMessenger:
         self.delete_bot = delete_bot if delete_bot is not None else bot
         self.storage = storage
         self.delete_timeout_seconds = delete_timeout_seconds
+        self.delete_concurrency = delete_concurrency
         self.ttl_seconds = ttl_seconds
         self.poll_interval = poll_interval
         self.batch_size = batch_size
@@ -116,15 +120,17 @@ class EphemeralMessenger:
         self._sleep = sleep
         self._worker_task: asyncio.Task[None] | None = None
         self._stopping = False
+        self._process_lock = asyncio.Lock()
+        self._delete_semaphore = asyncio.Semaphore(delete_concurrency)
+        self._inflight_deletions: set[tuple[int, int]] = set()
         self._retry_attempts: dict[tuple[int, int], int] = {}
         self._fallback_deadlines: dict[tuple[int, int], str] = {}
 
     async def start(self) -> None:
-        """Recover already-due messages before starting the polling worker."""
+        """Start recovery in the background without delaying Telegram polling."""
         if self._worker_task is not None and not self._worker_task.done():
             return
         self._stopping = False
-        await self.process_due()
         self._worker_task = asyncio.create_task(
             self._run_worker(),
             name="nexa-ephemeral-message-worker",
@@ -197,13 +203,24 @@ class EphemeralMessenger:
 
     async def process_due(self) -> int:
         """Attempt one bounded batch and return the number of completed records."""
-        now = self._clock()
-        completed = await self._flush_fallback(now, force_delete=False)
-        due = await self.storage.due_ephemeral(_utc_iso(now), self.batch_size)
-        for record in due:
-            key = (record.chat_id, record.message_id)
+        async with self._process_lock:
+            now = self._clock()
+            completed = await self._flush_fallback(now, force_delete=False)
+            due = await self.storage.due_ephemeral(_utc_iso(now), self.batch_size)
+            if not due:
+                return completed
+            outcomes = await asyncio.gather(*(self._process_record(record, now) for record in due))
+            return completed + sum(outcomes)
+
+    async def _process_record(self, record: EphemeralRecordLike, now: datetime) -> int:
+        key = (record.chat_id, record.message_id)
+        if key in self._inflight_deletions:
+            return 0
+        self._inflight_deletions.add(key)
+        try:
             try:
-                deleted = await self._delete_message(record.chat_id, record.message_id)
+                async with self._delete_semaphore:
+                    deleted = await self._delete_message(record.chat_id, record.message_id)
                 if deleted is False:
                     raise RuntimeError("Telegram returned false while deleting a message")
             except asyncio.CancelledError:
@@ -211,7 +228,7 @@ class EphemeralMessenger:
             except (TelegramBadRequest, TelegramForbiddenError):
                 await self.storage.ack_ephemeral(record.chat_id, record.message_id)
                 self._retry_attempts.pop(key, None)
-                completed += 1
+                return 1
             except Exception as exc:
                 attempts = min(self._retry_attempts.get(key, 0) + 1, 31)
                 self._retry_attempts[key] = attempts
@@ -233,11 +250,13 @@ class EphemeralMessenger:
                     record.message_id,
                     _utc_iso(retry_at),
                 )
+                return 0
             else:
                 await self.storage.ack_ephemeral(record.chat_id, record.message_id)
                 self._retry_attempts.pop(key, None)
-                completed += 1
-        return completed
+                return 1
+        finally:
+            self._inflight_deletions.discard(key)
 
     async def _flush_fallback(self, now: datetime, *, force_delete: bool) -> int:
         completed = 0
@@ -325,8 +344,8 @@ class EphemeralMessenger:
     async def _run_worker(self) -> None:
         while True:
             try:
-                await self._sleep(self.poll_interval)
                 await self.process_due()
+                await self._sleep(self.poll_interval)
             except asyncio.CancelledError:
                 if self._stopping:
                     raise

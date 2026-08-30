@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,7 +12,7 @@ import aiosqlite
 
 from nexa_guardian.ai_contract import AI_GATEWAY_MODELS
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 UTC = timezone.utc
 
 AI_LEARNING_EVIDENCE_TYPES = (
@@ -88,6 +90,15 @@ CREATE TABLE IF NOT EXISTS ai_decisions (
     cached INTEGER NOT NULL DEFAULT 0,
     enforced INTEGER NOT NULL DEFAULT 0,
     error_type TEXT NOT NULL DEFAULT '',
+    reasoning_effort TEXT NOT NULL DEFAULT '',
+    service_tier TEXT NOT NULL DEFAULT '',
+    review_path TEXT NOT NULL DEFAULT 'legacy' CHECK (review_path <> ''),
+    media_latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (media_latency_ms >= 0),
+    queue_latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (queue_latency_ms >= 0),
+    request_latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (request_latency_ms >= 0),
+    action_latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (action_latency_ms >= 0),
+    total_latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (total_latency_ms >= 0),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     created_at TEXT NOT NULL
 );
 
@@ -151,11 +162,66 @@ CREATE TABLE IF NOT EXISTS runtime_settings (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (chat_id, key)
 );
+
+CREATE TABLE IF NOT EXISTS log_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER,
+    actor_id INTEGER,
+    target_id INTEGER,
+    action TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    claimed_until TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_log_outbox_due
+ON log_outbox (due_at, claimed_until, id);
+
+CREATE TABLE IF NOT EXISTS member_activity (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    first_observed_at TEXT NOT NULL,
+    last_message_at TEXT,
+    last_membership_at TEXT,
+    last_status TEXT NOT NULL DEFAULT '',
+    message_count INTEGER NOT NULL DEFAULT 0 CHECK (message_count >= 0),
+    PRIMARY KEY (chat_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_member_activity_chat_last_message
+ON member_activity (chat_id, last_message_at);
+
+CREATE INDEX IF NOT EXISTS idx_member_activity_chat_first_observed
+ON member_activity (chat_id, first_observed_at);
 """
 
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _nonnegative_int(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} 必须是非负整数")
+    return value
+
+
+def _metadata_token(name: str, value: str, *, allow_empty: bool) -> str:
+    normalized = value.strip()
+    if not normalized and allow_empty:
+        return ""
+    if (
+        not normalized
+        or len(normalized) > 64
+        or any(
+            not (character.isascii() and (character.isalnum() or character in "_.-"))
+            for character in normalized
+        )
+    ):
+        raise ValueError(f"{name} 必须是安全的短标识")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +257,12 @@ class AIStats:
     failed: int
     cached: int
     average_latency_ms: int
+    reasoning_effort_counts: tuple[tuple[str, int], ...] = ()
+    review_path_counts: tuple[tuple[str, int], ...] = ()
+    gateway_latency_p50_ms: int = 0
+    gateway_latency_p95_ms: int = 0
+    total_latency_p50_ms: int = 0
+    total_latency_p95_ms: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +275,15 @@ class AIDecision:
     cached: bool
     enforced: bool
     error_type: str
+    reasoning_effort: str
+    service_tier: str
+    review_path: str
+    media_latency_ms: int
+    queue_latency_ms: int
+    request_latency_ms: int
+    action_latency_ms: int
+    total_latency_ms: int
+    attempt_count: int
     created_at: str
 
 
@@ -237,6 +318,30 @@ class EphemeralRecord:
     delete_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class LogOutboxRecord:
+    id: int
+    chat_id: int
+    message_id: int | None
+    actor_id: int | None
+    target_id: int | None
+    action: str
+    due_at: str
+    attempt_count: int
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemberActivity:
+    chat_id: int
+    user_id: int
+    first_observed_at: str
+    last_message_at: str | None
+    last_membership_at: str | None
+    last_status: str
+    message_count: int
+
+
 class Storage:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -249,24 +354,68 @@ class Storage:
             raise RuntimeError("数据库尚未初始化")
         return self._db
 
+    @asynccontextmanager
+    async def _write_transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Serialize writes and always close the transaction on cancellation or error."""
+
+        async with self._write_lock:
+            try:
+                yield self.db
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+
     async def open(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._db.execute("PRAGMA foreign_keys=ON")
-        await self._db.execute("PRAGMA busy_timeout=5000")
-        cursor = await self._db.execute("PRAGMA user_version")
-        row = await cursor.fetchone()
-        current_version = int(row[0]) if row is not None else 0
-        if current_version > SCHEMA_VERSION:
-            raise RuntimeError(f"数据库版本 {current_version} 高于程序支持的 {SCHEMA_VERSION}")
-        await self._db.executescript(SCHEMA)
-        await self._ensure_ephemeral_schema()
-        if current_version < 4:
-            await self._rebuild_ai_totals()
-        await self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-        await self._db.commit()
+        try:
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.execute("PRAGMA foreign_keys=ON")
+            await self._db.execute("PRAGMA busy_timeout=5000")
+            cursor = await self._db.execute("PRAGMA user_version")
+            row = await cursor.fetchone()
+            current_version = int(row[0]) if row is not None else 0
+            if current_version > SCHEMA_VERSION:
+                raise RuntimeError(f"数据库版本 {current_version} 高于程序支持的 {SCHEMA_VERSION}")
+            await self._db.executescript(SCHEMA)
+            await self._ensure_ephemeral_schema()
+            await self._ensure_ai_decisions_schema(current_version)
+            if current_version < 4:
+                await self._rebuild_ai_totals()
+            await self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            await self._db.commit()
+        except BaseException:
+            await self._db.rollback()
+            raise
+
+    async def _ensure_ai_decisions_schema(self, current_version: int) -> None:
+        cursor = await self.db.execute("PRAGMA table_info(ai_decisions)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        additions = {
+            "reasoning_effort": "TEXT NOT NULL DEFAULT ''",
+            "service_tier": "TEXT NOT NULL DEFAULT ''",
+            "review_path": "TEXT NOT NULL DEFAULT 'legacy' CHECK (review_path <> '')",
+            "media_latency_ms": ("INTEGER NOT NULL DEFAULT 0 CHECK (media_latency_ms >= 0)"),
+            "queue_latency_ms": ("INTEGER NOT NULL DEFAULT 0 CHECK (queue_latency_ms >= 0)"),
+            "request_latency_ms": ("INTEGER NOT NULL DEFAULT 0 CHECK (request_latency_ms >= 0)"),
+            "action_latency_ms": ("INTEGER NOT NULL DEFAULT 0 CHECK (action_latency_ms >= 0)"),
+            "total_latency_ms": ("INTEGER NOT NULL DEFAULT 0 CHECK (total_latency_ms >= 0)"),
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0)",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                await self.db.execute(f"ALTER TABLE ai_decisions ADD COLUMN {name} {definition}")  # noqa: S608 - names and definitions come from a fixed internal mapping
+        if current_version < 6:
+            await self.db.execute(
+                """
+                UPDATE ai_decisions
+                SET review_path = 'legacy',
+                    request_latency_ms = MAX(latency_ms, 0),
+                    total_latency_ms = MAX(latency_ms, 0)
+                """
+            )
 
     async def _ensure_ephemeral_schema(self) -> None:
         cursor = await self.db.execute("PRAGMA table_info(ephemeral_bot_messages)")
@@ -340,8 +489,8 @@ class Storage:
             self._db = None
 
     async def add_warning(self, chat_id: int, user_id: int) -> int:
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 """
                 INSERT INTO warnings (chat_id, user_id, count, last_reason, updated_at)
                 VALUES (?, ?, 1, ?, ?)
@@ -352,12 +501,62 @@ class Storage:
                 """,
                 (chat_id, user_id, "", utc_now()),
             )
-            cursor = await self.db.execute(
+            cursor = await db.execute(
                 "SELECT count FROM warnings WHERE chat_id = ? AND user_id = ?",
                 (chat_id, user_id),
             )
             row = await cursor.fetchone()
-            await self.db.commit()
+        if row is None:
+            raise RuntimeError("警告写入后读取失败")
+        return int(row["count"])
+
+    async def add_warning_and_record_action(
+        self,
+        chat_id: int,
+        user_id: int,
+        actor_id: int | None = None,
+        *,
+        enqueue_log: bool = False,
+        log_due_at: str | None = None,
+    ) -> int:
+        """Atomically increment a warning and append its moderation action."""
+
+        timestamp = utc_now()
+        async with self._write_transaction() as db:
+            await db.execute(
+                """
+                INSERT INTO warnings (chat_id, user_id, count, last_reason, updated_at)
+                VALUES (?, ?, 1, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    count = warnings.count + 1,
+                    last_reason = excluded.last_reason,
+                    updated_at = excluded.updated_at
+                """,
+                (chat_id, user_id, "", timestamp),
+            )
+            cursor = await db.execute(
+                "SELECT count FROM warnings WHERE chat_id = ? AND user_id = ?",
+                (chat_id, user_id),
+            )
+            row = await cursor.fetchone()
+            await self._insert_action(
+                db,
+                chat_id=chat_id,
+                action="warn",
+                actor_id=actor_id,
+                target_id=user_id,
+                timestamp=timestamp,
+            )
+            if enqueue_log:
+                await self._insert_log_outbox(
+                    db,
+                    chat_id=chat_id,
+                    action="warn",
+                    actor_id=actor_id,
+                    target_id=user_id,
+                    due_at=log_due_at or timestamp,
+                    timestamp=timestamp,
+                )
         if row is None:
             raise RuntimeError("警告写入后读取失败")
         return int(row["count"])
@@ -371,12 +570,11 @@ class Storage:
         return int(row["count"]) if row else 0
 
     async def clear_warnings(self, chat_id: int, user_id: int) -> None:
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 "DELETE FROM warnings WHERE chat_id = ? AND user_id = ?",
                 (chat_id, user_id),
             )
-            await self.db.commit()
 
     async def is_trusted(self, chat_id: int, user_id: int) -> bool:
         cursor = await self.db.execute(
@@ -389,18 +587,17 @@ class Storage:
         await self._upsert_pair("trusted_users", chat_id, user_id, actor_id)
 
     async def remove_trusted_user(self, chat_id: int, user_id: int) -> None:
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 "DELETE FROM trusted_users WHERE chat_id = ? AND user_id = ?",
                 (chat_id, user_id),
             )
-            await self.db.commit()
 
     async def _upsert_pair(self, table: str, chat_id: int, user_id: int, actor_id: int) -> None:
         if table != "trusted_users":
             raise ValueError("unsupported table")
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 """
                 INSERT INTO trusted_users (chat_id, user_id, added_by, created_at)
                 VALUES (?, ?, ?, ?)
@@ -410,7 +607,6 @@ class Storage:
                 """,
                 (chat_id, user_id, actor_id, utc_now()),
             )
-            await self.db.commit()
 
     async def allowed_domains(self, chat_id: int) -> set[str]:
         cursor = await self.db.execute(
@@ -420,8 +616,8 @@ class Storage:
         return {str(row["domain"]) for row in await cursor.fetchall()}
 
     async def add_allowed_domain(self, chat_id: int, domain: str, actor_id: int) -> None:
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 """
                 INSERT INTO allowed_domains (chat_id, domain, added_by, created_at)
                 VALUES (?, ?, ?, ?)
@@ -431,15 +627,13 @@ class Storage:
                 """,
                 (chat_id, domain, actor_id, utc_now()),
             )
-            await self.db.commit()
 
     async def remove_allowed_domain(self, chat_id: int, domain: str) -> None:
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 "DELETE FROM allowed_domains WHERE chat_id = ? AND domain = ?",
                 (chat_id, domain),
             )
-            await self.db.commit()
 
     async def blocked_words(self, chat_id: int) -> set[str]:
         cursor = await self.db.execute(
@@ -453,8 +647,8 @@ class Storage:
 
     async def add_blocked_words(self, chat_id: int, words: tuple[str, ...], actor_id: int) -> None:
         timestamp = utc_now()
-        async with self._write_lock:
-            await self.db.executemany(
+        async with self._write_transaction() as db:
+            await db.executemany(
                 """
                 INSERT INTO blocked_words (chat_id, word, added_by, created_at)
                 VALUES (?, ?, ?, ?)
@@ -464,18 +658,16 @@ class Storage:
                 """,
                 ((chat_id, word, actor_id, timestamp) for word in words),
             )
-            await self.db.commit()
 
     async def remove_blocked_word(self, chat_id: int, word: str) -> None:
         await self.remove_blocked_words(chat_id, (word,))
 
     async def remove_blocked_words(self, chat_id: int, words: tuple[str, ...]) -> None:
-        async with self._write_lock:
-            await self.db.executemany(
+        async with self._write_transaction() as db:
+            await db.executemany(
                 "DELETE FROM blocked_words WHERE chat_id = ? AND word = ?",
                 ((chat_id, word) for word in words),
             )
-            await self.db.commit()
 
     async def record_action(
         self,
@@ -485,17 +677,73 @@ class Storage:
         message_id: int | None = None,
         actor_id: int | None = None,
         target_id: int | None = None,
+        enqueue_log: bool = False,
+        log_due_at: str | None = None,
     ) -> None:
-        async with self._write_lock:
-            await self.db.execute(
-                """
-                INSERT INTO moderation_log
-                    (chat_id, message_id, actor_id, target_id, action, reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (chat_id, message_id, actor_id, target_id, action, "", utc_now()),
+        timestamp = utc_now()
+        async with self._write_transaction() as db:
+            await self._insert_action(
+                db,
+                chat_id=chat_id,
+                action=action,
+                message_id=message_id,
+                actor_id=actor_id,
+                target_id=target_id,
+                timestamp=timestamp,
             )
-            await self.db.commit()
+            if enqueue_log:
+                await self._insert_log_outbox(
+                    db,
+                    chat_id=chat_id,
+                    action=action,
+                    message_id=message_id,
+                    actor_id=actor_id,
+                    target_id=target_id,
+                    due_at=log_due_at or timestamp,
+                    timestamp=timestamp,
+                )
+
+    @staticmethod
+    async def _insert_action(
+        db: aiosqlite.Connection,
+        *,
+        chat_id: int,
+        action: str,
+        timestamp: str,
+        message_id: int | None = None,
+        actor_id: int | None = None,
+        target_id: int | None = None,
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO moderation_log
+                (chat_id, message_id, actor_id, target_id, action, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (chat_id, message_id, actor_id, target_id, action, "", timestamp),
+        )
+
+    @staticmethod
+    async def _insert_log_outbox(
+        db: aiosqlite.Connection,
+        *,
+        chat_id: int,
+        action: str,
+        due_at: str,
+        timestamp: str,
+        message_id: int | None = None,
+        actor_id: int | None = None,
+        target_id: int | None = None,
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO log_outbox (
+                chat_id, message_id, actor_id, target_id, action,
+                due_at, claimed_until, attempt_count, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, ?)
+            """,
+            (chat_id, message_id, actor_id, target_id, action, due_at, timestamp),
+        )
 
     async def chat_stats(self, chat_id: int, *, since: str | None = None) -> ChatStats:
         query = """
@@ -577,68 +825,100 @@ class Storage:
         cached: bool,
         enforced: bool,
         error_type: str = "",
+        reasoning_effort: str = "",
+        service_tier: str = "",
+        review_path: str = "legacy",
+        media_latency_ms: int = 0,
+        queue_latency_ms: int = 0,
+        request_latency_ms: int | None = None,
+        action_latency_ms: int = 0,
+        total_latency_ms: int | None = None,
+        attempt_count: int = 0,
     ) -> None:
+        normalized_reasoning_effort = _metadata_token(
+            "reasoning_effort", reasoning_effort, allow_empty=True
+        )
+        normalized_service_tier = _metadata_token("service_tier", service_tier, allow_empty=True)
+        normalized_review_path = _metadata_token("review_path", review_path, allow_empty=False)
         gateway_call = int(model in AI_GATEWAY_MODELS and not cached)
         gateway_cache = int(model in AI_GATEWAY_MODELS and cached)
         gateway_failure = int(model in AI_GATEWAY_MODELS and bool(error_type))
         latency_sample = int(gateway_call == 1 and not error_type)
         safe_latency_ms = max(0, latency_ms)
-        async with self._write_lock:
-            try:
-                await self.db.execute(
-                    """
-                    INSERT INTO ai_decisions (
-                        chat_id, message_id, target_id, is_ad, confidence, category,
-                        model, latency_ms, cached, enforced, error_type, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        chat_id,
-                        message_id,
-                        target_id,
-                        None if is_ad is None else int(is_ad),
-                        confidence,
-                        category,
-                        model,
-                        safe_latency_ms,
-                        int(cached),
-                        int(enforced),
-                        error_type,
-                        utc_now(),
-                    ),
-                )
-                await self.db.execute(
-                    """
-                    INSERT INTO ai_totals (
-                        chat_id, decisions, calls, ads, enforced, failed, cached,
-                        latency_total_ms, latency_samples
-                    ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(chat_id) DO UPDATE SET
-                        decisions = ai_totals.decisions + 1,
-                        calls = ai_totals.calls + excluded.calls,
-                        ads = ai_totals.ads + excluded.ads,
-                        enforced = ai_totals.enforced + excluded.enforced,
-                        failed = ai_totals.failed + excluded.failed,
-                        cached = ai_totals.cached + excluded.cached,
-                        latency_total_ms = ai_totals.latency_total_ms + excluded.latency_total_ms,
-                        latency_samples = ai_totals.latency_samples + excluded.latency_samples
-                    """,
-                    (
-                        chat_id,
-                        gateway_call,
-                        int(is_ad is True),
-                        int(enforced),
-                        gateway_failure,
-                        gateway_cache,
-                        safe_latency_ms if latency_sample else 0,
-                        latency_sample,
-                    ),
-                )
-            except BaseException:
-                await self.db.rollback()
-                raise
-            else:
-                await self.db.commit()
+        safe_media_latency_ms = _nonnegative_int("media_latency_ms", media_latency_ms)
+        safe_queue_latency_ms = _nonnegative_int("queue_latency_ms", queue_latency_ms)
+        safe_request_latency_ms = _nonnegative_int(
+            "request_latency_ms",
+            safe_latency_ms if request_latency_ms is None else request_latency_ms,
+        )
+        safe_action_latency_ms = _nonnegative_int("action_latency_ms", action_latency_ms)
+        safe_total_latency_ms = _nonnegative_int(
+            "total_latency_ms",
+            safe_latency_ms if total_latency_ms is None else total_latency_ms,
+        )
+        safe_attempt_count = _nonnegative_int("attempt_count", attempt_count)
+        async with self._write_transaction() as db:
+            await db.execute(
+                """
+                INSERT INTO ai_decisions (
+                    chat_id, message_id, target_id, is_ad, confidence, category,
+                    model, latency_ms, cached, enforced, error_type,
+                    reasoning_effort, service_tier, review_path,
+                    media_latency_ms, queue_latency_ms, request_latency_ms,
+                    action_latency_ms, total_latency_ms, attempt_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    message_id,
+                    target_id,
+                    None if is_ad is None else int(is_ad),
+                    confidence,
+                    category,
+                    model,
+                    safe_latency_ms,
+                    int(cached),
+                    int(enforced),
+                    error_type,
+                    normalized_reasoning_effort,
+                    normalized_service_tier,
+                    normalized_review_path,
+                    safe_media_latency_ms,
+                    safe_queue_latency_ms,
+                    safe_request_latency_ms,
+                    safe_action_latency_ms,
+                    safe_total_latency_ms,
+                    safe_attempt_count,
+                    utc_now(),
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO ai_totals (
+                    chat_id, decisions, calls, ads, enforced, failed, cached,
+                    latency_total_ms, latency_samples
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    decisions = ai_totals.decisions + 1,
+                    calls = ai_totals.calls + excluded.calls,
+                    ads = ai_totals.ads + excluded.ads,
+                    enforced = ai_totals.enforced + excluded.enforced,
+                    failed = ai_totals.failed + excluded.failed,
+                    cached = ai_totals.cached + excluded.cached,
+                    latency_total_ms = ai_totals.latency_total_ms + excluded.latency_total_ms,
+                    latency_samples = ai_totals.latency_samples + excluded.latency_samples
+                """,
+                (
+                    chat_id,
+                    gateway_call,
+                    int(is_ad is True),
+                    int(enforced),
+                    gateway_failure,
+                    gateway_cache,
+                    safe_latency_ms if latency_sample else 0,
+                    latency_sample,
+                ),
+            )
 
     async def ai_stats(self, chat_id: int, *, since: str | None = None) -> AIStats:
         if since is None:
@@ -695,6 +975,12 @@ class Storage:
         row = await cursor.fetchone()
         if row is None:
             return AIStats(0, 0, 0, 0, 0, 0, 0)
+        (
+            reasoning_effort_counts,
+            review_path_counts,
+            gateway_percentiles,
+            total_percentiles,
+        ) = await self._ai_diagnostics(chat_id, since=since)
         return AIStats(
             total=int(row["total"] or 0),
             calls=int(row["calls"] or 0),
@@ -703,13 +989,120 @@ class Storage:
             failed=int(row["failed"] or 0),
             cached=int(row["cached"] or 0),
             average_latency_ms=int(row["average_latency_ms"] or 0),
+            reasoning_effort_counts=reasoning_effort_counts,
+            review_path_counts=review_path_counts,
+            gateway_latency_p50_ms=gateway_percentiles[0],
+            gateway_latency_p95_ms=gateway_percentiles[1],
+            total_latency_p50_ms=total_percentiles[0],
+            total_latency_p95_ms=total_percentiles[1],
         )
+
+    async def _ai_diagnostics(
+        self,
+        chat_id: int,
+        *,
+        since: str,
+    ) -> tuple[
+        tuple[tuple[str, int], ...],
+        tuple[tuple[str, int], ...],
+        tuple[int, int],
+        tuple[int, int],
+    ]:
+        effort_cursor = await self.db.execute(
+            """
+            SELECT CASE
+                       WHEN reasoning_effort = '' THEN 'legacy'
+                       ELSE reasoning_effort
+                   END AS value,
+                   COUNT(*) AS count
+            FROM ai_decisions
+            WHERE chat_id = ? AND created_at >= ?
+            GROUP BY value
+            ORDER BY value
+            """,
+            (chat_id, since),
+        )
+        path_cursor = await self.db.execute(
+            """
+            SELECT review_path AS value, COUNT(*) AS count
+            FROM ai_decisions
+            WHERE chat_id = ? AND created_at >= ?
+            GROUP BY review_path
+            ORDER BY review_path
+            """,
+            (chat_id, since),
+        )
+        effort_counts = tuple(
+            (str(row["value"]), int(row["count"])) for row in await effort_cursor.fetchall()
+        )
+        path_counts = tuple(
+            (str(row["value"]), int(row["count"])) for row in await path_cursor.fetchall()
+        )
+        gateway_percentiles = await self._latency_percentiles(
+            chat_id,
+            since=since,
+            column="request_latency_ms",
+            gateway_only=True,
+        )
+        total_percentiles = await self._latency_percentiles(
+            chat_id,
+            since=since,
+            column="total_latency_ms",
+            gateway_only=False,
+        )
+        return effort_counts, path_counts, gateway_percentiles, total_percentiles
+
+    async def _latency_percentiles(
+        self,
+        chat_id: int,
+        *,
+        since: str,
+        column: str,
+        gateway_only: bool,
+    ) -> tuple[int, int]:
+        if column not in {"request_latency_ms", "total_latency_ms"}:
+            raise ValueError("unsupported latency column")
+        parameters: list[int | str] = [chat_id, since]
+        gateway_filter = ""
+        if gateway_only:
+            placeholders = ",".join("?" for _ in AI_GATEWAY_MODELS)
+            gateway_filter = f" AND model IN ({placeholders}) AND cached = 0"
+            parameters.extend(AI_GATEWAY_MODELS)
+        cursor = await self.db.execute(
+            f"""
+            WITH ranked AS (
+                SELECT {column} AS value,
+                       ROW_NUMBER() OVER (ORDER BY {column}) AS row_number,
+                       COUNT(*) OVER () AS sample_count
+                FROM ai_decisions
+                WHERE chat_id = ? AND created_at >= ?{gateway_filter}
+            )
+            SELECT
+                COALESCE(MAX(CASE
+                    WHEN row_number = CAST((sample_count * 50 + 99) / 100 AS INTEGER)
+                    THEN value
+                END), 0) AS p50,
+                COALESCE(MAX(CASE
+                    WHEN row_number = CAST((sample_count * 95 + 99) / 100 AS INTEGER)
+                    THEN value
+                END), 0) AS p95
+            FROM ranked
+            """,  # noqa: S608 - column and placeholders come from fixed internal allowlists
+            tuple(parameters),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return 0, 0
+        return int(row["p50"] or 0), int(row["p95"] or 0)
 
     async def recent_ai_decisions(self, chat_id: int, *, limit: int) -> tuple[AIDecision, ...]:
         cursor = await self.db.execute(
             """
             SELECT is_ad, confidence, category, model, latency_ms, cached,
-                   enforced, error_type, created_at
+                   enforced, error_type, reasoning_effort, service_tier,
+                   review_path, media_latency_ms, queue_latency_ms,
+                   request_latency_ms, action_latency_ms, total_latency_ms,
+                   attempt_count, created_at
             FROM ai_decisions
             WHERE chat_id = ?
             ORDER BY id DESC
@@ -727,6 +1120,15 @@ class Storage:
                 cached=bool(row["cached"]),
                 enforced=bool(row["enforced"]),
                 error_type=str(row["error_type"]),
+                reasoning_effort=str(row["reasoning_effort"]),
+                service_tier=str(row["service_tier"]),
+                review_path=str(row["review_path"]),
+                media_latency_ms=int(row["media_latency_ms"]),
+                queue_latency_ms=int(row["queue_latency_ms"]),
+                request_latency_ms=int(row["request_latency_ms"]),
+                action_latency_ms=int(row["action_latency_ms"]),
+                total_latency_ms=int(row["total_latency_ms"]),
+                attempt_count=int(row["attempt_count"]),
                 created_at=str(row["created_at"]),
             )
             for row in await cursor.fetchall()
@@ -734,11 +1136,8 @@ class Storage:
 
     async def prune_ai_decisions(self, *, retention_days: int) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat(timespec="seconds")
-        async with self._write_lock:
-            cursor = await self.db.execute(
-                "DELETE FROM ai_decisions WHERE created_at < ?", (cutoff,)
-            )
-            await self.db.commit()
+        async with self._write_transaction() as db:
+            cursor = await db.execute("DELETE FROM ai_decisions WHERE created_at < ?", (cutoff,))
         return cursor.rowcount
 
     async def record_ai_learning(
@@ -777,45 +1176,40 @@ class Storage:
             raise ValueError("AI 学习置信度必须在 0 到 1 之间")
 
         timestamp = utc_now()
-        async with self._write_lock:
-            try:
-                await self.db.execute(
-                    """
-                    INSERT INTO ai_learning_memory (
-                        chat_id, category, evidence_profile, decision_count,
-                        max_confidence, created_at, updated_at
-                    ) VALUES (?, ?, ?, 1, ?, ?, ?)
-                    ON CONFLICT(chat_id, category, evidence_profile) DO UPDATE SET
-                        decision_count = ai_learning_memory.decision_count + 1,
-                        max_confidence = MAX(
-                            ai_learning_memory.max_confidence,
-                            excluded.max_confidence
-                        ),
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        chat_id,
-                        normalized_category,
-                        evidence_profile,
-                        normalized_confidence,
-                        timestamp,
-                        timestamp,
+        async with self._write_transaction() as db:
+            await db.execute(
+                """
+                INSERT INTO ai_learning_memory (
+                    chat_id, category, evidence_profile, decision_count,
+                    max_confidence, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(chat_id, category, evidence_profile) DO UPDATE SET
+                    decision_count = ai_learning_memory.decision_count + 1,
+                    max_confidence = MAX(
+                        ai_learning_memory.max_confidence,
+                        excluded.max_confidence
                     ),
-                )
-                cursor = await self.db.execute(
-                    """
-                    SELECT chat_id, category, evidence_profile, decision_count,
-                           max_confidence, created_at, updated_at
-                    FROM ai_learning_memory
-                    WHERE chat_id = ? AND category = ? AND evidence_profile = ?
-                    """,
-                    (chat_id, normalized_category, evidence_profile),
-                )
-                row = await cursor.fetchone()
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    chat_id,
+                    normalized_category,
+                    evidence_profile,
+                    normalized_confidence,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            cursor = await db.execute(
+                """
+                SELECT chat_id, category, evidence_profile, decision_count,
+                       max_confidence, created_at, updated_at
+                FROM ai_learning_memory
+                WHERE chat_id = ? AND category = ? AND evidence_profile = ?
+                """,
+                (chat_id, normalized_category, evidence_profile),
+            )
+            row = await cursor.fetchone()
         if row is None:
             raise RuntimeError("AI 学习记忆写入后读取失败")
         return self._learning_memory_from_row(row)
@@ -858,8 +1252,8 @@ class Storage:
         if status not in {"candidate", "active", "rejected", "disabled"}:
             raise ValueError("无效的 AI 特征状态")
         timestamp = utc_now()
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 """
                 INSERT INTO ai_signatures (
                     chat_id, normalized_signature, display_signature, category,
@@ -891,7 +1285,7 @@ class Storage:
                     timestamp,
                 ),
             )
-            cursor = await self.db.execute(
+            cursor = await db.execute(
                 """
                 SELECT id, normalized_signature, display_signature, category, status,
                        max_confidence, hit_count, created_at, updated_at
@@ -901,7 +1295,6 @@ class Storage:
                 (chat_id, normalized_signature),
             )
             row = await cursor.fetchone()
-            await self.db.commit()
         if row is None:
             raise RuntimeError("AI 特征写入后读取失败")
         return self._signature_from_row(row)
@@ -931,8 +1324,8 @@ class Storage:
         }
 
     async def record_ai_signature_hit(self, chat_id: int, normalized_signature: str) -> bool:
-        async with self._write_lock:
-            cursor = await self.db.execute(
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
                 """
                 UPDATE ai_signatures
                 SET hit_count = hit_count + 1, updated_at = ?
@@ -940,26 +1333,24 @@ class Storage:
                 """,
                 (utc_now(), chat_id, normalized_signature),
             )
-            await self.db.commit()
         return cursor.rowcount > 0
 
     async def activate_ai_signature(self, chat_id: int, signature_id: int) -> bool:
-        async with self._write_lock:
-            cursor = await self.db.execute(
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
                 """
                 UPDATE ai_signatures SET status = 'active', updated_at = ?
                 WHERE chat_id = ? AND id = ? AND status = 'candidate'
                 """,
                 (utc_now(), chat_id, signature_id),
             )
-            await self.db.commit()
         return cursor.rowcount > 0
 
     async def disable_ai_signature(self, chat_id: int, identifier: str) -> bool:
         normalized_identifier = identifier.strip()
-        async with self._write_lock:
+        async with self._write_transaction() as db:
             if normalized_identifier.isdigit():
-                cursor = await self.db.execute(
+                cursor = await db.execute(
                     """
                     UPDATE ai_signatures SET status = 'disabled', updated_at = ?
                     WHERE chat_id = ? AND id = ? AND status <> 'disabled'
@@ -967,14 +1358,13 @@ class Storage:
                     (utc_now(), chat_id, int(normalized_identifier)),
                 )
             else:
-                cursor = await self.db.execute(
+                cursor = await db.execute(
                     """
                     UPDATE ai_signatures SET status = 'disabled', updated_at = ?
                     WHERE chat_id = ? AND normalized_signature = ? AND status <> 'disabled'
                     """,
                     (utc_now(), chat_id, normalized_identifier),
                 )
-            await self.db.commit()
         return cursor.rowcount > 0
 
     @staticmethod
@@ -992,8 +1382,8 @@ class Storage:
         )
 
     async def set_runtime_setting(self, chat_id: int, key: str, value: str) -> None:
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 """
                 INSERT INTO runtime_settings (chat_id, key, value, updated_at)
                 VALUES (?, ?, ?, ?)
@@ -1003,7 +1393,6 @@ class Storage:
                 """,
                 (chat_id, key, value, utc_now()),
             )
-            await self.db.commit()
 
     async def runtime_setting(self, chat_id: int, key: str) -> str | None:
         cursor = await self.db.execute(
@@ -1014,8 +1403,8 @@ class Storage:
         return str(row["value"]) if row is not None else None
 
     async def enqueue_ephemeral(self, chat_id: int, message_id: int, delete_at: str) -> None:
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 """
                 INSERT INTO ephemeral_bot_messages (chat_id, message_id, delete_at)
                 VALUES (?, ?, ?)
@@ -1023,7 +1412,6 @@ class Storage:
                 """,
                 (chat_id, message_id, delete_at),
             )
-            await self.db.commit()
 
     async def due_ephemeral(self, now: str, limit: int = 100) -> tuple[EphemeralRecord, ...]:
         cursor = await self.db.execute(
@@ -1046,16 +1434,24 @@ class Storage:
         )
 
     async def ack_ephemeral(self, chat_id: int, message_id: int) -> None:
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 "DELETE FROM ephemeral_bot_messages WHERE chat_id = ? AND message_id = ?",
                 (chat_id, message_id),
             )
-            await self.db.commit()
+
+    async def ack_ephemeral_many(self, records: Sequence[tuple[int, int]]) -> None:
+        if not records:
+            return
+        async with self._write_transaction() as db:
+            await db.executemany(
+                "DELETE FROM ephemeral_bot_messages WHERE chat_id = ? AND message_id = ?",
+                records,
+            )
 
     async def reschedule_ephemeral(self, chat_id: int, message_id: int, delete_at: str) -> None:
-        async with self._write_lock:
-            await self.db.execute(
+        async with self._write_transaction() as db:
+            await db.execute(
                 """
                 UPDATE ephemeral_bot_messages
                 SET delete_at = ?
@@ -1063,4 +1459,222 @@ class Storage:
                 """,
                 (delete_at, chat_id, message_id),
             )
-            await self.db.commit()
+
+    async def reschedule_ephemeral_many(
+        self,
+        records: Sequence[tuple[int, int, str]],
+    ) -> None:
+        if not records:
+            return
+        async with self._write_transaction() as db:
+            await db.executemany(
+                """
+                UPDATE ephemeral_bot_messages
+                SET delete_at = ?
+                WHERE chat_id = ? AND message_id = ?
+                """,
+                ((delete_at, chat_id, message_id) for chat_id, message_id, delete_at in records),
+            )
+
+    async def claim_due_log_outbox(
+        self,
+        now: str,
+        *,
+        lease_until: str,
+        limit: int = 100,
+    ) -> tuple[LogOutboxRecord, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit 必须是正整数")
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                SELECT id
+                FROM log_outbox
+                WHERE due_at <= ?
+                  AND (claimed_until IS NULL OR claimed_until <= ?)
+                ORDER BY due_at, id
+                LIMIT ?
+                """,
+                (now, now, limit),
+            )
+            outbox_ids = tuple(int(row["id"]) for row in await cursor.fetchall())
+            if not outbox_ids:
+                return ()
+            placeholders = ",".join("?" for _ in outbox_ids)
+            await db.execute(
+                f"""
+                UPDATE log_outbox
+                SET claimed_until = ?
+                WHERE id IN ({placeholders})
+                """,  # noqa: S608 - placeholders are generated from selected integer ids
+                (lease_until, *outbox_ids),
+            )
+            claimed_cursor = await db.execute(
+                f"""
+                SELECT id, chat_id, message_id, actor_id, target_id, action,
+                       due_at, attempt_count, created_at
+                FROM log_outbox
+                WHERE id IN ({placeholders})
+                ORDER BY due_at, id
+                """,  # noqa: S608 - placeholders are generated from selected integer ids
+                outbox_ids,
+            )
+            rows = await claimed_cursor.fetchall()
+        return tuple(self._log_outbox_from_row(row) for row in rows)
+
+    async def ack_log_outbox(self, outbox_id: int) -> None:
+        async with self._write_transaction() as db:
+            await db.execute("DELETE FROM log_outbox WHERE id = ?", (outbox_id,))
+
+    async def reschedule_log_outbox(self, outbox_id: int, due_at: str) -> None:
+        async with self._write_transaction() as db:
+            await db.execute(
+                """
+                UPDATE log_outbox
+                SET due_at = ?, claimed_until = NULL, attempt_count = attempt_count + 1
+                WHERE id = ?
+                """,
+                (due_at, outbox_id),
+            )
+
+    @staticmethod
+    def _log_outbox_from_row(row: aiosqlite.Row) -> LogOutboxRecord:
+        return LogOutboxRecord(
+            id=int(row["id"]),
+            chat_id=int(row["chat_id"]),
+            message_id=(int(row["message_id"]) if row["message_id"] is not None else None),
+            actor_id=int(row["actor_id"]) if row["actor_id"] is not None else None,
+            target_id=int(row["target_id"]) if row["target_id"] is not None else None,
+            action=str(row["action"]),
+            due_at=str(row["due_at"]),
+            attempt_count=int(row["attempt_count"]),
+            created_at=str(row["created_at"]),
+        )
+
+    async def record_member_message(
+        self,
+        chat_id: int,
+        user_id: int,
+        *,
+        observed_at: str | None = None,
+    ) -> None:
+        timestamp = observed_at or utc_now()
+        async with self._write_transaction() as db:
+            await db.execute(
+                """
+                INSERT INTO member_activity (
+                    chat_id, user_id, first_observed_at, last_message_at,
+                    last_membership_at, last_status, message_count
+                ) VALUES (?, ?, ?, ?, NULL, '', 1)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    first_observed_at = MIN(
+                        member_activity.first_observed_at,
+                        excluded.first_observed_at
+                    ),
+                    last_message_at = CASE
+                        WHEN member_activity.last_message_at IS NULL
+                             OR member_activity.last_message_at < excluded.last_message_at
+                        THEN excluded.last_message_at
+                        ELSE member_activity.last_message_at
+                    END,
+                    message_count = member_activity.message_count + 1
+                """,
+                (chat_id, user_id, timestamp, timestamp),
+            )
+
+    async def record_member_status(
+        self,
+        chat_id: int,
+        user_id: int,
+        status: str,
+        *,
+        observed_at: str | None = None,
+    ) -> None:
+        normalized_status = _metadata_token("status", status, allow_empty=False)
+        timestamp = observed_at or utc_now()
+        async with self._write_transaction() as db:
+            await db.execute(
+                """
+                INSERT INTO member_activity (
+                    chat_id, user_id, first_observed_at, last_message_at,
+                    last_membership_at, last_status, message_count
+                ) VALUES (?, ?, ?, NULL, ?, ?, 0)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    first_observed_at = MIN(
+                        member_activity.first_observed_at,
+                        excluded.first_observed_at
+                    ),
+                    last_membership_at = CASE
+                        WHEN member_activity.last_membership_at IS NULL
+                             OR member_activity.last_membership_at < excluded.last_membership_at
+                        THEN excluded.last_membership_at
+                        ELSE member_activity.last_membership_at
+                    END,
+                    last_status = CASE
+                        WHEN member_activity.last_membership_at IS NULL
+                             OR member_activity.last_membership_at <= excluded.last_membership_at
+                        THEN excluded.last_status
+                        ELSE member_activity.last_status
+                    END
+                """,
+                (chat_id, user_id, timestamp, timestamp, normalized_status),
+            )
+
+    async def member_activity(self, chat_id: int, user_id: int) -> MemberActivity | None:
+        cursor = await self.db.execute(
+            """
+            SELECT chat_id, user_id, first_observed_at, last_message_at,
+                   last_membership_at, last_status, message_count
+            FROM member_activity
+            WHERE chat_id = ? AND user_id = ?
+            """,
+            (chat_id, user_id),
+        )
+        row = await cursor.fetchone()
+        return self._member_activity_from_row(row) if row is not None else None
+
+    async def inactive_member_candidates(
+        self,
+        chat_id: int,
+        *,
+        cutoff: str,
+        limit: int,
+    ) -> tuple[MemberActivity, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit 必须是正整数")
+        cursor = await self.db.execute(
+            """
+            SELECT chat_id, user_id, first_observed_at, last_message_at,
+                   last_membership_at, last_status, message_count
+            FROM member_activity
+            WHERE chat_id = ?
+              AND MAX(
+                  COALESCE(last_message_at, first_observed_at),
+                  COALESCE(last_membership_at, first_observed_at)
+              ) < ?
+              AND last_status NOT IN ('left', 'kicked')
+            ORDER BY MAX(
+                COALESCE(last_message_at, first_observed_at),
+                COALESCE(last_membership_at, first_observed_at)
+            ), user_id
+            LIMIT ?
+            """,
+            (chat_id, cutoff, limit),
+        )
+        return tuple(self._member_activity_from_row(row) for row in await cursor.fetchall())
+
+    @staticmethod
+    def _member_activity_from_row(row: aiosqlite.Row) -> MemberActivity:
+        return MemberActivity(
+            chat_id=int(row["chat_id"]),
+            user_id=int(row["user_id"]),
+            first_observed_at=str(row["first_observed_at"]),
+            last_message_at=(
+                str(row["last_message_at"]) if row["last_message_at"] is not None else None
+            ),
+            last_membership_at=(
+                str(row["last_membership_at"]) if row["last_membership_at"] is not None else None
+            ),
+            last_status=str(row["last_status"]),
+            message_count=int(row["message_count"]),
+        )

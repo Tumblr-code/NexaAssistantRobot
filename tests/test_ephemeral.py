@@ -123,6 +123,15 @@ def at(seconds: int) -> datetime:
     return datetime(2026, 8, 29, 0, 0, seconds, tzinfo=timezone.utc)
 
 
+def test_delete_concurrency_cannot_exceed_four() -> None:
+    with pytest.raises(ValueError, match="between one and four"):
+        EphemeralMessenger(  # type: ignore[arg-type]
+            FakeBot(),
+            FakeStorage(),
+            delete_concurrency=5,
+        )
+
+
 async def test_send_and_answer_are_tracked_for_thirty_seconds() -> None:
     clock = MutableClock(at(0))
     storage = FakeStorage()
@@ -199,6 +208,108 @@ async def test_process_due_uses_dedicated_delete_bot() -> None:
     assert polling_bot.deleted == []
     assert delete_bot.deleted == [(-100, 9)]
     assert storage.acked == [(-100, 9)]
+
+
+async def test_start_does_not_block_polling_while_history_recovery_is_slow() -> None:
+    records = [
+        EphemeralRecord(-100, message_id, "2026-08-29T00:00:00.000000+00:00")
+        for message_id in range(1, 101)
+    ]
+    storage = FakeStorage(records)
+    four_deletes_started = asyncio.Event()
+
+    class BlockingDeleteBot(FakeBot):
+        async def delete_message(self, chat_id: int, message_id: int) -> bool:
+            self.deleted.append((chat_id, message_id))
+            if len(self.deleted) == 4:
+                four_deletes_started.set()
+            await asyncio.Event().wait()
+            return True
+
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        FakeBot(),
+        storage,
+        delete_bot=BlockingDeleteBot(),  # type: ignore[arg-type]
+        clock=MutableClock(at(1)),
+    )
+
+    await asyncio.wait_for(messenger.start(), timeout=0.05)
+    polling_can_start = True
+    await asyncio.wait_for(four_deletes_started.wait(), timeout=0.2)
+
+    assert polling_can_start
+    assert messenger._worker_task is not None
+    assert not messenger._worker_task.done()
+
+    await asyncio.wait_for(messenger.shutdown(), timeout=0.2)
+
+
+async def test_due_deletions_are_bounded_to_four_concurrent_requests() -> None:
+    records = [
+        EphemeralRecord(-100, message_id, "2026-08-29T00:00:00.000000+00:00")
+        for message_id in range(1, 101)
+    ]
+    storage = FakeStorage(records)
+
+    class MeasuringDeleteBot(FakeBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+
+        async def delete_message(self, chat_id: int, message_id: int) -> bool:
+            self.deleted.append((chat_id, message_id))
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0.005)
+                return True
+            finally:
+                self.active -= 1
+
+    delete_bot = MeasuringDeleteBot()
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        FakeBot(),
+        storage,
+        delete_bot=delete_bot,  # type: ignore[arg-type]
+        clock=MutableClock(at(1)),
+    )
+
+    assert await messenger.process_due() == 100
+
+    assert delete_bot.max_active == 4
+    assert len(delete_bot.deleted) == 100
+    assert len(storage.acked) == 100
+
+
+async def test_concurrent_due_scans_do_not_delete_the_same_record_twice() -> None:
+    record = EphemeralRecord(-100, 9, "2026-08-29T00:00:00.000000+00:00")
+    storage = FakeStorage([record])
+    delete_started = asyncio.Event()
+    allow_delete = asyncio.Event()
+
+    class BlockingDeleteBot(FakeBot):
+        async def delete_message(self, chat_id: int, message_id: int) -> bool:
+            self.deleted.append((chat_id, message_id))
+            delete_started.set()
+            await allow_delete.wait()
+            return True
+
+    delete_bot = BlockingDeleteBot()
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        FakeBot(),
+        storage,
+        delete_bot=delete_bot,  # type: ignore[arg-type]
+        clock=MutableClock(at(1)),
+    )
+
+    first = asyncio.create_task(messenger.process_due())
+    await delete_started.wait()
+    second = asyncio.create_task(messenger.process_due())
+    allow_delete.set()
+
+    assert await asyncio.gather(first, second) == [1, 0]
+    assert delete_bot.deleted == [(-100, 9)]
 
 
 async def test_delete_timeout_reschedules_due_message() -> None:

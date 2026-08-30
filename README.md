@@ -10,18 +10,21 @@ Nexa Guardian 的身份是 Nexa 官方群管理审核员。固定的一方站点
 
 上述精确域名本身不会被当作外部链接信号；相似域名、伪造后缀、钓鱼、冒充和附带其他广告证据的内容仍会进入审核。
 
-生产服务位于 VM `SERVER-IP`，由 `nexa-guardian.service` 持久运行，目标为 `@ExampleGroup`。仓库中的 v0.2 AI 模式只有在兼容网关探测通过并配置 `AI_ENABLED=true` 后才会启用；未启用时继续运行旧规则兼容模式。
+生产服务位于 VM `SERVER-IP`，由 `nexa-guardian.service` 持久运行，目标为 `@ExampleGroup`。仓库中的 v0.3.0 AI 模式只有在兼容网关探测通过并配置 `AI_ENABLED=true` 后才会启用；未启用时继续运行旧规则兼容模式。
 
 ## 已实现
 
-- GPT-5.6 Sol 以 `high` 推理强度和低输出模式结构化审核文字、媒体标题、图片和视频封面。
+- GPT-5.6 Sol 自适应审核：无本地可疑信号的纯文字先用 `low`；可疑、刷屏、图片或视频封面直接用 `high`；`low` 只有在判为非广告且置信度不低于 `0.90` 时才直接放行，其余结果升级为 `high` 复核。
+- AI 网关复用 keep-alive 连接；相同并发内容合并为一次请求，并把排队、重试纳入同一个总超时。判断记录拆分媒体、排队、网关、动作和端到端延迟，可在 `/aistats` 查看路径与 P50/P95。
+- 图片从 Telegram 可用尺寸中选择达到目标边长的最小预览，视频只取封面；下载受独立并发、大小和 2 秒超时限制，失败时只用已有文字继续审核。
 - 外链、转发、联系方式、混淆字符、刷屏及已学习特征仅作为可疑预检；正常聊天静默审核。
 - 只有可疑消息会显示“正在审核…”；结果原地更新，群内机器人输出统一在约 30 秒后删除，授权管理员私聊回复永久保留。
 - 每次成功广告判断都写入不含原文和用户标识的永久聚合记忆；安全短语进入候选库，高置信短语立即启用，中等置信短语重复命中 3 次后启用，后续可不调用 API 直接拦截。
 - 违规累计警告，达到阈值后自动封禁并清零。
+- 从 v0.3.0 上线时开始记录成员首次观察时间、最后群内发言和成员状态元数据；唯一管理员可私聊预览并二次确认移出至少 30 天未发言的已观察成员。
 - 管理员命令：警告、禁言、解禁、封禁、解封、移出、删消息。
 - 每群独立的可信用户、域名白名单、AI 特征和 SQLite 状态。
-- 可选独立日志群；日志不保存完整消息正文或 Token。
+- 可选独立日志群；管理动作先与本地记录原子写入持久 outbox，再异步发送和失败重试，不阻塞删消息、警告或封禁。
 - AI 判断不保存消息正文、图片、处罚原因或模型推理。
 - `DRY_RUN` 观察模式、群 ID 白名单、在线 SQLite 备份、持久化临时消息删除队列、独立 Telegram 删除连接、systemd/Docker 非 root 运行。
 
@@ -66,17 +69,27 @@ ALLOWED_CHAT_IDS=-1001234567890,-1009876543210
 
 常用配置：
 
-| 变量 | 默认值 | 作用 |
+| 变量 | 程序默认值 | 作用 |
 |---|---:|---|
+| `EXPECTED_BOT_ID` | 空 | 启动时核验机器人数字 ID；生产必须显式配置 |
+| `EXPECTED_BOT_USERNAME` | 空 | 启动时核验用户名（可不带 `@`）；生产必须显式配置 |
+| `UPDATE_CONCURRENCY_LIMIT` | `32` | aiogram 同时处理的更新上限，避免无限创建任务 |
 | `AI_ENABLED` | `false` | 启用 GPT-5.6 Sol AI 审核；启用前必须完成网关探测 |
 | `OPENAI_BASE_URL` | 空 | 兼容网关基础地址，支持 `/v1/responses` |
 | `OPENAI_API_KEY` | 空 | 兼容网关密钥，仅保存于服务器 `0600` 环境文件 |
 | `AI_MODEL` | `gpt-5.6-sol` | 固定审核模型，不接受家族别名或自动降级 |
-| `AI_REASONING_EFFORT` | `high` | 固定推理强度，不自动降为低强度 |
+| `AI_REASONING_EFFORT` | `high` | 兼容及能力探测基准；固定为 `high` |
+| `AI_NORMAL_REASONING_EFFORT` | 继承上项 | 普通纯文字首轮强度；生产固定为 `low` |
+| `AI_SUSPICIOUS_REASONING_EFFORT` | 继承上项 | 可疑、刷屏和媒体消息强度；生产固定为 `high` |
+| `AI_NORMAL_ACCEPT_CONFIDENCE` | `0.90` | 普通 `low` 非广告直接放行的最低置信度；其他结果升级 `high` |
 | `AI_SERVICE_TIER` | `default` | 固定为当前兼容网关实际支持并回显的服务层 |
 | `AI_AD_THRESHOLD` | `0.92` | 删除并警告的最低广告置信度 |
 | `AI_LEARN_THRESHOLD` | `0.97` | 自动启用学习特征的最低置信度 |
 | `AI_FAILURE_DELETE` | `true` | AI 故障时删除原消息，但不警告、不学习 |
+| `AI_IMAGE_MAX_BYTES` | `5242880` | 单个媒体预览的硬上限；生产固定为 `1572864`（1.5 MiB） |
+| `AI_IMAGE_TARGET_LONG_EDGE` | `1280` | 优先选择长边达到该值的最小 Telegram 图片预览 |
+| `AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS` | `2` | 单个图片或视频封面下载超时 |
+| `AI_MEDIA_CONCURRENCY` | `4` | 同时下载媒体预览的上限 |
 | `NOTICE_TTL_SECONDS` | `30` | 群聊及日志群机器人输出的保留秒数；授权管理员私聊不清理 |
 | `BLOCK_EXTERNAL_LINKS` | `true` | AI 模式仅用于可疑预检；旧模式直接过滤 |
 | `AUTHORIZED_ADMIN_IDS` | 空 | 可执行手动命令的数字用户 ID；私聊管理要求恰好一个且仍需具备群权限 |
@@ -89,7 +102,9 @@ ALLOWED_CHAT_IDS=-1001234567890,-1009876543210
 | `DRY_RUN` | `false` | 只记录自动命中，不删除/警告/禁言；手动管理员命令仍执行 |
 | `LOG_CHAT_ID` | 空 | 可选的集中管理日志群/频道 |
 
-兼容网关必须同时支持 Responses API、严格 JSON Schema、图片输入、`reasoning.effort=high` 和可核验的服务层。当前生产网关会把 `priority` 请求降为 `default`，因此程序明确固定并校验 `service_tier=default`，不会把降级伪装成 Priority。快速响应由低输出、8 秒总超时、并发、10 分钟缓存和已学习特征本地直拦实现。程序只接受响应中明确返回 `status=completed`、`model=gpt-5.6-sol`、`reasoning.effort=high`、`service_tier=default` 的结果，缺失或不匹配均按审核服务故障处理。请求设置 `store=false`，只发送待判断文本或图片，不发送用户名、用户 ID、群名和聊天历史。普通文件和无预览贴纸不送入 AI。
+兼容网关必须同时支持 Responses API、严格 JSON Schema、图片输入、`reasoning.effort=low/high` 和可核验的服务层。当前生产网关会把 `priority` 请求降为 `default`，因此程序明确固定并校验 `service_tier=default`，不会把降级伪装成 Priority。快速响应由连接复用、相同内容 singleflight、普通文字 `low`、8 秒端到端总超时、10 分钟缓存和已学习特征本地直拦实现。程序只接受响应中明确返回 `status=completed`、`model=gpt-5.6-sol`、本次请求对应的推理强度及 `service_tier=default` 的结果，缺失或不匹配均按审核服务故障处理。请求设置 `store=false`，只发送待判断文本或图片，不发送用户名、用户 ID、群名和聊天历史。普通文件和无预览贴纸不送入 AI。
+
+生产发布额外要求显式配置并由发布探针校验：`EXPECTED_BOT_ID`、`EXPECTED_BOT_USERNAME`、`UPDATE_CONCURRENCY_LIMIT=32`、`AI_NORMAL_REASONING_EFFORT=low`、`AI_SUSPICIOUS_REASONING_EFFORT=high`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、`AI_IMAGE_MAX_BYTES=1572864`、`AI_IMAGE_TARGET_LONG_EDGE=1280`、`AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2` 和 `AI_MEDIA_CONCURRENCY=4`。身份不匹配时服务会在启动轮询前退出。
 
 模型及服务层字段依据 [OpenAI GPT-5.6 Sol 模型说明](https://developers.openai.com/api/docs/models/gpt-5.6-sol) 和 [Responses API 参考](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)。
 
@@ -183,16 +198,20 @@ uv run pytest --cov=src/nexa_guardian --cov-fail-under=75
 /aistats                     私聊查看 AI 审核统计
 /airecent [1-30]             私聊查看最近 AI 判断
 /aipause /airesume           私聊紧急暂停/恢复 AI
+/inactive [30-365]           私聊预览长期未发言的已观察成员
+/cleanupinactive [30-365]    私聊生成 10 分钟有效的二次确认清理计划
 
 /settings /stats /status /chatid /help
 /recent [1-30]               私聊查看最近管理操作
 ```
 
-管理动作不接收、显示或记录原因；旧版命令尾部附带的文字会被兼容忽略。`/stats` 按北京时间展示今天、近 7 天和累计数据。`/recent` 默认返回 10 条、最多 30 条，为避免在群里公开用户 ID，只能由授权管理员私聊使用。
+管理动作不接收、显示或记录原因；旧版命令尾部附带的文字会被兼容忽略。`/stats` 按北京时间展示今天、近 7 天和累计数据。`/recent` 默认返回 10 条、最多 30 条，为避免在群里公开用户 ID，只能由授权管理员私聊使用。`/aistats` 还展示普通/可疑推理路径以及网关和端到端延迟的 P50/P95，便于区分媒体下载、队列、网关与 Telegram 动作耗时。
 
 `/addword` 已停用。AI 只把来自当前文字、通过长度、隐私及宽泛词校验的稳定广告短语写入永久特征库；姓名、地址、链接、账号、手机号和订单号不会进入特征。没有安全短语的图片广告等仍只累计固定分类与证据类型，不保存原文、图片、用户 ID 或消息 ID。`/words` 横向排列已启用特征并自动分段；管理员可用 `/delword` 立即停用误学项。
 
 机器人在群聊和日志群发送的消息会在首次发送成功约 30 秒后删除；编辑“正在审核…”不会重置时间。删除队列只保存 Telegram 消息标识和到期时间，服务重启后会继续补删。删除使用独立于长轮询的 Telegram 连接，单次请求超时后保留队列并退避重试。唯一授权管理员的私聊回复永久保留，不进入删除队列。
+
+成员筛选从 v0.3.0 实际上线后才开始积累观察数据，至少观察 30 天后才可能出现清理候选。`/inactive` 只报告机器人看到的最后群内发言、成员状态事件或首次观察时间；Telegram Bot API 不提供可靠的成员最后上线时间，也不能枚举机器人接入前的全部历史成员，因此该功能不能证明账号“一个月没上线”，也不能完整发现已注销账号。`/cleanupinactive` 只允许唯一授权管理员私聊使用，要求限制成员权限并用 10 分钟有效的确认码二次确认；执行前会在逐成员锁内再次核验最新活动、管理员、机器人、可信用户和当前成员状态，避免与发言、设为可信或永久封禁交错。清理动作只是移出群组并允许以后重新加入，不会自动运行，也不会把“未发言”等同于“已注销”。遇到 Telegram 限流会有界重试；解除封禁失败时立即停止剩余批次，且移出步骤使用 5 分钟临时封禁兜底，避免意外永久封禁。
 
 私聊 `/del` 无法引用群消息，需填写群消息 ID：`/del 群消息ID`。机器人不会仅凭私聊身份放行：私聊只接受唯一配置的授权管理员，其他账号会被静默忽略；每次操作仍会同时核验目标群管理员身份和所需权限。若授权管理员或目标群不是恰好一个，私聊管理会拒绝执行，避免误操作到错误群。
 
@@ -202,14 +221,20 @@ uv run pytest --cov=src/nexa_guardian --cov-fail-under=75
 
 ## 7. 上线验证顺序
 
-1. 执行完整 CI，并在受保护环境文件中显式配置 `AI_MODEL=gpt-5.6-sol`、
-   `AI_REASONING_EFFORT=high`、`AI_SERVICE_TIER=default`、`AI_ENABLED=true`、
-   `WARN_LIMIT=3`、`NOTICE_TTL_SECONDS=30` 和 `AI_FAILURE_DELETE=true`。
+1. 执行完整 CI，并在受保护环境文件中显式配置 `EXPECTED_BOT_ID`、
+   `EXPECTED_BOT_USERNAME`、`UPDATE_CONCURRENCY_LIMIT=32`、`AI_MODEL=gpt-5.6-sol`、
+   `AI_REASONING_EFFORT=high`、`AI_NORMAL_REASONING_EFFORT=low`、
+   `AI_SUSPICIOUS_REASONING_EFFORT=high`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、
+   `AI_SERVICE_TIER=default`、`AI_IMAGE_MAX_BYTES=1572864`、
+   `AI_IMAGE_TARGET_LONG_EDGE=1280`、`AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2`、
+   `AI_MEDIA_CONCURRENCY=4`、`AI_ENABLED=true`、`WARN_LIMIT=3`、
+   `NOTICE_TTL_SECONDS=30` 和 `AI_FAILURE_DELETE=true`。
 2. 运行发布脚本；脚本先备份配置、构建候选版本，并用不含群消息的请求验证 Responses API、
-   结构化输出、图片输入及响应实际采用 Sol/high/default；通过后才短暂停服，创建并校验最终一致的 SQLite 备份并原子切换。
+   结构化输出、图片输入、low/high 推理响应契约及上述生产设置；通过后才短暂停服，创建并校验最终一致的 SQLite 备份并原子切换。
 3. 上线后验证服务、唯一管理员私聊权限、群内临时消息补删队列，并确认私聊回复不入队。
 4. 用非管理员测试账号验证正常聊天静默、可疑提示、广告删除和第三次警告封禁。
 5. 验证 AI 超时时只删除消息、不增加警告，并确认连续失败告警与 `/aipause` 可用。
+6. 验证 `/inactive` 只显示 v0.3.0 上线后观察到的活动元数据；不要为验收而实际清理生产成员。
 
 网关凭据写入受保护环境文件后，可在候选 release 的虚拟环境中执行：
 
@@ -219,7 +244,7 @@ uv run pytest --cov=src/nexa_guardian --cov-fail-under=75
   --require-production-settings
 ```
 
-探测只发送固定的无害文字和 1×1 测试图片，不读取或发送群消息；只有响应明确回显
-`completed`、`gpt-5.6-sol`、`high` 和 `default` 后，才允许切换生产 release。
+探测只发送固定的无害文字和 1×1 测试图片，不读取或发送群消息；只有网关明确回显
+`completed`、`gpt-5.6-sol`、请求对应的 `low/high` 和 `default`，且全部生产配置契约通过后，才允许切换生产 release。
 
 轮询启动时如果发现该 Token 已经配置 webhook，程序会拒绝启动，**不会自动删除现有 webhook**。这是为了避免误用现有客服机器人 Token 时切断原服务。

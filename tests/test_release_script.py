@@ -4,7 +4,8 @@ from pathlib import Path
 def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     script = (Path(__file__).parents[1] / "deploy" / "release.sh").read_text(encoding="utf-8")
 
-    probe = script.index("probing GPT-5.6 Sol high-reasoning low-output capabilities")
+    assert 'readonly CODE_SCHEMA_VERSION="6"' in script
+    probe = script.index("probing GPT-5.6 Sol adaptive-reasoning capabilities")
     pause_timer = script.index("pausing ${BACKUP_TIMER_NAME}")
     backup_inactive = script.index("database backup service did not become idle")
     stop = script.index("for a final consistent database backup")

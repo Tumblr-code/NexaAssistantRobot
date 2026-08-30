@@ -8,7 +8,12 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-from nexa_guardian.ai_contract import AI_MODEL, AI_REASONING_EFFORT, AI_SERVICE_TIER
+from nexa_guardian.ai_contract import (
+    AI_MODEL,
+    AI_REASONING_EFFORT,
+    AI_REASONING_EFFORTS,
+    AI_SERVICE_TIER,
+)
 from nexa_guardian.ai_review import (
     AIReviewer,
     AIReviewResult,
@@ -35,8 +40,8 @@ async def probe_gateway(
 
     if model != AI_MODEL:
         raise ValueError(f"AI_MODEL must be exactly {AI_MODEL}")
-    if reasoning_effort != AI_REASONING_EFFORT:
-        raise ValueError(f"AI_REASONING_EFFORT must be exactly {AI_REASONING_EFFORT}")
+    if reasoning_effort not in AI_REASONING_EFFORTS:
+        raise ValueError("AI_REASONING_EFFORT must be low or high")
     if service_tier != AI_SERVICE_TIER:
         raise ValueError(f"AI_SERVICE_TIER must be exactly {AI_SERVICE_TIER}")
 
@@ -52,11 +57,15 @@ async def probe_gateway(
         cache_ttl=0,
         cache_size=0,
     )
-    return await reviewer.review(
-        text=PROBE_TEXT,
-        image_data_url=PROBE_IMAGE_DATA_URL,
-        safety_identifier="gateway-capability-probe",
-    )
+    try:
+        return await reviewer.review(
+            text=PROBE_TEXT,
+            image_data_url=PROBE_IMAGE_DATA_URL,
+            safety_identifier="gateway-capability-probe",
+            reasoning_effort=reasoning_effort,
+        )
+    finally:
+        await reviewer.close()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -83,6 +92,9 @@ def _env_value(values: Mapping[str, str | None], name: str, default: str = "") -
 def _validate_production_settings(values: Mapping[str, str | None]) -> None:
     true_values = {"true", "1", "yes", "on"}
     false_values = {"false", "0", "no", "off"}
+    for name in ("AI_ENABLED", "AI_FAILURE_DELETE", "DRY_RUN"):
+        if name not in values or not _env_value(values, name):
+            raise ValueError(f"{name} must be explicitly configured for production")
     if _env_value(values, "AI_ENABLED", "false").casefold() not in true_values:
         raise ValueError("AI_ENABLED must be true for production")
     if _env_value(values, "AI_FAILURE_DELETE", "true").casefold() not in true_values:
@@ -92,6 +104,8 @@ def _validate_production_settings(values: Mapping[str, str | None]) -> None:
     fixed_settings = {
         "AI_MODEL": AI_MODEL,
         "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
+        "AI_NORMAL_REASONING_EFFORT": "low",
+        "AI_SUSPICIOUS_REASONING_EFFORT": "high",
         "AI_SERVICE_TIER": AI_SERVICE_TIER,
     }
     for name, expected in fixed_settings.items():
@@ -101,15 +115,20 @@ def _validate_production_settings(values: Mapping[str, str | None]) -> None:
             raise ValueError(f"{name} must be {expected} for production")
 
     integer_settings = {
+        "UPDATE_CONCURRENCY_LIMIT": (32, "32"),
         "WARN_LIMIT": (3, "3"),
         "NOTICE_TTL_SECONDS": (30, "30"),
         "AI_CONCURRENCY": (8, "8"),
         "AI_CACHE_TTL_SECONDS": (600, "600"),
         "AI_CACHE_MAX_ENTRIES": (1000, "1000"),
         "AI_DECISION_RETENTION_DAYS": (30, "30"),
-        "AI_IMAGE_MAX_BYTES": (5 * 1024 * 1024, str(5 * 1024 * 1024)),
+        "AI_IMAGE_MAX_BYTES": (1_572_864, "1572864"),
+        "AI_IMAGE_TARGET_LONG_EDGE": (1280, "1280"),
+        "AI_MEDIA_CONCURRENCY": (4, "4"),
     }
     for name, (expected, default) in integer_settings.items():
+        if name not in values or not _env_value(values, name):
+            raise ValueError(f"{name} must be explicitly configured for production")
         try:
             actual = int(_env_value(values, name, default))
         except ValueError as exc:
@@ -121,14 +140,29 @@ def _validate_production_settings(values: Mapping[str, str | None]) -> None:
         "AI_AD_THRESHOLD": (0.92, "0.92"),
         "AI_LEARN_THRESHOLD": (0.97, "0.97"),
         "AI_TIMEOUT_SECONDS": (8.0, "8"),
+        "AI_NORMAL_ACCEPT_CONFIDENCE": (0.90, "0.90"),
+        "AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS": (2.0, "2"),
     }
     for name, (expected, default) in float_settings.items():
+        if name not in values or not _env_value(values, name):
+            raise ValueError(f"{name} must be explicitly configured for production")
         try:
             actual = float(_env_value(values, name, default))
         except ValueError as exc:
             raise ValueError(f"{name} must be {expected:g} for production") from exc
         if actual != expected:
             raise ValueError(f"{name} must be {expected:g} for production")
+
+    expected_bot_id = _env_value(values, "EXPECTED_BOT_ID")
+    try:
+        parsed_bot_id = int(expected_bot_id)
+    except ValueError as exc:
+        raise ValueError("EXPECTED_BOT_ID must be a positive integer for production") from exc
+    if parsed_bot_id <= 0:
+        raise ValueError("EXPECTED_BOT_ID must be a positive integer for production")
+    expected_username = _env_value(values, "EXPECTED_BOT_USERNAME").removeprefix("@")
+    if not expected_username:
+        raise ValueError("EXPECTED_BOT_USERNAME must be explicitly configured for production")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -149,22 +183,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments.require_production_settings:
             _validate_production_settings(values)
-        result = asyncio.run(
-            probe_gateway(
-                base_url=base_url,
-                api_key=api_key,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                service_tier=service_tier,
+        efforts = ("low", "high") if arguments.require_production_settings else (reasoning_effort,)
+
+        async def run_probes() -> tuple[AIReviewResult, ...]:
+            return tuple(
+                [
+                    await probe_gateway(
+                        base_url=base_url,
+                        api_key=api_key,
+                        model=model,
+                        reasoning_effort=effort,
+                        service_tier=service_tier,
+                    )
+                    for effort in efforts
+                ]
             )
-        )
+
+        results = asyncio.run(run_probes())
     except Exception as exc:
         print(f"gateway probe failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
-        f"gateway probe ok: model={AI_MODEL} reasoning={AI_REASONING_EFFORT} "
-        f"service_tier={AI_SERVICE_TIER} structured_output=true image_input=true "
-        f"latency_ms={result.latency_ms}"
+        f"gateway probe ok: model={AI_MODEL} "
+        f"reasoning={','.join(result.reasoning_effort for result in results)} "
+        f"service_tier={','.join(result.actual_service_tier for result in results)} "
+        "structured_output=true image_input=true "
+        f"latency_ms={','.join(str(result.latency_ms) for result in results)}"
     )
     return 0
 

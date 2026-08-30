@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from nexa_guardian.ai_contract import (
     AI_MODEL,
     AI_REASONING_EFFORT,
+    AI_REASONING_EFFORTS,
     AI_SERVICE_TIER,
     NEXA_OFFICIAL_DOMAINS,
 )
@@ -356,6 +357,66 @@ class ResponseRequester(Protocol):
     ) -> Awaitable[HTTPResponse]: ...
 
 
+class _AiohttpRequester:
+    """Lazily own one bounded keep-alive session for the AI gateway."""
+
+    def __init__(self, *, concurrency: int) -> None:
+        self.concurrency = concurrency
+        self._session: Any | None = None
+        self._session_lock = asyncio.Lock()
+        self._closed = False
+
+    async def __call__(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, object],
+        timeout: float,
+    ) -> HTTPResponse:
+        import aiohttp
+
+        session = await self._session_for_request()
+        try:
+            client_timeout = aiohttp.ClientTimeout(total=timeout)
+            async with session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=client_timeout,
+            ) as response:
+                try:
+                    body: object = await response.json(content_type=None)
+                except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                    body = {}
+                return HTTPResponse(status=response.status, body=body)
+        except asyncio.TimeoutError as exc:
+            raise AIReviewTimeout("AI review endpoint timed out") from exc
+        except aiohttp.ClientError as exc:
+            raise AIReviewConnectionError("AI review endpoint connection failed") from exc
+
+    async def _session_for_request(self) -> Any:
+        import aiohttp
+
+        async with self._session_lock:
+            if self._closed:
+                raise AIReviewConnectionError("AI review HTTP client is closed")
+            if self._session is None or bool(getattr(self._session, "closed", False)):
+                connector = aiohttp.TCPConnector(limit=self.concurrency)
+                self._session = aiohttp.ClientSession(connector=connector)
+            return self._session
+
+    async def close(self) -> None:
+        async with self._session_lock:
+            if self._closed:
+                return
+            self._closed = True
+            session = self._session
+            self._session = None
+        if session is not None and not bool(getattr(session, "closed", False)):
+            await session.close()
+
+
 @dataclass(frozen=True, slots=True)
 class AIReviewResult:
     is_ad: bool
@@ -365,6 +426,17 @@ class AIReviewResult:
     cached: bool
     latency_ms: int
     rejected_signatures: tuple[str, ...] = ()
+    reasoning_effort: str = AI_REASONING_EFFORT
+    actual_service_tier: str = AI_SERVICE_TIER
+    review_path: str = "gateway"
+    queue_latency_ms: int = 0
+    request_latency_ms: int = 0
+    attempt_count: int = 0
+
+    @property
+    def service_tier(self) -> str:
+        """Backward-friendly name for the tier actually reported by the gateway."""
+        return self.actual_service_tier
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +453,9 @@ class SuspicionResult:
 class _CacheEntry:
     result: AIReviewResult
     expires_at: float
+
+
+MIN_RETRY_REMAINING_SECONDS = 3.0
 
 
 def normalize_signature(value: str) -> str:
@@ -503,8 +578,8 @@ class AIReviewer:
             raise ValueError("base_url, api_key, and model are required")
         if model != AI_MODEL:
             raise ValueError(f"model must be exactly {AI_MODEL}")
-        if reasoning_effort != AI_REASONING_EFFORT:
-            raise ValueError(f"reasoning_effort must be exactly {AI_REASONING_EFFORT}")
+        if reasoning_effort not in AI_REASONING_EFFORTS:
+            raise ValueError("reasoning_effort must be low or high")
         if service_tier != AI_SERVICE_TIER:
             raise ValueError(f"service_tier must be exactly {AI_SERVICE_TIER}")
         if timeout <= 0 or concurrency <= 0 or cache_ttl < 0 or cache_size < 0:
@@ -518,9 +593,18 @@ class AIReviewer:
         self.timeout = timeout
         self.cache_ttl = cache_ttl
         self.cache_size = cache_size
-        self._requester = requester or _aiohttp_request
+        if requester is None:
+            self._default_requester = _AiohttpRequester(concurrency=concurrency)
+            self._requester: ResponseRequester = self._default_requester
+        else:
+            self._default_requester = None
+            self._requester = requester
         self._semaphore = asyncio.Semaphore(concurrency)
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+        self._inflight: dict[str, asyncio.Task[AIReviewResult]] = {}
+        self._inflight_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._closed = False
         self._clock = clock
 
     async def review(
@@ -531,50 +615,166 @@ class AIReviewer:
         safety_identifier: str,
         risk_signals: Sequence[str] = (),
         linked_hosts: Sequence[str] = (),
+        reasoning_effort: str | None = None,
     ) -> AIReviewResult:
+        if self._closed:
+            raise RuntimeError("AI reviewer is closed")
         if not text.strip() and image_data_url is None:
             raise ValueError("text or image_data_url is required")
         if image_data_url is not None and not image_data_url.startswith("data:image/"):
             raise ValueError("image_data_url must be an image data URL")
         if not safety_identifier.strip():
             raise ValueError("safety_identifier is required")
+        selected_effort = self.reasoning_effort if reasoning_effort is None else reasoning_effort
+        if selected_effort not in AI_REASONING_EFFORTS:
+            raise ValueError("reasoning_effort must be low or high")
 
         normalized_risk_signals = _normalize_risk_signals(risk_signals)
         normalized_linked_hosts = _normalize_linked_hosts(linked_hosts)
 
         started = self._clock()
+        deadline = started + self.timeout
         cache_key = _content_digest(
             self.model,
+            selected_effort,
+            self.service_tier,
             text,
             image_data_url,
             normalized_risk_signals,
             normalized_linked_hosts,
         )
-        cached = self._get_cached(cache_key)
-        if cached is not None:
-            return replace(
-                cached,
-                cached=True,
-                latency_ms=_elapsed_ms(started, self._clock()),
-            )
+        cached_result = self._cached_result(cache_key, started)
+        if cached_result is not None:
+            return cached_result
 
+        async with self._inflight_lock:
+            if self._closed:
+                raise RuntimeError("AI reviewer is closed")
+            cached_result = self._cached_result(cache_key, started)
+            if cached_result is not None:
+                return cached_result
+            task = self._inflight.get(cache_key)
+            owner = task is None
+            if task is None:
+                task = asyncio.create_task(
+                    self._run_inflight(
+                        cache_key=cache_key,
+                        text=text,
+                        image_data_url=image_data_url,
+                        safety_identifier=safety_identifier,
+                        risk_signals=normalized_risk_signals,
+                        linked_hosts=normalized_linked_hosts,
+                        reasoning_effort=selected_effort,
+                        started=started,
+                        deadline=deadline,
+                    ),
+                    name="nexa-ai-review",
+                )
+                task.add_done_callback(self._consume_inflight_result)
+                self._inflight[cache_key] = task
+
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise AIReviewTimeout("AI review exceeded the total timeout")
         try:
-            result = await asyncio.wait_for(
-                self._review_uncached(
-                    text=text,
-                    image_data_url=image_data_url,
-                    safety_identifier=safety_identifier,
-                    risk_signals=normalized_risk_signals,
-                    linked_hosts=normalized_linked_hosts,
-                    started=started,
-                ),
-                timeout=self.timeout,
-            )
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
         except asyncio.TimeoutError as exc:
             raise AIReviewTimeout("AI review exceeded the total timeout") from exc
 
-        self._put_cached(cache_key, result)
-        return result
+        if owner:
+            return result
+        elapsed = _elapsed_ms(started, self._clock())
+        return replace(
+            result,
+            cached=True,
+            latency_ms=elapsed,
+            review_path="singleflight",
+            queue_latency_ms=elapsed,
+            request_latency_ms=0,
+            attempt_count=0,
+        )
+
+    async def _run_inflight(
+        self,
+        *,
+        cache_key: str,
+        text: str,
+        image_data_url: str | None,
+        safety_identifier: str,
+        risk_signals: tuple[str, ...],
+        linked_hosts: tuple[str, ...],
+        reasoning_effort: str,
+        started: float,
+        deadline: float,
+    ) -> AIReviewResult:
+        current_task = asyncio.current_task()
+        try:
+            result = await self._review_uncached(
+                text=text,
+                image_data_url=image_data_url,
+                safety_identifier=safety_identifier,
+                risk_signals=risk_signals,
+                linked_hosts=linked_hosts,
+                reasoning_effort=reasoning_effort,
+                started=started,
+                deadline=deadline,
+            )
+            self._put_cached(cache_key, result)
+            return result
+        finally:
+            async with self._inflight_lock:
+                if current_task is not None and self._inflight.get(cache_key) is current_task:
+                    self._inflight.pop(cache_key, None)
+
+    @staticmethod
+    def _consume_inflight_result(task: asyncio.Task[AIReviewResult]) -> None:
+        if task.cancelled():
+            return
+        task.exception()
+
+    async def close(self) -> None:
+        """Cancel outstanding reviews and idempotently close the owned HTTP session."""
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            async with self._inflight_lock:
+                tasks = tuple(self._inflight.values())
+                self._inflight.clear()
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if self._default_requester is not None:
+                await self._default_requester.close()
+
+    def _cached_result(self, key: str, started: float) -> AIReviewResult | None:
+        cached = self._get_cached(key)
+        if cached is None:
+            return None
+        return replace(
+            cached,
+            cached=True,
+            latency_ms=_elapsed_ms(started, self._clock()),
+            review_path="cache",
+            queue_latency_ms=0,
+            request_latency_ms=0,
+            attempt_count=0,
+        )
+
+    async def _acquire_gateway_slot(self, *, deadline: float) -> int:
+        queue_started = self._clock()
+        remaining = deadline - queue_started
+        if remaining <= 0:
+            raise AIReviewTimeout("AI review exceeded the total timeout while queued")
+        try:
+            await asyncio.wait_for(
+                self._semaphore.acquire(),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError as exc:
+            raise AIReviewTimeout("AI review exceeded the total timeout while queued") from exc
+        return _elapsed_ms(queue_started, self._clock())
 
     async def _review_uncached(
         self,
@@ -584,7 +784,9 @@ class AIReviewer:
         safety_identifier: str,
         risk_signals: tuple[str, ...],
         linked_hosts: tuple[str, ...],
+        reasoning_effort: str,
         started: float,
+        deadline: float,
     ) -> AIReviewResult:
         payload = _build_payload(
             model=self.model,
@@ -593,7 +795,7 @@ class AIReviewer:
             safety_identifier=_opaque_safety_identifier(safety_identifier),
             risk_signals=risk_signals,
             linked_hosts=linked_hosts,
-            reasoning_effort=self.reasoning_effort,
+            reasoning_effort=reasoning_effort,
             service_tier=self.service_tier,
         )
         headers = {
@@ -601,33 +803,58 @@ class AIReviewer:
             "Content-Type": "application/json",
         }
 
-        async with self._semaphore:
+        queue_latency_ms = await self._acquire_gateway_slot(deadline=deadline)
+        request_latency_ms = 0
+        attempt_count = 0
+        try:
             response: HTTPResponse | None = None
             for attempt in range(2):
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise AIReviewTimeout("AI review exceeded the total timeout")
+                attempt_count += 1
+                request_started = self._clock()
                 try:
-                    response = await self._requester(
-                        url=self.endpoint,
-                        headers=headers,
-                        payload=payload,
-                        timeout=self.timeout,
+                    response = await asyncio.wait_for(
+                        self._requester(
+                            url=self.endpoint,
+                            headers=headers,
+                            payload=payload,
+                            timeout=remaining,
+                        ),
+                        timeout=remaining,
                     )
+                except asyncio.TimeoutError as exc:
+                    raise AIReviewTimeout("AI review exceeded the total timeout") from exc
                 except (AIReviewConnectionError, ConnectionError) as exc:
-                    if attempt == 0:
+                    if attempt == 0 and deadline - self._clock() >= MIN_RETRY_REMAINING_SECONDS:
                         continue
                     raise AIReviewConnectionError("AI review endpoint connection failed") from exc
+                finally:
+                    request_latency_ms += _elapsed_ms(request_started, self._clock())
 
                 if response.status == 429 or 500 <= response.status <= 599:
-                    if attempt == 0:
+                    if attempt == 0 and deadline - self._clock() >= MIN_RETRY_REMAINING_SECONDS:
                         continue
                 break
+        finally:
+            self._semaphore.release()
 
         if response is None:
             raise AIReviewConnectionError("AI review endpoint connection failed")
         if not 200 <= response.status <= 299:
             raise AIReviewHTTPError(response.status)
 
-        _validate_response_contract(response.body)
+        if deadline - self._clock() <= 0:
+            raise AIReviewTimeout("AI review exceeded the total timeout")
+        actual_service_tier = _validate_response_contract(
+            response.body,
+            reasoning_effort=reasoning_effort,
+            service_tier=self.service_tier,
+        )
         decision = _parse_decision(response.body, source_text=text)
+        if deadline - self._clock() <= 0:
+            raise AIReviewTimeout("AI review exceeded the total timeout")
         return AIReviewResult(
             is_ad=decision["is_ad"],
             confidence=decision["confidence"],
@@ -636,6 +863,12 @@ class AIReviewer:
             cached=False,
             latency_ms=_elapsed_ms(started, self._clock()),
             rejected_signatures=decision["rejected_signatures"],
+            reasoning_effort=reasoning_effort,
+            actual_service_tier=actual_service_tier,
+            review_path="gateway",
+            queue_latency_ms=queue_latency_ms,
+            request_latency_ms=request_latency_ms,
+            attempt_count=attempt_count,
         )
 
     def _get_cached(self, key: str) -> AIReviewResult | None:
@@ -729,18 +962,25 @@ def _build_payload(
     }
 
 
-def _validate_response_contract(body: object) -> None:
+def _validate_response_contract(
+    body: object,
+    *,
+    reasoning_effort: str = AI_REASONING_EFFORT,
+    service_tier: str = AI_SERVICE_TIER,
+) -> str:
     if not isinstance(body, Mapping):
         raise AIReviewResponseError("AI review response must be a JSON object")
     if body.get("status") != "completed":
         raise AIReviewResponseError("AI review response was not completed")
     if body.get("model") != AI_MODEL:
         raise AIReviewResponseError("AI review response used an unexpected model")
-    if body.get("service_tier") != AI_SERVICE_TIER:
+    actual_service_tier = body.get("service_tier")
+    if not isinstance(actual_service_tier, str) or actual_service_tier != service_tier:
         raise AIReviewResponseError("AI review response used an unexpected service tier")
     reasoning = body.get("reasoning")
-    if not isinstance(reasoning, Mapping) or reasoning.get("effort") != AI_REASONING_EFFORT:
-        raise AIReviewResponseError("AI review response did not use high reasoning")
+    if not isinstance(reasoning, Mapping) or reasoning.get("effort") != reasoning_effort:
+        raise AIReviewResponseError("AI review response used an unexpected reasoning effort")
+    return actual_service_tier
 
 
 def _parse_decision(body: object, *, source_text: str) -> dict[str, Any]:
@@ -831,21 +1071,11 @@ async def _aiohttp_request(
     payload: Mapping[str, object],
     timeout: float,
 ) -> HTTPResponse:
-    import aiohttp
-
+    requester = _AiohttpRequester(concurrency=1)
     try:
-        client_timeout = aiohttp.ClientTimeout(total=timeout)
-        async with aiohttp.ClientSession(timeout=client_timeout) as session:
-            async with session.post(url, headers=headers, json=payload) as response:
-                try:
-                    body: object = await response.json(content_type=None)
-                except (aiohttp.ContentTypeError, json.JSONDecodeError):
-                    body = {}
-                return HTTPResponse(status=response.status, body=body)
-    except asyncio.TimeoutError as exc:
-        raise AIReviewTimeout("AI review endpoint timed out") from exc
-    except aiohttp.ClientError as exc:
-        raise AIReviewConnectionError("AI review endpoint connection failed") from exc
+        return await requester(url=url, headers=headers, payload=payload, timeout=timeout)
+    finally:
+        await requester.close()
 
 
 def _opaque_safety_identifier(value: str) -> str:
@@ -855,6 +1085,8 @@ def _opaque_safety_identifier(value: str) -> str:
 
 def _content_digest(
     model: str,
+    reasoning_effort: str,
+    service_tier: str,
     text: str,
     image_data_url: str | None,
     risk_signals: tuple[str, ...],
@@ -862,6 +1094,10 @@ def _content_digest(
 ) -> str:
     digest = hashlib.sha256()
     digest.update(model.encode())
+    digest.update(b"\0")
+    digest.update(reasoning_effort.encode())
+    digest.update(b"\0")
+    digest.update(service_tier.encode())
     digest.update(b"\0")
     digest.update(text.encode())
     digest.update(b"\0")

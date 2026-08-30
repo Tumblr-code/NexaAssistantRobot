@@ -36,6 +36,19 @@ def _integer(name: str, default: int, *, minimum: int = 0) -> int:
     return value
 
 
+def _optional_positive_integer(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是正整数") from exc
+    if value <= 0:
+        raise ValueError(f"{name} 必须是正整数")
+    return value
+
+
 def _boolean(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -80,10 +93,16 @@ class Settings:
     duplicate_max_messages: int
     dry_run: bool
     log_level: str
+    expected_bot_id: int | None = None
+    expected_bot_username: str = ""
+    update_concurrency_limit: int = 32
     openai_base_url: str = ""
     openai_api_key: str = ""
     ai_model: str = AI_MODEL
     ai_reasoning_effort: str = AI_REASONING_EFFORT
+    ai_normal_reasoning_effort: str = AI_REASONING_EFFORT
+    ai_suspicious_reasoning_effort: str = AI_REASONING_EFFORT
+    ai_normal_accept_confidence: float = 0.90
     ai_service_tier: str = AI_SERVICE_TIER
     ai_enabled: bool = False
     ai_ad_threshold: float = 0.92
@@ -95,6 +114,9 @@ class Settings:
     ai_failure_delete: bool = True
     ai_decision_retention_days: int = 30
     ai_image_max_bytes: int = 5 * 1024 * 1024
+    ai_image_target_long_edge: int = 1280
+    ai_image_download_timeout_seconds: float = 2.0
+    ai_media_concurrency: int = 4
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -119,6 +141,18 @@ class Settings:
         openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
         ai_model = os.getenv("AI_MODEL", AI_MODEL).strip()
         ai_reasoning_effort = os.getenv("AI_REASONING_EFFORT", AI_REASONING_EFFORT).strip()
+        normal_effort_raw = os.getenv("AI_NORMAL_REASONING_EFFORT")
+        suspicious_effort_raw = os.getenv("AI_SUSPICIOUS_REASONING_EFFORT")
+        if (normal_effort_raw is None) != (suspicious_effort_raw is None):
+            raise ValueError(
+                "AI_NORMAL_REASONING_EFFORT 与 AI_SUSPICIOUS_REASONING_EFFORT 必须同时配置"
+            )
+        ai_normal_reasoning_effort = (
+            ai_reasoning_effort if normal_effort_raw is None else normal_effort_raw.strip()
+        )
+        ai_suspicious_reasoning_effort = (
+            ai_reasoning_effort if suspicious_effort_raw is None else suspicious_effort_raw.strip()
+        )
         ai_service_tier = os.getenv("AI_SERVICE_TIER", AI_SERVICE_TIER).strip()
         if ai_enabled and not openai_base_url:
             raise ValueError("AI_ENABLED=true 时必须配置 OPENAI_BASE_URL")
@@ -128,6 +162,10 @@ class Settings:
             raise ValueError(f"AI_MODEL 必须固定为 {AI_MODEL}")
         if ai_reasoning_effort != AI_REASONING_EFFORT:
             raise ValueError(f"AI_REASONING_EFFORT 必须固定为 {AI_REASONING_EFFORT}")
+        if ai_normal_reasoning_effort not in {"low", "high"}:
+            raise ValueError("AI_NORMAL_REASONING_EFFORT 只能是 low 或 high")
+        if ai_suspicious_reasoning_effort != "high":
+            raise ValueError("AI_SUSPICIOUS_REASONING_EFFORT 必须是 high")
         if ai_service_tier != AI_SERVICE_TIER:
             raise ValueError(f"AI_SERVICE_TIER 必须固定为 {AI_SERVICE_TIER}")
 
@@ -158,10 +196,18 @@ class Settings:
             duplicate_max_messages=_integer("DUPLICATE_MAX_MESSAGES", 2, minimum=1),
             dry_run=_boolean("DRY_RUN", False),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            expected_bot_id=_optional_positive_integer("EXPECTED_BOT_ID"),
+            expected_bot_username=os.getenv("EXPECTED_BOT_USERNAME", "").strip().removeprefix("@"),
+            update_concurrency_limit=_integer("UPDATE_CONCURRENCY_LIMIT", 32, minimum=1),
             openai_base_url=openai_base_url,
             openai_api_key=openai_api_key,
             ai_model=ai_model,
             ai_reasoning_effort=ai_reasoning_effort,
+            ai_normal_reasoning_effort=ai_normal_reasoning_effort,
+            ai_suspicious_reasoning_effort=ai_suspicious_reasoning_effort,
+            ai_normal_accept_confidence=_float(
+                "AI_NORMAL_ACCEPT_CONFIDENCE", 0.90, minimum=0.5, maximum=1.0
+            ),
             ai_service_tier=ai_service_tier,
             ai_enabled=ai_enabled,
             ai_ad_threshold=ai_ad_threshold,
@@ -173,4 +219,9 @@ class Settings:
             ai_failure_delete=_boolean("AI_FAILURE_DELETE", True),
             ai_decision_retention_days=_integer("AI_DECISION_RETENTION_DAYS", 30, minimum=1),
             ai_image_max_bytes=_integer("AI_IMAGE_MAX_BYTES", 5 * 1024 * 1024, minimum=1024),
+            ai_image_target_long_edge=_integer("AI_IMAGE_TARGET_LONG_EDGE", 1280, minimum=320),
+            ai_image_download_timeout_seconds=_float(
+                "AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", 2.0, minimum=0.25, maximum=30.0
+            ),
+            ai_media_concurrency=_integer("AI_MEDIA_CONCURRENCY", 4, minimum=1),
         )

@@ -5,15 +5,19 @@ import base64
 import html
 import io
 import logging
+import secrets
 import time
 import weakref
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from typing import Any, TypedDict, TypeVar
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Router
 from aiogram.enums import ChatMemberStatus, ChatType
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -22,6 +26,7 @@ from aiogram.types import (
     ChatMemberUpdated,
     ChatPermissions,
     Message,
+    PhotoSize,
     User,
 )
 from aiohttp import ClientError as AiohttpClientError
@@ -50,7 +55,7 @@ from nexa_guardian.detection import (
     human_duration,
     normalize_domain,
 )
-from nexa_guardian.storage import AIStats, ChatStats, Storage
+from nexa_guardian.storage import AIStats, ChatStats, LogOutboxRecord, MemberActivity, Storage
 
 logger = logging.getLogger(__name__)
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
@@ -59,6 +64,34 @@ UTC = timezone.utc
 AUTO_BAN_MEMORY_SECONDS = 60 * 60
 AUTO_BAN_MEMORY_MAX = 10_000
 AI_CANDIDATE_PROMOTION_HITS = 3
+INACTIVE_MIN_DAYS = 30
+INACTIVE_MAX_DAYS = 365
+INACTIVE_CLEANUP_LIMIT = 50
+INACTIVE_CONFIRM_TTL_SECONDS = 10 * 60
+INACTIVE_KICK_FALLBACK_SECONDS = 5 * 60
+INACTIVE_RETRY_AFTER_MAX_SECONDS = 15
+BOT_PROFILE_NAME = "Nexa 群管助手"
+BOT_PROFILE_SHORT_DESCRIPTION = (
+    "Nexa 官方群管理审核员：GPT-5.6 Sol 智能识别广告与刷屏，自动删除并警告；"
+    "第 3 次直接封禁，支持管理员筛选长期未发言成员。"
+)
+BOT_PROFILE_DESCRIPTION = """Nexa Guardian 是 @ExampleGroup 的官方群管理与安全审核员。
+
+• GPT-5.6 Sol 审核文字、图片及视频封面
+• 自动清理广告、诈骗、恶意推广与刷屏；第 3 次警告直接封禁
+• 普通聊天静默处理；仅可疑消息显示审核状态
+• 持续学习高置信广告特征，提升后续拦截效率
+• 支持警告、禁言、解禁、移出、封禁、可信用户与域名白名单
+• 唯一授权管理员可私聊筛选并二次确认清理长期未发言的已观察成员
+• 群内机器人回复约 30 秒后清理；管理员私聊回复永久保留
+• 不保存群消息原文、图片或模型推理
+
+成员筛选依据机器人观察到的活动，不代表 Telegram 最后上线时间。发送 /help 查看管理命令。
+
+官方服务：
+Example Store 商城：https://example.org
+Example · Pass：https://pass.example.com
+Example · Gift：https://gift.example.com"""
 AI_LEARNING_EVIDENCE = (
     "link",
     "mention",
@@ -71,6 +104,82 @@ AI_LEARNING_EVIDENCE = (
     "text",
     "image",
 )
+TelegramCallResult = TypeVar("TelegramCallResult")
+
+
+class MediaPreviewTooLarge(ValueError):
+    """Raised before a Telegram preview can exceed the configured memory bound."""
+
+
+class BoundedBytesIO(io.BytesIO):
+    def __init__(self, maximum_bytes: int) -> None:
+        super().__init__()
+        self.maximum_bytes = maximum_bytes
+
+    def write(self, data: Any) -> int:
+        if self.tell() + len(data) > self.maximum_bytes:
+            raise MediaPreviewTooLarge("media preview exceeded configured byte limit")
+        return super().write(data)
+
+
+def select_photo_preview(
+    photos: list[PhotoSize],
+    *,
+    target_long_edge: int,
+    maximum_bytes: int,
+) -> PhotoSize | None:
+    candidates = [
+        photo
+        for photo in photos
+        if (file_size := getattr(photo, "file_size", None)) is None
+        or int(file_size) <= maximum_bytes
+    ]
+    if not candidates:
+        return None
+
+    def long_edge(photo: PhotoSize) -> int:
+        return max(int(getattr(photo, "width", 0)), int(getattr(photo, "height", 0)))
+
+    at_target = [photo for photo in candidates if long_edge(photo) >= target_long_edge]
+    if at_target:
+        return min(at_target, key=long_edge)
+    return max(candidates, key=long_edge)
+
+
+@dataclass(frozen=True, slots=True)
+class PendingInactiveCleanup:
+    actor_id: int
+    chat_id: int
+    days: int
+    cutoff: str
+    members: tuple[tuple[int, str], ...]
+    expires_at: float
+
+
+class AIDecisionMetrics(TypedDict):
+    reasoning_effort: str
+    service_tier: str
+    review_path: str
+    media_latency_ms: int
+    queue_latency_ms: int
+    request_latency_ms: int
+    action_latency_ms: int
+    total_latency_ms: int
+    attempt_count: int
+
+
+async def telegram_call_with_bounded_retry(
+    operation: Callable[[], Awaitable[TelegramCallResult]],
+) -> TelegramCallResult:
+    """Retry one Telegram flood-control response without stalling indefinitely."""
+
+    try:
+        return await operation()
+    except TelegramRetryAfter as exc:
+        if exc.retry_after > INACTIVE_RETRY_AFTER_MAX_SECONDS:
+            raise
+        await asyncio.sleep(max(0, exc.retry_after) + 0.1)
+        return await operation()
 
 
 ACTION_LABELS = {
@@ -96,11 +205,13 @@ ACTION_LABELS = {
     "delete_failed": "删除失败",
     "ai_signature_delete": "AI 特征命中删除",
     "ai_failure_delete": "AI 故障保护删除",
+    "cleanup_inactive": "清理长期未发言成员",
+    "cleanup_inactive_unban_failed": "清理成员后解除封禁失败",
 }
 
 HELP_TEXT = """<b>Nexa Guardian 群管命令</b>
 
-自动功能：GPT-5.6 广告审核、AI 特征学习、累计 3 次警告自动封禁。
+自动功能：GPT-5.6 Sol 广告审核、AI 特征学习、累计 3 次警告自动封禁。
 
 群内可回复成员消息；私聊机器人时，把数字用户 ID 放在命令后：
 <code>/warn</code>　警告
@@ -123,9 +234,12 @@ HELP_TEXT = """<b>Nexa Guardian 群管命令</b>
 
 检查：<code>/status</code> <code>/settings</code> <code>/stats</code>
 <code>/recent</code> <code>/aistats</code> <code>/airecent</code> <code>/chatid</code>
+<code>/inactive [30-365]</code>　私聊预览长期未发言成员
+<code>/cleanupinactive [30-365]</code>　私聊生成二次确认清理计划
 
 私聊示例：<code>/mute 123456789 2h</code>
-私聊仅唯一授权管理员可用，机器人私聊回复永久保留；群内回复约 30 秒后清理。"""
+私聊仅唯一授权管理员可用，机器人私聊回复永久保留；群内回复约 30 秒后清理。
+成员筛选只依据机器人上线后观察到的群内活动，不代表 Telegram 最后上线时间。"""
 
 
 def display_user(user: User | None, user_id: int) -> str:
@@ -149,6 +263,10 @@ def stats_cutoffs(now: datetime | None = None) -> tuple[str, str]:
 def action_time(value: str) -> str:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return parsed.astimezone(DISPLAY_TIMEZONE).strftime("%m-%d %H:%M")
+
+
+def telegram_message_is_absent(error: TelegramBadRequest) -> bool:
+    return "message to delete not found" in str(error).casefold()
 
 
 def stats_line(label: str, stats: ChatStats) -> str:
@@ -195,6 +313,31 @@ class ActionReporter:
         self.bot = bot
         self.storage = storage
         self.log_chat_id = log_chat_id
+        self._worker_task: asyncio.Task[None] | None = None
+        self._stopping = False
+
+    async def start(self) -> None:
+        if self.log_chat_id is None:
+            return
+        if self._worker_task is not None and not self._worker_task.done():
+            return
+        self._stopping = False
+        self._worker_task = asyncio.create_task(
+            self._run_worker(),
+            name="nexa-moderation-log-outbox",
+        )
+
+    async def shutdown(self) -> None:
+        self._stopping = True
+        task = self._worker_task
+        self._worker_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def record(
         self,
@@ -211,6 +354,7 @@ class ActionReporter:
             message_id=message_id,
             actor_id=actor_id,
             target_id=target_id,
+            enqueue_log=self.log_chat_id is not None,
         )
         logger.info(
             "moderation action=%s chat_id=%s actor_id=%s target_id=%s message_id=%s",
@@ -220,19 +364,53 @@ class ActionReporter:
             target_id,
             message_id,
         )
+
+    async def _deliver(self, record: LogOutboxRecord) -> None:
         if self.log_chat_id is None:
             return
         text = (
             f"<b>群管日志</b>\n"
-            f"动作：<code>{html.escape(action)}</code>\n"
-            f"群：<code>{chat_id}</code>\n"
-            f"目标：<code>{target_id or '-'}</code>\n"
-            f"操作者：<code>{actor_id or '自动'}</code>"
+            f"动作：<code>{html.escape(record.action)}</code>\n"
+            f"群：<code>{record.chat_id}</code>\n"
+            f"目标：<code>{record.target_id or '-'}</code>\n"
+            f"操作者：<code>{record.actor_id or '自动'}</code>"
         )
         try:
             await self.bot.send_message(self.log_chat_id, text)
-        except TelegramAPIError:
-            logger.exception("发送群管日志失败 log_chat_id=%s", self.log_chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            delay = min(300, 2 ** min(record.attempt_count + 1, 8))
+            due_at = (datetime.now(UTC) + timedelta(seconds=delay)).isoformat(timespec="seconds")
+            await self.storage.reschedule_log_outbox(record.id, due_at)
+            logger.exception(
+                "发送群管日志失败，已进入重试 log_chat_id=%s outbox_id=%s",
+                self.log_chat_id,
+                record.id,
+            )
+        else:
+            await self.storage.ack_log_outbox(record.id)
+
+    async def _run_worker(self) -> None:
+        while True:
+            try:
+                now = datetime.now(UTC)
+                records = await self.storage.claim_due_log_outbox(
+                    now.isoformat(timespec="seconds"),
+                    lease_until=(now + timedelta(seconds=30)).isoformat(timespec="seconds"),
+                    limit=20,
+                )
+                if records:
+                    await asyncio.gather(*(self._deliver(record) for record in records))
+                else:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                if self._stopping:
+                    raise
+                logger.error("群管日志 outbox worker 被意外取消，继续运行")
+            except Exception:
+                logger.exception("群管日志 outbox worker 迭代失败")
+                await asyncio.sleep(1)
 
 
 class ModerationController:
@@ -276,10 +454,12 @@ class ModerationController:
             )
         self._ai_failure_streak = 0
         self._ai_failure_lock = asyncio.Lock()
+        self._media_semaphore = asyncio.Semaphore(settings.ai_media_concurrency)
         self._member_action_locks: weakref.WeakValueDictionary[tuple[int, int], asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
         self._auto_banned_members: OrderedDict[tuple[int, int], float] = OrderedDict()
+        self._inactive_cleanup_plans: dict[tuple[int, str], PendingInactiveCleanup] = {}
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -325,6 +505,8 @@ class ModerationController:
         self.router.message.register(self.ai_recent, Command("airecent"))
         self.router.message.register(self.ai_pause, Command("aipause"))
         self.router.message.register(self.ai_resume, Command("airesume"))
+        self.router.message.register(self.inactive_members, Command("inactive"))
+        self.router.message.register(self.cleanup_inactive, Command("cleanupinactive"))
         self.router.message.register(self.moderate_message)
         self.router.edited_message.register(self.moderate_message)
         self.router.chat_member.register(self.chat_member_changed)
@@ -364,40 +546,57 @@ class ModerationController:
         return message.sender_chat is not None
 
     async def set_commands(self) -> None:
-        await self.bot.set_my_commands(
-            [
-                BotCommand(command="help", description="查看群内和私聊管理命令"),
-                BotCommand(command="status", description="检查机器人权限和状态"),
-                BotCommand(command="settings", description="查看当前群管规则"),
-                BotCommand(command="stats", description="查看今日、近7天和累计统计"),
-                BotCommand(command="recent", description="私聊查看最近管理操作"),
-                BotCommand(command="warn", description="警告：/warn 用户ID"),
-                BotCommand(command="mute", description="禁言：/mute 用户ID 2h"),
-                BotCommand(command="unmute", description="解禁：/unmute 用户ID"),
-                BotCommand(command="ban", description="封禁：/ban 用户ID"),
-                BotCommand(command="unban", description="解除封禁：/unban 用户ID"),
-                BotCommand(command="kick", description="移出：/kick 用户ID"),
-                BotCommand(command="del", description="删除回复的群消息"),
-                BotCommand(command="warnings", description="查询用户警告次数"),
-                BotCommand(command="clearwarns", description="清除用户警告"),
-                BotCommand(command="trust", description="添加可信用户"),
-                BotCommand(command="untrust", description="移除可信用户"),
-                BotCommand(command="delword", description="停用误学的 AI 特征"),
-                BotCommand(command="domains", description="查看域名白名单"),
-                BotCommand(command="addomain", description="添加域名白名单"),
-                BotCommand(command="deldomain", description="移除域名白名单"),
-                BotCommand(command="words", description="查看 AI 已学习特征"),
-                BotCommand(command="aicandidates", description="查看 AI 候选特征"),
-                BotCommand(command="aistats", description="查看 AI 审核统计"),
-                BotCommand(command="airecent", description="查看最近 AI 判断"),
-                BotCommand(command="aipause", description="紧急暂停 AI 审核"),
-                BotCommand(command="airesume", description="恢复 AI 审核"),
-                BotCommand(command="chatid", description="查看目标群 ID"),
-            ]
-        )
+        commands = [
+            BotCommand(command="help", description="查看群内和私聊管理命令"),
+            BotCommand(command="status", description="检查机器人权限和状态"),
+            BotCommand(command="settings", description="查看当前群管规则"),
+            BotCommand(command="stats", description="查看今日、近7天和累计统计"),
+            BotCommand(command="recent", description="私聊查看最近管理操作"),
+            BotCommand(command="warn", description="警告：/warn 用户ID"),
+            BotCommand(command="mute", description="禁言：/mute 用户ID 2h"),
+            BotCommand(command="unmute", description="解禁：/unmute 用户ID"),
+            BotCommand(command="ban", description="封禁：/ban 用户ID"),
+            BotCommand(command="unban", description="解除封禁：/unban 用户ID"),
+            BotCommand(command="kick", description="移出：/kick 用户ID"),
+            BotCommand(command="del", description="删除回复的群消息"),
+            BotCommand(command="warnings", description="查询用户警告次数"),
+            BotCommand(command="clearwarns", description="清除用户警告"),
+            BotCommand(command="trust", description="添加可信用户"),
+            BotCommand(command="untrust", description="移除可信用户"),
+            BotCommand(command="delword", description="停用误学的 AI 特征"),
+            BotCommand(command="domains", description="查看域名白名单"),
+            BotCommand(command="addomain", description="添加域名白名单"),
+            BotCommand(command="deldomain", description="移除域名白名单"),
+            BotCommand(command="words", description="查看 AI 已学习特征"),
+            BotCommand(command="aicandidates", description="查看 AI 候选特征"),
+            BotCommand(command="aistats", description="查看 AI 审核统计"),
+            BotCommand(command="airecent", description="查看最近 AI 判断"),
+            BotCommand(command="aipause", description="紧急暂停 AI 审核"),
+            BotCommand(command="airesume", description="恢复 AI 审核"),
+            BotCommand(command="inactive", description="私聊预览长期未发言成员"),
+            BotCommand(command="cleanupinactive", description="私聊二次确认清理成员"),
+            BotCommand(command="chatid", description="查看目标群 ID"),
+        ]
+        for language_code in (None, "zh"):
+            await self.bot.set_my_commands(commands, language_code=language_code)
+            await self.bot.set_my_name(BOT_PROFILE_NAME, language_code=language_code)
+            await self.bot.set_my_short_description(
+                BOT_PROFILE_SHORT_DESCRIPTION,
+                language_code=language_code,
+            )
+            await self.bot.set_my_description(
+                BOT_PROFILE_DESCRIPTION,
+                language_code=language_code,
+            )
+
+    async def startup(self) -> None:
+        await self.reporter.start()
 
     async def shutdown(self) -> None:
-        return None
+        await self.reporter.shutdown()
+        close_reviewer = getattr(self.ai_reviewer, "close", None)
+        if close_reviewer is not None:
+            await close_reviewer()
 
     def is_allowed_chat(self, chat_id: int) -> bool:
         return chat_id in self.settings.allowed_chat_ids
@@ -946,7 +1145,8 @@ class ModerationController:
         except ValueError as exc:
             await message.answer(html.escape(str(exc)))
             return
-        await self.storage.add_trusted_user(chat_id, target.user_id, actor[0])
+        async with self._member_action_lock(chat_id, target.user_id):
+            await self.storage.add_trusted_user(chat_id, target.user_id, actor[0])
         await self.reporter.record(
             chat_id=chat_id,
             action="trust",
@@ -965,7 +1165,8 @@ class ModerationController:
         except ValueError as exc:
             await message.answer(html.escape(str(exc)))
             return
-        await self.storage.remove_trusted_user(chat_id, target.user_id)
+        async with self._member_action_lock(chat_id, target.user_id):
+            await self.storage.remove_trusted_user(chat_id, target.user_id)
         await self.reporter.record(
             chat_id=chat_id,
             action="untrust",
@@ -1086,9 +1287,21 @@ class ModerationController:
                 f"缓存 {stats.cached}｜均延迟 {stats.average_latency_ms}ms"
             )
 
+        effort_counts = (
+            " / ".join(f"{name} {count}" for name, count in week.reasoning_effort_counts) or "暂无"
+        )
+        path_counts = (
+            " / ".join(f"{name} {count}" for name, count in week.review_path_counts) or "暂无"
+        )
+
         await message.answer(
             "<b>AI 审核统计（北京时间）</b>\n"
-            f"{line('今天', today)}\n{line('近 7 天', week)}\n{line('累计', total)}"
+            f"{line('今天', today)}\n{line('近 7 天', week)}\n{line('累计', total)}\n"
+            f"近 7 天推理：{html.escape(effort_counts)}\n"
+            f"近 7 天路径：{html.escape(path_counts)}\n"
+            f"近 7 天延迟：网关 P50/P95 {week.gateway_latency_p50_ms}/"
+            f"{week.gateway_latency_p95_ms}ms｜端到端 P50/P95 "
+            f"{week.total_latency_p50_ms}/{week.total_latency_p95_ms}ms"
         )
 
     async def ai_recent(self, message: Message) -> None:
@@ -1140,6 +1353,279 @@ class ModerationController:
             return None
         return actor
 
+    async def _private_member_admin(
+        self,
+        message: Message,
+        *,
+        restrict: bool,
+    ) -> tuple[int, AdminRights, int] | None:
+        actor = await self._group_admin(message, restrict=restrict)
+        if actor is None:
+            return None
+        if message.chat.type != ChatType.PRIVATE:
+            await message.answer("为避免公开成员 ID，此成员清理命令仅可在机器人私聊中使用。")
+            return None
+        return actor
+
+    @staticmethod
+    def _inactive_days(arguments: tuple[str, ...]) -> int | None:
+        if len(arguments) > 1:
+            return None
+        if not arguments:
+            return INACTIVE_MIN_DAYS
+        try:
+            days = int(arguments[0])
+        except ValueError:
+            return None
+        return days if INACTIVE_MIN_DAYS <= days <= INACTIVE_MAX_DAYS else None
+
+    @staticmethod
+    def _member_activity_stamp(activity: MemberActivity) -> str:
+        return max(
+            activity.first_observed_at,
+            activity.last_message_at or activity.first_observed_at,
+            activity.last_membership_at or activity.first_observed_at,
+        )
+
+    async def _inactive_candidates(
+        self,
+        chat_id: int,
+        *,
+        cutoff: str,
+    ) -> tuple[MemberActivity, ...]:
+        observed = await self.storage.inactive_member_candidates(
+            chat_id,
+            cutoff=cutoff,
+            limit=INACTIVE_CLEANUP_LIMIT * 5,
+        )
+        eligible: list[MemberActivity] = []
+        for activity in observed:
+            if activity.user_id in self.settings.authorized_admin_ids:
+                continue
+            is_admin, is_trusted = await asyncio.gather(
+                self.admins.cached_is_admin(chat_id, activity.user_id),
+                self.storage.is_trusted(chat_id, activity.user_id),
+            )
+            # An unknown administrator state is never safe to clean.
+            if is_admin is not False or is_trusted:
+                continue
+            eligible.append(activity)
+            if len(eligible) >= INACTIVE_CLEANUP_LIMIT:
+                break
+        return tuple(eligible)
+
+    async def inactive_members(self, message: Message) -> None:
+        actor = await self._private_member_admin(message, restrict=False)
+        if actor is None:
+            return
+        arguments = command_arguments(message)
+        days = self._inactive_days(arguments)
+        if days is None:
+            await message.answer("用法：<code>/inactive [30-365]</code>")
+            return
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
+        candidates = await self._inactive_candidates(actor[2], cutoff=cutoff)
+        if not candidates:
+            await message.answer(
+                f"<b>{days} 天未发言候选（0）</b>\n"
+                "当前没有满足条件的已观察成员。\n\n"
+                "群内活动不代表 Telegram 最后上线；机器人无法读取用户最后上线时间，"
+                "也无法枚举接入前的历史成员。"
+            )
+            return
+        lines = [
+            f"<code>{item.user_id}</code>｜最后群内活动 "
+            f"{action_time(self._member_activity_stamp(item))}"
+            for item in candidates
+        ]
+        await message.answer(
+            f"<b>{days} 天未发言候选（{len(candidates)}）</b>\n"
+            + "\n".join(lines)
+            + "\n\n群内活动不代表 Telegram 最后上线；清理前还会重新核验身份和最新活动。"
+        )
+
+    def _prune_inactive_cleanup_plans(self) -> None:
+        now = time.monotonic()
+        for key, plan in tuple(self._inactive_cleanup_plans.items()):
+            if plan.expires_at <= now:
+                self._inactive_cleanup_plans.pop(key, None)
+
+    def _new_inactive_confirmation_code(self, actor_id: int) -> str:
+        while True:
+            code = secrets.token_hex(3).upper()
+            if (actor_id, code) not in self._inactive_cleanup_plans:
+                return code
+
+    async def cleanup_inactive(self, message: Message) -> None:
+        actor = await self._private_member_admin(message, restrict=True)
+        if actor is None:
+            return
+        self._prune_inactive_cleanup_plans()
+        arguments = command_arguments(message)
+        if len(arguments) == 2 and arguments[1].casefold() == "confirm":
+            code = arguments[0].upper()
+            plan = self._inactive_cleanup_plans.pop((actor[0], code), None)
+            if plan is None or plan.expires_at <= time.monotonic():
+                await message.answer("确认码无效或已过期；请重新生成清理计划。")
+                return
+            await self._execute_inactive_cleanup(message, plan)
+            return
+
+        days = self._inactive_days(arguments)
+        if days is None:
+            await message.answer(
+                "用法：<code>/cleanupinactive [30-365]</code>\n"
+                "确认：<code>/cleanupinactive 确认码 confirm</code>"
+            )
+            return
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
+        candidates = await self._inactive_candidates(actor[2], cutoff=cutoff)
+        if not candidates:
+            await message.answer(
+                f"没有可清理的 {days} 天未发言成员。\n群内活动不代表 Telegram 最后上线。"
+            )
+            return
+        for key in tuple(self._inactive_cleanup_plans):
+            if key[0] == actor[0]:
+                self._inactive_cleanup_plans.pop(key, None)
+        code = self._new_inactive_confirmation_code(actor[0])
+        plan = PendingInactiveCleanup(
+            actor_id=actor[0],
+            chat_id=actor[2],
+            days=days,
+            cutoff=cutoff,
+            members=tuple((item.user_id, self._member_activity_stamp(item)) for item in candidates),
+            expires_at=time.monotonic() + INACTIVE_CONFIRM_TTL_SECONDS,
+        )
+        self._inactive_cleanup_plans[(actor[0], code)] = plan
+        await message.answer(
+            f"已生成清理计划：{len(plan.members)} 人，阈值 {days} 天。\n"
+            "机器人会再次核验管理员、机器人、可信用户、成员状态和最新群内活动。\n"
+            "群内活动不代表 Telegram 最后上线。\n"
+            f"10 分钟内发送：<code>/cleanupinactive {code} confirm</code>"
+        )
+
+    async def _execute_inactive_cleanup(
+        self,
+        message: Message,
+        plan: PendingInactiveCleanup,
+    ) -> None:
+        cleaned = 0
+        skipped = 0
+        failed = 0
+        unban_failed = 0
+        not_processed = 0
+        admin_statuses = {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR}
+        absent_statuses = {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}
+        for index, (user_id, expected_activity) in enumerate(plan.members):
+            async with self._member_action_lock(plan.chat_id, user_id):
+                activity, is_trusted = await asyncio.gather(
+                    self.storage.member_activity(plan.chat_id, user_id),
+                    self.storage.is_trusted(plan.chat_id, user_id),
+                )
+                try:
+                    member = await telegram_call_with_bounded_retry(
+                        lambda target_id=user_id: self.bot.get_chat_member(plan.chat_id, target_id)
+                    )
+                except TelegramRetryAfter:
+                    logger.warning(
+                        "清理前核验成员触发长时间限流 chat_id=%s user_id=%s",
+                        plan.chat_id,
+                        user_id,
+                    )
+                    failed += 1
+                    not_processed = len(plan.members) - index - 1
+                    break
+                except TelegramAPIError:
+                    logger.exception(
+                        "清理前核验成员失败 chat_id=%s user_id=%s",
+                        plan.chat_id,
+                        user_id,
+                    )
+                    failed += 1
+                    continue
+                if (
+                    activity is None
+                    or self._member_activity_stamp(activity) != expected_activity
+                    or self._member_activity_stamp(activity) >= plan.cutoff
+                    or activity.last_status in {"left", "kicked"}
+                    or user_id in self.settings.authorized_admin_ids
+                    or is_trusted
+                    or member.status in admin_statuses | absent_statuses
+                    or getattr(getattr(member, "user", None), "is_bot", False)
+                ):
+                    skipped += 1
+                    continue
+                try:
+                    await telegram_call_with_bounded_retry(
+                        lambda target_id=user_id: self.bot.ban_chat_member(
+                            plan.chat_id,
+                            target_id,
+                            until_date=datetime.now(UTC)
+                            + timedelta(seconds=INACTIVE_KICK_FALLBACK_SECONDS),
+                            revoke_messages=False,
+                        )
+                    )
+                except TelegramRetryAfter:
+                    logger.warning(
+                        "长期未发言成员移出触发长时间限流 chat_id=%s user_id=%s",
+                        plan.chat_id,
+                        user_id,
+                    )
+                    failed += 1
+                    not_processed = len(plan.members) - index - 1
+                    break
+                except TelegramAPIError:
+                    logger.exception(
+                        "长期未发言成员移出失败 chat_id=%s user_id=%s",
+                        plan.chat_id,
+                        user_id,
+                    )
+                    failed += 1
+                    continue
+                try:
+                    await telegram_call_with_bounded_retry(
+                        lambda target_id=user_id: self.bot.unban_chat_member(
+                            plan.chat_id,
+                            target_id,
+                            only_if_banned=True,
+                        )
+                    )
+                except TelegramAPIError:
+                    logger.exception(
+                        "长期未发言成员移出后解除封禁失败 chat_id=%s user_id=%s",
+                        plan.chat_id,
+                        user_id,
+                    )
+                    await self.reporter.record(
+                        chat_id=plan.chat_id,
+                        action="cleanup_inactive_unban_failed",
+                        actor_id=plan.actor_id,
+                        target_id=user_id,
+                    )
+                    failed += 1
+                    unban_failed += 1
+                    not_processed = len(plan.members) - index - 1
+                    break
+                await self.reporter.record(
+                    chat_id=plan.chat_id,
+                    action="cleanup_inactive",
+                    actor_id=plan.actor_id,
+                    target_id=user_id,
+                )
+                cleaned += 1
+        await message.answer(
+            f"清理完成：已移出 {cleaned} 人，跳过 {skipped} 人，失败 {failed} 人，"
+            f"未继续处理 {not_processed} 人。\n"
+            + (
+                f"其中 {unban_failed} 人解除封禁失败；临时封禁最多 5 分钟后自动失效，"
+                "请通过 /recent 查看目标并核查。\n"
+                if unban_failed
+                else ""
+            )
+            + "本次依据为机器人观察到的群内活动，不是 Telegram 最后上线时间。"
+        )
+
     async def moderate_message(self, message: Message) -> None:
         if message.chat.type not in GROUP_TYPES or not self.is_allowed_chat(message.chat.id):
             return
@@ -1147,10 +1633,33 @@ class ModerationController:
             return
         if message.sender_chat is not None and message.sender_chat.id == message.chat.id:
             return
-
         user = message.from_user
         user_id = user.id if user is not None and not user.is_bot else None
         if user_id is not None:
+            observed_value = message.edit_date or message.date
+            observed_at = (
+                observed_value
+                if isinstance(observed_value, datetime)
+                else datetime.fromtimestamp(observed_value, UTC)
+            )
+            try:
+                async with self._member_action_lock(message.chat.id, user_id):
+                    await self.storage.record_member_message(
+                        message.chat.id,
+                        user_id,
+                        observed_at=observed_at.astimezone(UTC).isoformat(timespec="seconds"),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "成员活跃度写入失败 chat_id=%s user_id=%s",
+                    message.chat.id,
+                    user_id,
+                )
+        if user_id is not None:
+            if user_id in self.settings.authorized_admin_ids:
+                return
             admin_state = await self.admins.cached_is_admin(message.chat.id, user_id)
             if admin_state is not False:
                 return
@@ -1190,16 +1699,25 @@ class ModerationController:
             processing = await self._processing_notice(message)
             if await self._finish_if_ai_paused(message, processing):
                 return
-            await self.storage.record_ai_signature_hit(
-                message.chat.id,
-                suspicion.matched_signature,
-            )
             enforced = await self._handle_violation(
                 message,
                 user_id,
                 Violation("ai_signature", ""),
                 processing=processing,
             )
+            if enforced:
+                try:
+                    await self.storage.record_ai_signature_hit(
+                        message.chat.id,
+                        suspicion.matched_signature,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "AI 特征命中计数写入失败 chat_id=%s",
+                        message.chat.id,
+                    )
             await self.storage.record_ai_decision(
                 chat_id=message.chat.id,
                 message_id=message.message_id,
@@ -1211,29 +1729,44 @@ class ModerationController:
                 latency_ms=0,
                 cached=True,
                 enforced=enforced,
+                reasoning_effort="none",
+                service_tier="local",
+                review_path="local_signature",
+                request_latency_ms=0,
+                total_latency_ms=0,
+                attempt_count=0,
             )
             return
 
         has_media_preview = bool(message.photo) or (
-            message.video is not None and message.video.thumbnail is not None
+            message.video is not None
+            and (bool(getattr(message.video, "cover", None)) or message.video.thumbnail is not None)
         )
         if not text.strip() and not has_media_preview:
             return
 
-        processing = (
-            await self._processing_notice(message)
+        processing_task = (
+            asyncio.create_task(
+                self._processing_notice(message),
+                name=f"nexa-review-notice-{message.chat.id}-{message.message_id}",
+            )
             if suspicion.is_suspicious or flood_violation is not None
             else None
         )
-        if await self._finish_if_ai_paused(message, processing):
-            return
 
+        media_started = time.monotonic()
         image_data_url = await self._message_image_data_url(message)
+        media_latency_ms = max(0, int((time.monotonic() - media_started) * 1000))
         if not text.strip() and image_data_url is None:
+            processing = await processing_task if processing_task is not None else None
             if processing is not None:
                 await self._finish_processing(message, processing, "审核完成。")
             return
 
+        review_started = time.monotonic()
+        use_high_reasoning = (
+            suspicion.is_suspicious or flood_violation is not None or has_media_preview
+        )
         try:
             safety_target = str(target_id or "unknown")
             risk_signals = set(suspicion.reasons)
@@ -1249,66 +1782,46 @@ class ModerationController:
                     if (host := domain_from_url(raw_url)) is not None
                 )
             )
-            result = await self.ai_reviewer.review(
-                text=text,
-                image_data_url=image_data_url,
-                safety_identifier=f"{message.chat.id}:{safety_target}",
-                risk_signals=normalized_risk_signals,
-                linked_hosts=linked_hosts,
+            result = await asyncio.wait_for(
+                self._adaptive_review(
+                    text=text,
+                    image_data_url=image_data_url,
+                    safety_identifier=f"{message.chat.id}:{safety_target}",
+                    risk_signals=normalized_risk_signals,
+                    linked_hosts=linked_hosts,
+                    use_high_reasoning=use_high_reasoning,
+                ),
+                timeout=self.settings.ai_timeout_seconds,
             )
-        except (AIReviewError, AiohttpClientError) as exc:
+        except (AIReviewError, AiohttpClientError, asyncio.TimeoutError) as exc:
+            processing = await processing_task if processing_task is not None else None
             await self._handle_ai_failure(
                 message,
                 target_id=target_id,
                 processing=processing,
                 error_type=type(exc).__name__,
+                media_latency_ms=media_latency_ms,
+                reasoning_effort=(
+                    self.settings.ai_suspicious_reasoning_effort
+                    if use_high_reasoning
+                    else self.settings.ai_normal_reasoning_effort
+                ),
+                total_latency_ms=(
+                    media_latency_ms + max(0, int((time.monotonic() - review_started) * 1000))
+                ),
             )
             return
 
+        processing = await processing_task if processing_task is not None else None
         await self._note_gateway_success(cached=result.cached)
-        if result.is_ad:
-            evidence = set(normalized_risk_signals)
-            if text.strip():
-                evidence.add("text")
-            if image_data_url is not None:
-                evidence.add("image")
-            await self.storage.record_ai_learning(
-                chat_id=message.chat.id,
-                category=result.category,
-                evidence=tuple(signal for signal in AI_LEARNING_EVIDENCE if signal in evidence),
-                confidence=result.confidence,
-            )
-            signature_status = (
-                "active" if result.confidence >= self.settings.ai_learn_threshold else "candidate"
-            )
-            for signature in result.signatures:
-                learned_signature = await self.storage.upsert_ai_signature(
-                    chat_id=message.chat.id,
-                    normalized_signature=signature,
-                    display_signature=signature,
-                    category=result.category,
-                    status=signature_status,
-                    confidence=result.confidence,
-                )
-                if (
-                    learned_signature.status == "candidate"
-                    and learned_signature.hit_count >= AI_CANDIDATE_PROMOTION_HITS
-                    and learned_signature.max_confidence >= self.settings.ai_ad_threshold
-                ):
-                    await self.storage.activate_ai_signature(
-                        message.chat.id,
-                        learned_signature.id,
-                    )
-            for signature in result.rejected_signatures:
-                await self.storage.upsert_ai_signature(
-                    chat_id=message.chat.id,
-                    normalized_signature=signature,
-                    display_signature=signature,
-                    category=result.category,
-                    status="rejected",
-                    confidence=result.confidence,
-                )
         if await self._finish_if_ai_paused(message, processing):
+            await self._persist_ai_learning(
+                chat_id=message.chat.id,
+                result=result,
+                text=text,
+                image_data_url=image_data_url,
+                risk_signals=normalized_risk_signals,
+            )
             await self.storage.record_ai_decision(
                 chat_id=message.chat.id,
                 message_id=message.message_id,
@@ -1320,9 +1833,16 @@ class ModerationController:
                 latency_ms=result.latency_ms,
                 cached=result.cached,
                 enforced=False,
+                **self._ai_decision_metrics(
+                    result,
+                    media_latency_ms=media_latency_ms,
+                    action_latency_ms=0,
+                    total_latency_ms=media_latency_ms + result.latency_ms,
+                ),
             )
             return
         enforce = result.is_ad and result.confidence >= self.settings.ai_ad_threshold
+        action_started = time.monotonic()
         if enforce:
             enforced = await self._handle_violation(
                 message,
@@ -1334,6 +1854,15 @@ class ModerationController:
             enforced = False
             if processing is not None:
                 await self._finish_processing(message, processing, "审核完成。")
+        action_latency_ms = max(0, int((time.monotonic() - action_started) * 1000))
+
+        await self._persist_ai_learning(
+            chat_id=message.chat.id,
+            result=result,
+            text=text,
+            image_data_url=image_data_url,
+            risk_signals=normalized_risk_signals,
+        )
 
         await self.storage.record_ai_decision(
             chat_id=message.chat.id,
@@ -1346,6 +1875,12 @@ class ModerationController:
             latency_ms=result.latency_ms,
             cached=result.cached,
             enforced=enforced,
+            **self._ai_decision_metrics(
+                result,
+                media_latency_ms=media_latency_ms,
+                action_latency_ms=action_latency_ms,
+                total_latency_ms=media_latency_ms + result.latency_ms + action_latency_ms,
+            ),
         )
 
     async def _finish_if_ai_paused(
@@ -1359,6 +1894,26 @@ class ModerationController:
             await self._finish_processing(message, processing, "AI 审核已暂停，消息已保留。")
         return True
 
+    @staticmethod
+    def _ai_decision_metrics(
+        result,
+        *,
+        media_latency_ms: int,
+        action_latency_ms: int,
+        total_latency_ms: int,
+    ) -> AIDecisionMetrics:
+        return {
+            "reasoning_effort": str(getattr(result, "reasoning_effort", "high")),
+            "service_tier": str(getattr(result, "service_tier", "default")),
+            "review_path": str(getattr(result, "review_path", "gateway")),
+            "media_latency_ms": media_latency_ms,
+            "queue_latency_ms": int(getattr(result, "queue_latency_ms", 0)),
+            "request_latency_ms": int(getattr(result, "request_latency_ms", result.latency_ms)),
+            "action_latency_ms": action_latency_ms,
+            "total_latency_ms": total_latency_ms,
+            "attempt_count": int(getattr(result, "attempt_count", int(not result.cached))),
+        }
+
     async def _note_gateway_success(self, *, cached: bool) -> None:
         if cached:
             return
@@ -1369,6 +1924,115 @@ class ModerationController:
         async with self._ai_failure_lock:
             self._ai_failure_streak += 1
             return self._ai_failure_streak == 3
+
+    async def _adaptive_review(
+        self,
+        *,
+        text: str,
+        image_data_url: str | None,
+        safety_identifier: str,
+        risk_signals: tuple[str, ...],
+        linked_hosts: tuple[str, ...],
+        use_high_reasoning: bool,
+    ):
+        if self.ai_reviewer is None:
+            raise RuntimeError("AI reviewer is unavailable")
+        initial_effort = (
+            self.settings.ai_suspicious_reasoning_effort
+            if use_high_reasoning
+            else self.settings.ai_normal_reasoning_effort
+        )
+        result = await self.ai_reviewer.review(
+            text=text,
+            image_data_url=image_data_url,
+            safety_identifier=safety_identifier,
+            risk_signals=risk_signals,
+            linked_hosts=linked_hosts,
+            reasoning_effort=initial_effort,
+        )
+        if initial_effort != "low" or (
+            not result.is_ad and result.confidence >= self.settings.ai_normal_accept_confidence
+        ):
+            return result
+
+        confirmed = await self.ai_reviewer.review(
+            text=text,
+            image_data_url=image_data_url,
+            safety_identifier=safety_identifier,
+            risk_signals=risk_signals,
+            linked_hosts=linked_hosts,
+            reasoning_effort=self.settings.ai_suspicious_reasoning_effort,
+        )
+        updates: dict[str, object] = {
+            "latency_ms": result.latency_ms + confirmed.latency_ms,
+        }
+        for field_name in (
+            "queue_latency_ms",
+            "request_latency_ms",
+            "attempt_count",
+        ):
+            if hasattr(result, field_name) and hasattr(confirmed, field_name):
+                updates[field_name] = int(getattr(result, field_name)) + int(
+                    getattr(confirmed, field_name)
+                )
+        if hasattr(confirmed, "review_path"):
+            updates["review_path"] = "low_to_high"
+        return replace(confirmed, **updates)
+
+    async def _persist_ai_learning(
+        self,
+        *,
+        chat_id: int,
+        result,
+        text: str,
+        image_data_url: str | None,
+        risk_signals: tuple[str, ...],
+    ) -> None:
+        if not result.is_ad:
+            return
+        evidence = set(risk_signals)
+        if text.strip():
+            evidence.add("text")
+        if image_data_url is not None:
+            evidence.add("image")
+        try:
+            await self.storage.record_ai_learning(
+                chat_id=chat_id,
+                category=result.category,
+                evidence=tuple(signal for signal in AI_LEARNING_EVIDENCE if signal in evidence),
+                confidence=result.confidence,
+            )
+            signature_status = (
+                "active" if result.confidence >= self.settings.ai_learn_threshold else "candidate"
+            )
+            for signature in result.signatures:
+                learned_signature = await self.storage.upsert_ai_signature(
+                    chat_id=chat_id,
+                    normalized_signature=signature,
+                    display_signature=signature,
+                    category=result.category,
+                    status=signature_status,
+                    confidence=result.confidence,
+                )
+                if (
+                    learned_signature.status == "candidate"
+                    and learned_signature.hit_count >= AI_CANDIDATE_PROMOTION_HITS
+                    and learned_signature.max_confidence >= self.settings.ai_ad_threshold
+                ):
+                    await self.storage.activate_ai_signature(chat_id, learned_signature.id)
+            for signature in result.rejected_signatures:
+                await self.storage.upsert_ai_signature(
+                    chat_id=chat_id,
+                    normalized_signature=signature,
+                    display_signature=signature,
+                    category=result.category,
+                    status="rejected",
+                    confidence=result.confidence,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("AI 学习写入失败 chat_id=%s", chat_id)
 
     async def _moderate_legacy(
         self,
@@ -1398,9 +2062,21 @@ class ModerationController:
     async def _message_image_data_url(self, message: Message) -> str | None:
         downloadable = None
         if message.photo:
-            downloadable = message.photo[-1]
-        elif message.video is not None and message.video.thumbnail is not None:
-            downloadable = message.video.thumbnail
+            downloadable = select_photo_preview(
+                list(message.photo),
+                target_long_edge=self.settings.ai_image_target_long_edge,
+                maximum_bytes=self.settings.ai_image_max_bytes,
+            )
+        elif message.video is not None:
+            video_cover = getattr(message.video, "cover", None)
+            if video_cover:
+                downloadable = select_photo_preview(
+                    list(video_cover),
+                    target_long_edge=self.settings.ai_image_target_long_edge,
+                    maximum_bytes=self.settings.ai_image_max_bytes,
+                )
+            if downloadable is None:
+                downloadable = message.video.thumbnail
         if downloadable is None:
             return None
         if (
@@ -1408,10 +2084,20 @@ class ModerationController:
             and downloadable.file_size > self.settings.ai_image_max_bytes
         ):
             return None
-        destination = io.BytesIO()
+        destination = BoundedBytesIO(self.settings.ai_image_max_bytes)
         try:
-            await self.bot.download(downloadable, destination=destination)
-        except (TelegramAPIError, AiohttpClientError, asyncio.TimeoutError, OSError):
+            async with self._media_semaphore:
+                await asyncio.wait_for(
+                    self.bot.download(downloadable, destination=destination),
+                    timeout=self.settings.ai_image_download_timeout_seconds,
+                )
+        except (
+            TelegramAPIError,
+            AiohttpClientError,
+            asyncio.TimeoutError,
+            OSError,
+            MediaPreviewTooLarge,
+        ):
             logger.warning("媒体预览下载失败，改用可用文字审核")
             return None
         content = destination.getvalue()
@@ -1427,6 +2113,9 @@ class ModerationController:
         target_id: int | None,
         processing: Message | None,
         error_type: str,
+        media_latency_ms: int = 0,
+        reasoning_effort: str = "high",
+        total_latency_ms: int = 0,
     ) -> None:
         should_alert = await self._note_gateway_failure()
         paused = await self.storage.runtime_setting(message.chat.id, "ai_paused") == "1"
@@ -1436,6 +2125,27 @@ class ModerationController:
             delete_attempted = True
             try:
                 await self.bot.delete_message(message.chat.id, message.message_id)
+            except TelegramBadRequest as exc:
+                if telegram_message_is_absent(exc):
+                    enforced = True
+                    await self.reporter.record(
+                        chat_id=message.chat.id,
+                        action="delete",
+                        message_id=message.message_id,
+                        target_id=target_id,
+                    )
+                else:
+                    logger.exception(
+                        "AI 故障保护删除失败 chat_id=%s message_id=%s",
+                        message.chat.id,
+                        message.message_id,
+                    )
+                    await self.reporter.record(
+                        chat_id=message.chat.id,
+                        action="delete_failed",
+                        message_id=message.message_id,
+                        target_id=target_id,
+                    )
             except TelegramAPIError:
                 logger.exception(
                     "AI 故障保护删除失败 chat_id=%s message_id=%s",
@@ -1468,6 +2178,13 @@ class ModerationController:
             cached=False,
             enforced=enforced,
             error_type=error_type,
+            reasoning_effort=reasoning_effort,
+            service_tier=self.settings.ai_service_tier,
+            review_path=f"failure_{reasoning_effort}",
+            media_latency_ms=media_latency_ms,
+            total_latency_ms=total_latency_ms,
+            request_latency_ms=max(0, total_latency_ms - media_latency_ms),
+            attempt_count=1,
         )
         if paused:
             result_text = "AI 审核已暂停，消息已保留。"
@@ -1539,12 +2256,17 @@ class ModerationController:
             if self._is_auto_banned(key):
                 return self.settings.warn_limit, True, None
 
-            count = await self.storage.add_warning(chat_id, user_id)
-            await self.reporter.record(
-                chat_id=chat_id,
-                action="warn",
-                actor_id=actor_id,
-                target_id=user_id,
+            count = await self.storage.add_warning_and_record_action(
+                chat_id,
+                user_id,
+                actor_id,
+                enqueue_log=self.settings.log_chat_id is not None,
+            )
+            logger.info(
+                "moderation action=warn chat_id=%s actor_id=%s target_id=%s",
+                chat_id,
+                actor_id,
+                user_id,
             )
             if count < self.settings.warn_limit:
                 return count, False, None
@@ -1591,6 +2313,27 @@ class ModerationController:
 
         try:
             await self.bot.delete_message(message.chat.id, message.message_id)
+        except TelegramBadRequest as exc:
+            if telegram_message_is_absent(exc):
+                logger.info(
+                    "自动删除目标已不存在，继续处罚 chat_id=%s message_id=%s",
+                    message.chat.id,
+                    message.message_id,
+                )
+            else:
+                logger.exception(
+                    "自动删除失败 chat_id=%s message_id=%s",
+                    message.chat.id,
+                    message.message_id,
+                )
+                await self.reporter.record(
+                    chat_id=message.chat.id,
+                    action="delete_failed",
+                    message_id=message.message_id,
+                    target_id=target_id,
+                )
+                await self._finish_processing(message, processing, "广告消息删除失败。")
+                return False
         except TelegramAPIError:
             logger.exception(
                 "自动删除失败 chat_id=%s message_id=%s", message.chat.id, message.message_id
@@ -1629,8 +2372,30 @@ class ModerationController:
         return True
 
     async def chat_member_changed(self, event: ChatMemberUpdated) -> None:
-        self.admins.invalidate(event.chat.id)
-        key = (event.chat.id, event.new_chat_member.user.id)
+        user = event.new_chat_member.user
+        is_admin = event.new_chat_member.status in {
+            ChatMemberStatus.CREATOR,
+            ChatMemberStatus.ADMINISTRATOR,
+        }
+        self.admins.update_member(event.chat.id, user.id, is_admin=is_admin)
+        if self.is_allowed_chat(event.chat.id) and not user.is_bot:
+            try:
+                async with self._member_action_lock(event.chat.id, user.id):
+                    await self.storage.record_member_status(
+                        event.chat.id,
+                        user.id,
+                        event.new_chat_member.status.value,
+                        observed_at=event.date.astimezone(UTC).isoformat(timespec="seconds"),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "成员状态写入失败 chat_id=%s user_id=%s",
+                    event.chat.id,
+                    user.id,
+                )
+        key = (event.chat.id, user.id)
         if event.new_chat_member.status == ChatMemberStatus.KICKED:
             self._remember_auto_banned(key)
         else:
