@@ -841,14 +841,18 @@ class ModerationController:
         )
 
     async def _raffle_keyword_message(self, message: Message) -> bool:
+        anonymous_admin = (
+            message.sender_chat is not None and message.sender_chat.id == message.chat.id
+        )
         if (
             message.chat.type not in GROUP_TYPES
             or not self.is_allowed_chat(message.chat.id)
             or message.text is None
-            or message.from_user is None
-            or message.from_user.is_bot
-            or message.sender_chat is not None
             or message.is_automatic_forward
+        ):
+            return False
+        if not anonymous_admin and (
+            message.from_user is None or message.from_user.is_bot or message.sender_chat is not None
         ):
             return False
         try:
@@ -874,7 +878,7 @@ class ModerationController:
             logger.debug("删除抽奖置顶服务消息失败 chat_id=%s", message.chat.id)
 
     async def join_lottery_keyword(self, message: Message) -> None:
-        if message.from_user is None or message.text is None:
+        if message.text is None:
             return
         try:
             normalized = normalize_raffle_keyword(message.text)
@@ -883,21 +887,41 @@ class ModerationController:
         raffle = await self.storage.active_raffle_for_keyword(message.chat.id, normalized)
         if raffle is None:
             return
-        try:
-            member = await self.bot.get_chat_member(message.chat.id, message.from_user.id)
-        except TelegramAPIError:
-            await self._delete_raffle_keyword_message(message)
-            await self.bot.send_message(message.chat.id, "暂时无法核验群成员身份，请稍后重试。")
-            return
-        if member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} or (
-            member.status == ChatMemberStatus.RESTRICTED
-            and not bool(getattr(member, "is_member", False))
-        ):
-            await self._delete_raffle_keyword_message(message)
-            await self.bot.send_message(message.chat.id, "只有当前群成员可以参加抽奖。")
-            return
+        anonymous_admin = (
+            message.sender_chat is not None and message.sender_chat.id == message.chat.id
+        )
+        if anonymous_admin:
+            try:
+                actor = await self.admins.unique_anonymous_actor(
+                    message.chat.id, self.settings.authorized_admin_ids
+                )
+            except TelegramAPIError:
+                actor = None
+                logger.exception("核验匿名抽奖参与者失败 chat_id=%s", message.chat.id)
+            if actor is None:
+                await self._delete_raffle_keyword_message(message)
+                await self.bot.send_message(message.chat.id, "无法唯一核验匿名管理员，本次未登记。")
+                return
+            participant_id = actor[0]
+        else:
+            if message.from_user is None or message.from_user.is_bot:
+                return
+            participant_id = message.from_user.id
+            try:
+                member = await self.bot.get_chat_member(message.chat.id, participant_id)
+            except TelegramAPIError:
+                await self._delete_raffle_keyword_message(message)
+                await self.bot.send_message(message.chat.id, "暂时无法核验群成员身份，请稍后重试。")
+                return
+            if member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} or (
+                member.status == ChatMemberStatus.RESTRICTED
+                and not bool(getattr(member, "is_member", False))
+            ):
+                await self._delete_raffle_keyword_message(message)
+                await self.bot.send_message(message.chat.id, "只有当前群成员可以参加抽奖。")
+                return
 
-        joined, count = await self.storage.join_raffle(raffle.id, message.from_user.id)
+        joined, count = await self.storage.join_raffle(raffle.id, participant_id)
         await self._delete_raffle_keyword_message(message)
         if count == 0:
             await self.bot.send_message(message.chat.id, "该抽奖已结束。")
