@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import unicodedata
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -12,8 +13,9 @@ import aiosqlite
 
 from nexa_guardian.ai_contract import AI_GATEWAY_MODELS
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 UTC = timezone.utc
+RAFFLE_ZERO_WIDTH_TRANSLATION = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None)
 
 AI_LEARNING_EVIDENCE_TYPES = (
     "text",
@@ -201,19 +203,20 @@ CREATE TABLE IF NOT EXISTS raffles (
     chat_id INTEGER NOT NULL,
     message_id INTEGER,
     creator_id INTEGER NOT NULL,
+    keyword TEXT,
+    normalized_keyword TEXT,
     prize TEXT NOT NULL CHECK (length(prize) BETWEEN 1 AND 200),
     winner_count INTEGER NOT NULL CHECK (winner_count BETWEEN 1 AND 20),
     ends_at TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('running', 'finished', 'cancelled')),
+    publication_state TEXT NOT NULL DEFAULT 'active'
+        CHECK (publication_state IN ('pending', 'active')),
     created_at TEXT NOT NULL,
     finished_at TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_raffles_one_running_per_chat
 ON raffles (chat_id) WHERE status = 'running';
-
-CREATE INDEX IF NOT EXISTS idx_raffles_due
-ON raffles (status, ends_at, id);
 
 CREATE TABLE IF NOT EXISTS raffle_entries (
     raffle_id INTEGER NOT NULL REFERENCES raffles(id) ON DELETE CASCADE,
@@ -236,6 +239,24 @@ CREATE TABLE IF NOT EXISTS raffle_winners (
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def normalize_raffle_keyword(value: str) -> str:
+    normalized = (
+        unicodedata.normalize("NFKC", value)
+        .translate(RAFFLE_ZERO_WIDTH_TRANSLATION)
+        .strip()
+        .casefold()
+    )
+    if not 1 <= len(normalized) <= 32:
+        raise ValueError("参与关键词必须为 1–32 个字符")
+    if any(character.isspace() for character in normalized):
+        raise ValueError("参与关键词不能包含空格")
+    if any(unicodedata.category(character).startswith("C") for character in normalized):
+        raise ValueError("参与关键词不能包含控制字符")
+    if "/" in normalized or "@" in normalized or "://" in normalized:
+        raise ValueError("参与关键词不能是命令、账号或链接")
+    return normalized
 
 
 def _nonnegative_int(name: str, value: int) -> int:
@@ -384,10 +405,13 @@ class Raffle:
     chat_id: int
     message_id: int | None
     creator_id: int
+    keyword: str | None
+    normalized_keyword: str | None
     prize: str
     winner_count: int
     ends_at: str
     status: str
+    publication_state: str
     created_at: str
     finished_at: str | None
 
@@ -440,6 +464,7 @@ class Storage:
             await self._db.executescript(SCHEMA)
             await self._ensure_ephemeral_schema()
             await self._ensure_ai_decisions_schema(current_version)
+            await self._ensure_raffle_schema(current_version)
             if current_version < 4:
                 await self._rebuild_ai_totals()
             if current_version < 7:
@@ -503,6 +528,36 @@ class Storage:
             CREATE INDEX idx_ephemeral_delete_at
             ON ephemeral_bot_messages (delete_at);
             COMMIT;
+            """
+        )
+
+    async def _ensure_raffle_schema(self, current_version: int) -> None:
+        cursor = await self.db.execute("PRAGMA table_info(raffles)")
+        columns = {str(row["name"]) for row in await cursor.fetchall()}
+        if current_version < 8 and "keyword" not in columns:
+            running = await self.db.execute(
+                "SELECT 1 FROM raffles WHERE status = 'running' LIMIT 1"
+            )
+            if await running.fetchone() is not None:
+                raise RuntimeError("数据库存在旧版进行中抽奖，拒绝自动迁移")
+        additions = {
+            "keyword": "TEXT",
+            "normalized_keyword": "TEXT",
+            "publication_state": (
+                "TEXT NOT NULL DEFAULT 'active' CHECK (publication_state IN ('pending', 'active'))"
+            ),
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                await self.db.execute(f"ALTER TABLE raffles ADD COLUMN {name} {definition}")  # noqa: S608 - fixed internal mapping
+        await self.db.executescript(
+            """
+            DROP INDEX IF EXISTS idx_raffles_due;
+            DROP INDEX IF EXISTS idx_raffles_keyword;
+            CREATE INDEX idx_raffles_due
+            ON raffles (status, publication_state, ends_at, id);
+            CREATE INDEX idx_raffles_keyword
+            ON raffles (chat_id, status, publication_state, normalized_keyword)
             """
         )
 
@@ -1768,6 +1823,7 @@ class Storage:
         *,
         chat_id: int,
         creator_id: int,
+        keyword: str,
         prize: str,
         winner_count: int,
         ends_at: str,
@@ -1777,17 +1833,31 @@ class Storage:
             raise ValueError("奖品名称必须为 1–200 个字符")
         if isinstance(winner_count, bool) or not 1 <= winner_count <= 20:
             raise ValueError("中奖人数必须为 1–20")
+        normalized_keyword = normalize_raffle_keyword(keyword)
+        display_keyword = (
+            unicodedata.normalize("NFKC", keyword).translate(RAFFLE_ZERO_WIDTH_TRANSLATION).strip()
+        )
         timestamp = utc_now()
         async with self._write_transaction() as db:
             try:
                 cursor = await db.execute(
                     """
                     INSERT INTO raffles (
-                        chat_id, message_id, creator_id, prize, winner_count,
-                        ends_at, status, created_at, finished_at
-                    ) VALUES (?, NULL, ?, ?, ?, ?, 'running', ?, NULL)
+                        chat_id, message_id, creator_id, keyword, normalized_keyword,
+                        prize, winner_count, ends_at, status, publication_state,
+                        created_at, finished_at
+                    ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'running', 'pending', ?, NULL)
                     """,
-                    (chat_id, creator_id, normalized_prize, winner_count, ends_at, timestamp),
+                    (
+                        chat_id,
+                        creator_id,
+                        display_keyword,
+                        normalized_keyword,
+                        normalized_prize,
+                        winner_count,
+                        ends_at,
+                        timestamp,
+                    ),
                 )
             except aiosqlite.IntegrityError as exc:
                 raise ValueError("当前群已有进行中的抽奖") from exc
@@ -1800,10 +1870,46 @@ class Storage:
     async def set_raffle_message(self, raffle_id: int, message_id: int) -> bool:
         async with self._write_transaction() as db:
             cursor = await db.execute(
-                "UPDATE raffles SET message_id = ? WHERE id = ? AND status = 'running'",
+                """
+                UPDATE raffles SET message_id = ?
+                WHERE id = ? AND status = 'running' AND publication_state = 'pending'
+                """,
                 (message_id, raffle_id),
             )
         return cursor.rowcount == 1
+
+    async def activate_raffle(self, raffle_id: int) -> bool:
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                UPDATE raffles SET publication_state = 'active'
+                WHERE id = ? AND status = 'running'
+                  AND publication_state = 'pending' AND message_id IS NOT NULL
+                """,
+                (raffle_id,),
+            )
+        return cursor.rowcount == 1
+
+    async def discard_pending_raffle(self, raffle_id: int) -> bool:
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                DELETE FROM raffles
+                WHERE id = ? AND status = 'running' AND publication_state = 'pending'
+                """,
+                (raffle_id,),
+            )
+        return cursor.rowcount == 1
+
+    async def pending_raffles(self) -> tuple[Raffle, ...]:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM raffles
+            WHERE status = 'running' AND publication_state = 'pending'
+            ORDER BY id
+            """
+        )
+        return tuple(self._raffle_from_row(row) for row in await cursor.fetchall())
 
     async def raffle(self, raffle_id: int) -> Raffle | None:
         cursor = await self.db.execute("SELECT * FROM raffles WHERE id = ?", (raffle_id,))
@@ -1812,8 +1918,39 @@ class Storage:
 
     async def active_raffle(self, chat_id: int) -> Raffle | None:
         cursor = await self.db.execute(
-            "SELECT * FROM raffles WHERE chat_id = ? AND status = 'running' LIMIT 1",
+            """
+            SELECT * FROM raffles
+            WHERE chat_id = ? AND status = 'running' AND publication_state = 'active'
+            LIMIT 1
+            """,
             (chat_id,),
+        )
+        row = await cursor.fetchone()
+        return self._raffle_from_row(row) if row is not None else None
+
+    async def active_raffle_for_keyword(
+        self, chat_id: int, normalized_keyword: str
+    ) -> Raffle | None:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM raffles
+            WHERE chat_id = ? AND status = 'running' AND publication_state = 'active'
+              AND normalized_keyword = ? AND ends_at > ?
+            LIMIT 1
+            """,
+            (chat_id, normalized_keyword, utc_now()),
+        )
+        row = await cursor.fetchone()
+        return self._raffle_from_row(row) if row is not None else None
+
+    async def raffle_for_message(self, chat_id: int, message_id: int) -> Raffle | None:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM raffles
+            WHERE chat_id = ? AND message_id = ? AND status = 'running'
+            LIMIT 1
+            """,
+            (chat_id, message_id),
         )
         row = await cursor.fetchone()
         return self._raffle_from_row(row) if row is not None else None
@@ -1834,7 +1971,7 @@ class Storage:
         cursor = await self.db.execute(
             """
             SELECT * FROM raffles
-            WHERE status = 'running' AND ends_at <= ?
+            WHERE status = 'running' AND publication_state = 'active' AND ends_at <= ?
             ORDER BY ends_at, id LIMIT ?
             """,
             (now, limit),
@@ -1844,13 +1981,14 @@ class Storage:
     async def join_raffle(self, raffle_id: int, user_id: int) -> tuple[bool, int]:
         async with self._write_transaction() as db:
             cursor = await db.execute(
-                "SELECT status, ends_at FROM raffles WHERE id = ?",
+                "SELECT status, publication_state, ends_at FROM raffles WHERE id = ?",
                 (raffle_id,),
             )
             raffle = await cursor.fetchone()
             if (
                 raffle is None
                 or str(raffle["status"]) != "running"
+                or str(raffle["publication_state"]) != "active"
                 or str(raffle["ends_at"]) <= utc_now()
             ):
                 return False, 0
@@ -1889,7 +2027,7 @@ class Storage:
             cursor = await db.execute(
                 """
                 UPDATE raffles SET status = 'finished', finished_at = ?
-                WHERE id = ? AND status = 'running'
+                WHERE id = ? AND status = 'running' AND publication_state = 'active'
                 """,
                 (timestamp, raffle_id),
             )
@@ -1913,7 +2051,7 @@ class Storage:
             cursor = await db.execute(
                 """
                 UPDATE raffles SET status = 'cancelled', finished_at = ?
-                WHERE id = ? AND status = 'running'
+                WHERE id = ? AND status = 'running' AND publication_state = 'active'
                 """,
                 (utc_now(), raffle_id),
             )
@@ -1973,10 +2111,15 @@ class Storage:
             chat_id=int(row["chat_id"]),
             message_id=int(row["message_id"]) if row["message_id"] is not None else None,
             creator_id=int(row["creator_id"]),
+            keyword=str(row["keyword"]) if row["keyword"] is not None else None,
+            normalized_keyword=(
+                str(row["normalized_keyword"]) if row["normalized_keyword"] is not None else None
+            ),
             prize=str(row["prize"]),
             winner_count=int(row["winner_count"]),
             ends_at=str(row["ends_at"]),
             status=str(row["status"]),
+            publication_state=str(row["publication_state"]),
             created_at=str(row["created_at"]),
             finished_at=str(row["finished_at"]) if row["finished_at"] is not None else None,
         )

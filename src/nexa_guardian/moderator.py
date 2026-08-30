@@ -16,19 +16,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, TypedDict, TypeVar
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, F, Router
+from aiogram import Bot, Router
 from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
-    CallbackQuery,
     ChatMemberAdministrator,
     ChatMemberOwner,
     ChatMemberUpdated,
     ChatPermissions,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Message,
     PhotoSize,
     User,
@@ -68,6 +65,7 @@ from nexa_guardian.storage import (
     MemberActivity,
     Raffle,
     Storage,
+    normalize_raffle_keyword,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,7 +96,7 @@ BOT_PROFILE_DESCRIPTION = """Nexa Guardian 是 @NexaStoreGroup 的官方群管�
 • 普通聊天静默处理；仅可疑消息显示审核状态
 • 持续学习高置信广告特征，提升后续拦截效率
 • 极简管理入口：状态、删除、封禁与群抽奖
-• 抽奖支持按钮报名、定时开奖、取消及重抽
+• 抽奖支持关键词报名、自动置顶、定时开奖、取消及重抽
 • 群内机器人回复约 30 秒后清理；管理员私聊回复永久保留
 • 不保存群消息原文、图片或模型推理
 
@@ -233,7 +231,7 @@ HELP_TEXT = """<b>Nexa Guardian</b>
 <code>/ban</code>　回复成员消息后封禁
 <code>/del</code>　回复消息后删除
 <code>/del all</code>　清理全部群历史
-<code>/lottery 30m 1 奖品</code>　创建抽奖
+<code>/lottery 30m 1 参与 奖品</code>　创建关键词抽奖
 <code>/lottery end|cancel|reroll</code>　管理抽奖
 
 私聊仅唯一授权管理员可用；群内普通回复约 30 秒后清理。"""
@@ -475,6 +473,14 @@ class ModerationController:
             self._ignore_unauthorized_private,
             self._unauthorized_private_message,
         )
+        self.router.message.register(
+            self._delete_raffle_pin_service_message,
+            self._raffle_pin_service_message,
+        )
+        self.router.message.register(
+            self.join_lottery_keyword,
+            self._raffle_keyword_message,
+        )
         # Member-authored command-looking messages are still untrusted content.
         # Register this guard before Telegram command handlers so only verified
         # admins (and other moderation exemptions) can reach the command path.
@@ -487,7 +493,6 @@ class ModerationController:
         self.router.message.register(self.ban, Command("ban"))
         self.router.message.register(self.delete_replied, Command("del"))
         self.router.message.register(self.lottery, Command("lottery"))
-        self.router.callback_query.register(self.join_lottery, F.data.startswith("raffle:join:"))
         self.router.message.register(self.moderate_message)
         self.router.edited_message.register(self.moderate_message)
         self.router.chat_member.register(self.chat_member_changed)
@@ -549,6 +554,7 @@ class ModerationController:
     async def startup(self) -> None:
         self._stopping = False
         await self.reporter.start()
+        await self._clean_pending_raffles()
         self._raffle_worker_task = asyncio.create_task(
             self._raffle_worker(), name="nexa-raffle-worker"
         )
@@ -801,7 +807,9 @@ class ModerationController:
         mode = "观察模式（不执行自动动作）" if self.settings.dry_run else "执行模式"
         raffle = await self.storage.active_raffle(chat_id)
         raffle_status = (
-            f"进行中 #{raffle.id}，{await self.storage.raffle_entry_count(raffle.id)} 人参与"
+            f"进行中 #{raffle.id}，关键词 {html.escape(raffle.keyword or '-')}，"
+            f"{await self.storage.raffle_entry_count(raffle.id)} 人参与，"
+            f"{action_time(raffle.ends_at)} 开奖"
             if raffle is not None
             else "无进行中抽奖"
         )
@@ -821,28 +829,101 @@ class ModerationController:
         )
 
     @staticmethod
-    def _raffle_keyboard(raffle_id: int, count: int) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=f"参加抽奖 · {count}人",
-                        callback_data=f"raffle:join:{raffle_id}",
-                    )
-                ]
-            ]
-        )
-
-    @staticmethod
     def _raffle_card(raffle: Raffle, count: int) -> str:
         ends = action_time(raffle.ends_at)
         return (
             "<b>🎁 Nexa 群抽奖</b>\n\n"
             f"奖品：{html.escape(raffle.prize)}\n"
+            f"参与关键词：<code>{html.escape(raffle.keyword or '')}</code>\n"
             f"中奖人数：{raffle.winner_count}\n"
             f"参与人数：{count}\n"
             f"开奖时间：{ends}（北京时间）"
         )
+
+    async def _raffle_keyword_message(self, message: Message) -> bool:
+        if (
+            message.chat.type not in GROUP_TYPES
+            or not self.is_allowed_chat(message.chat.id)
+            or message.text is None
+            or message.from_user is None
+            or message.from_user.is_bot
+            or message.sender_chat is not None
+            or message.is_automatic_forward
+        ):
+            return False
+        try:
+            normalized = normalize_raffle_keyword(message.text)
+        except ValueError:
+            return False
+        return await self.storage.active_raffle_for_keyword(message.chat.id, normalized) is not None
+
+    async def _raffle_pin_service_message(self, message: Message) -> bool:
+        pinned = message.pinned_message
+        if (
+            pinned is None
+            or message.chat.type not in GROUP_TYPES
+            or not self.is_allowed_chat(message.chat.id)
+        ):
+            return False
+        return await self.storage.raffle_for_message(message.chat.id, pinned.message_id) is not None
+
+    async def _delete_raffle_pin_service_message(self, message: Message) -> None:
+        try:
+            await self.bot.delete_message(message.chat.id, message.message_id)
+        except TelegramAPIError:
+            logger.debug("删除抽奖置顶服务消息失败 chat_id=%s", message.chat.id)
+
+    async def join_lottery_keyword(self, message: Message) -> None:
+        if message.from_user is None or message.text is None:
+            return
+        try:
+            normalized = normalize_raffle_keyword(message.text)
+        except ValueError:
+            return
+        raffle = await self.storage.active_raffle_for_keyword(message.chat.id, normalized)
+        if raffle is None:
+            return
+        try:
+            member = await self.bot.get_chat_member(message.chat.id, message.from_user.id)
+        except TelegramAPIError:
+            await self._delete_raffle_keyword_message(message)
+            await self.bot.send_message(message.chat.id, "暂时无法核验群成员身份，请稍后重试。")
+            return
+        if member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} or (
+            member.status == ChatMemberStatus.RESTRICTED
+            and not bool(getattr(member, "is_member", False))
+        ):
+            await self._delete_raffle_keyword_message(message)
+            await self.bot.send_message(message.chat.id, "只有当前群成员可以参加抽奖。")
+            return
+
+        joined, count = await self.storage.join_raffle(raffle.id, message.from_user.id)
+        await self._delete_raffle_keyword_message(message)
+        if count == 0:
+            await self.bot.send_message(message.chat.id, "该抽奖已结束。")
+            return
+        if joined and raffle.message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    self._raffle_card(raffle, count),
+                    chat_id=raffle.chat_id,
+                    message_id=raffle.message_id,
+                )
+                await self.storage.ack_ephemeral(raffle.chat_id, raffle.message_id)
+            except TelegramAPIError:
+                logger.debug("更新抽奖人数失败 raffle_id=%s", raffle.id)
+        text = f"已参加抽奖，当前 {count} 人。" if joined else "你已参加过，本次不重复登记。"
+        await self.bot.send_message(message.chat.id, text)
+
+    async def _delete_raffle_keyword_message(self, message: Message) -> None:
+        try:
+            await self.bot.delete_message(message.chat.id, message.message_id)
+        except TelegramAPIError:
+            logger.debug(
+                "删除抽奖关键词消息失败 chat_id=%s message_id=%s",
+                message.chat.id,
+                message.message_id,
+            )
 
     async def lottery(self, message: Message) -> None:
         actor = await self._group_admin(message)
@@ -851,7 +932,7 @@ class ModerationController:
         payload = command_payload(message)
         if not payload:
             await message.answer(
-                "用法：<code>/lottery 30m 1 奖品</code>\n"
+                "用法：<code>/lottery 30m 1 参与 奖品</code>\n"
                 "管理：<code>/lottery end|cancel|reroll</code>"
             )
             return
@@ -870,9 +951,9 @@ class ModerationController:
             await self._reroll_latest(actor[2])
             return
 
-        parts = payload.split(maxsplit=2)
-        if len(parts) != 3:
-            await message.answer("格式：<code>/lottery 30m 1 奖品名称</code>")
+        parts = payload.split(maxsplit=3)
+        if len(parts) != 4:
+            await message.answer("格式：<code>/lottery 30m 1 参与 奖品名称</code>")
             return
         try:
             duration = parse_duration(parts[0])
@@ -887,7 +968,8 @@ class ModerationController:
             raffle = await self.storage.create_raffle(
                 chat_id=actor[2],
                 creator_id=actor[0],
-                prize=parts[2],
+                keyword=parts[2],
+                prize=parts[3],
                 winner_count=winner_count,
                 ends_at=(datetime.now(UTC) + timedelta(seconds=duration)).isoformat(
                     timespec="seconds"
@@ -896,62 +978,93 @@ class ModerationController:
         except ValueError as exc:
             await message.answer(html.escape(str(exc)))
             return
+        card: Message | None = None
+        pinned = False
         try:
             card = await self.bot.send_message(
                 actor[2],
                 self._raffle_card(raffle, 0),
-                reply_markup=self._raffle_keyboard(raffle.id, 0),
             )
             await self.storage.ack_ephemeral(actor[2], card.message_id)
-            await self.storage.set_raffle_message(raffle.id, card.message_id)
-        except TelegramAPIError:
-            await self.storage.cancel_raffle(raffle.id)
+            if not await self.storage.set_raffle_message(raffle.id, card.message_id):
+                raise RuntimeError("抽奖卡片绑定失败")
+            pinned = bool(
+                await self.bot.pin_chat_message(
+                    actor[2], card.message_id, disable_notification=True
+                )
+            )
+            if not pinned:
+                raise RuntimeError("Telegram 未确认置顶")
+            if not await self.storage.activate_raffle(raffle.id):
+                raise RuntimeError("抽奖激活失败")
+        except (TelegramAPIError, RuntimeError):
+            if card is not None:
+                if pinned:
+                    with contextlib.suppress(TelegramAPIError):
+                        await self.bot.unpin_chat_message(actor[2], message_id=card.message_id)
+                with contextlib.suppress(TelegramAPIError):
+                    await self.bot.delete_message(actor[2], card.message_id)
+                await self.storage.ack_ephemeral(actor[2], card.message_id)
+            await self.storage.discard_pending_raffle(raffle.id)
             logger.exception("发布抽奖卡片失败 chat_id=%s raffle_id=%s", actor[2], raffle.id)
             await message.answer("抽奖发布失败，已安全取消。")
             return
-        await message.answer(f"抽奖 #{raffle.id} 已创建。")
+        await message.answer(f"抽奖 #{raffle.id} 已创建并置顶。")
 
-    async def join_lottery(self, callback: CallbackQuery) -> None:
-        data = callback.data or ""
+    async def _unpin_raffle_message(self, raffle: Raffle) -> bool:
+        if raffle.message_id is None:
+            return True
         try:
-            raffle_id = int(data.rsplit(":", 1)[1])
-        except (IndexError, ValueError):
-            await callback.answer("抽奖标识无效。", show_alert=True)
-            return
-        raffle = await self.storage.raffle(raffle_id)
-        if raffle is None or raffle.status != "running":
-            await callback.answer("该抽奖已结束。", show_alert=True)
-            return
-        if callback.from_user.is_bot:
-            await callback.answer("机器人不能参加抽奖。", show_alert=True)
-            return
-        try:
-            member = await self.bot.get_chat_member(raffle.chat_id, callback.from_user.id)
-        except TelegramAPIError:
-            await callback.answer("暂时无法核验群成员身份。", show_alert=True)
-            return
-        if member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} or (
-            member.status == ChatMemberStatus.RESTRICTED
-            and not bool(getattr(member, "is_member", False))
-        ):
-            await callback.answer("只有当前群成员可以参加。", show_alert=True)
-            return
-        joined, count = await self.storage.join_raffle(raffle_id, callback.from_user.id)
-        if count == 0:
-            await callback.answer("该抽奖已结束。", show_alert=True)
-            return
-        await callback.answer("报名成功。" if joined else "你已经参加过了。")
-        if joined and raffle.message_id is not None:
-            try:
-                await self.bot.edit_message_text(
-                    self._raffle_card(raffle, count),
-                    chat_id=raffle.chat_id,
-                    message_id=raffle.message_id,
-                    reply_markup=self._raffle_keyboard(raffle.id, count),
-                )
+            return bool(
+                await self.bot.unpin_chat_message(raffle.chat_id, message_id=raffle.message_id)
+            )
+        except TelegramBadRequest as exc:
+            detail = str(exc).casefold()
+            if (
+                "message to unpin not found" in detail
+                or "message not found" in detail
+                or "message is not pinned" in detail
+            ):
+                return True
+            logger.warning(
+                "取消抽奖置顶失败 chat_id=%s raffle_id=%s error=%s",
+                raffle.chat_id,
+                raffle.id,
+                type(exc).__name__,
+            )
+            return False
+        except TelegramAPIError as exc:
+            logger.warning(
+                "取消抽奖置顶失败 chat_id=%s raffle_id=%s error=%s",
+                raffle.chat_id,
+                raffle.id,
+                type(exc).__name__,
+            )
+            return False
+
+    async def _clean_pending_raffles(self) -> None:
+        for raffle in await self.storage.pending_raffles():
+            if raffle.message_id is not None:
+                await self._unpin_raffle_message(raffle)
+                with contextlib.suppress(TelegramAPIError):
+                    await self.bot.delete_message(raffle.chat_id, raffle.message_id)
                 await self.storage.ack_ephemeral(raffle.chat_id, raffle.message_id)
-            except TelegramAPIError:
-                logger.debug("更新抽奖人数失败 raffle_id=%s", raffle.id)
+            await self.storage.discard_pending_raffle(raffle.id)
+
+    async def _schedule_raffle_card_cleanup(self, raffle: Raffle) -> None:
+        if raffle.message_id is None:
+            return
+        delete_at = (
+            datetime.now(UTC) + timedelta(seconds=self.settings.notice_ttl_seconds)
+        ).isoformat(timespec="microseconds")
+        try:
+            await self.storage.enqueue_ephemeral(raffle.chat_id, raffle.message_id, delete_at)
+        except Exception:
+            logger.exception(
+                "抽奖结果清理入队失败 chat_id=%s raffle_id=%s",
+                raffle.chat_id,
+                raffle.id,
+            )
 
     async def _valid_raffle_entries(self, raffle: Raffle) -> tuple[int, ...]:
         user_ids = await self.storage.raffle_entry_ids(raffle.id)
@@ -1005,6 +1118,8 @@ class ModerationController:
             )
         else:
             result = f"<b>抽奖已结束</b>\n\n奖品：{html.escape(raffle.prize)}\n无人符合条件。"
+        await self._schedule_raffle_card_cleanup(raffle)
+        await self._unpin_raffle_message(raffle)
         if raffle.message_id is not None:
             try:
                 await self.bot.edit_message_text(
@@ -1042,6 +1157,8 @@ class ModerationController:
         if not await self.storage.cancel_raffle(raffle.id):
             return
         text = f"<b>抽奖已取消</b>\n\n奖品：{html.escape(raffle.prize)}"
+        await self._schedule_raffle_card_cleanup(raffle)
+        await self._unpin_raffle_message(raffle)
         if raffle.message_id is not None:
             try:
                 await self.bot.edit_message_text(

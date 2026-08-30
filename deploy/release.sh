@@ -17,7 +17,7 @@ readonly BACKUP_ROOT="/var/backups/nexa-guardian"
 readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
 readonly PYTHON_BIN="/usr/bin/python3"
-readonly CODE_SCHEMA_VERSION="7"
+readonly CODE_SCHEMA_VERSION="8"
 
 artifact_mode=""
 artifact_path=""
@@ -696,6 +696,28 @@ service_stopped=1
 systemctl stop "${SERVICE_NAME}" || die "failed to stop service before database backup"
 systemctl is-active --quiet "${SERVICE_NAME}" \
   && die "service is still active after stop"
+
+log "checking that no raffle is still running"
+"${PYTHON_BIN}" - "${DATABASE_PATH}" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+database_uri = f"{Path(sys.argv[1]).resolve().as_uri()}?mode=ro"
+connection = sqlite3.connect(database_uri, uri=True, timeout=15)
+try:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'raffles'"
+    ).fetchone()
+    if table is not None:
+        running = connection.execute(
+            "SELECT COUNT(*) FROM raffles WHERE status = 'running'"
+        ).fetchone()
+        if running is not None and int(running[0]) != 0:
+            raise RuntimeError("a raffle is still running; release aborted")
+finally:
+    connection.close()
+PY
 
 log "creating validated database backup at ${backup_path}"
 "${PYTHON_BIN}" - "${DATABASE_PATH}" "${backup_path}" <<'PY'

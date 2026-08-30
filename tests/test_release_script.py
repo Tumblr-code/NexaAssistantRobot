@@ -4,11 +4,12 @@ from pathlib import Path
 def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     script = (Path(__file__).parents[1] / "deploy" / "release.sh").read_text(encoding="utf-8")
 
-    assert 'readonly CODE_SCHEMA_VERSION="7"' in script
+    assert 'readonly CODE_SCHEMA_VERSION="8"' in script
     probe = script.index("probing GPT-5.6 Sol adaptive-reasoning capabilities")
     pause_timer = script.index("pausing ${BACKUP_TIMER_NAME}")
     backup_inactive = script.index("database backup service did not become idle")
     stop = script.index("for a final consistent database backup")
+    raffle_check = script.index("checking that no raffle is still running")
     backup = script.index("creating validated database backup")
     switch = script.index("switching current to")
     database_validation = script.index("production schema version mismatch")
@@ -20,6 +21,7 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
         < pause_timer
         < backup_inactive
         < stop
+        < raffle_check
         < backup
         < switch
         < database_validation
@@ -40,6 +42,7 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
         'systemctl stop "${BACKUP_TIMER_NAME}"'
     )
     assert "wait_for_backup_service_idle" in pause_block
+    assert "a raffle is still running; release aborted" in script
 
     stop_block = script[script.index('log "stopping ${SERVICE_NAME}') : backup]
     assert stop_block.index("service_stopped=1") < stop_block.index(
