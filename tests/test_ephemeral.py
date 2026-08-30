@@ -435,10 +435,11 @@ async def test_worker_logs_unexpected_cancellation_and_keeps_running(
     await asyncio.wait_for(messenger.shutdown(), timeout=0.2)
 
 
-async def test_missing_or_forbidden_message_is_acknowledged() -> None:
+async def test_only_explicitly_missing_message_is_acknowledged() -> None:
     records = [
         EphemeralRecord(-100, 1, "2026-08-29T00:00:00.000000+00:00"),
         EphemeralRecord(-100, 2, "2026-08-29T00:00:00.000000+00:00"),
+        EphemeralRecord(-100, 3, "2026-08-29T00:00:00.000000+00:00"),
     ]
     storage = FakeStorage(records)
     bot = FakeBot()
@@ -451,6 +452,10 @@ async def test_missing_or_forbidden_message_is_acknowledged() -> None:
             method=DeleteMessage(chat_id=-100, message_id=2),
             message="bot was blocked",
         ),
+        TelegramBadRequest(
+            method=DeleteMessage(chat_id=-100, message_id=3),
+            message="message can't be deleted",
+        ),
     ]
     messenger = EphemeralMessenger(  # type: ignore[arg-type]
         bot,
@@ -460,9 +465,13 @@ async def test_missing_or_forbidden_message_is_acknowledged() -> None:
 
     completed = await messenger.process_due()
 
-    assert completed == 2
-    assert storage.acked == [(-100, 1), (-100, 2)]
-    assert storage.rescheduled == []
+    assert completed == 1
+    assert storage.acked == [(-100, 1)]
+    assert {(item.chat_id, item.message_id) for item in storage.rescheduled} == {
+        (-100, 2),
+        (-100, 3),
+    }
+    assert {item.delete_at for item in storage.rescheduled} == {"2026-08-29T00:00:06.000000+00:00"}
 
 
 async def test_transient_errors_keep_retrying_without_blocking_other_records() -> None:
@@ -516,6 +525,44 @@ async def test_enqueue_failure_uses_memory_fallback_and_deletes_when_due() -> No
     assert completed == 1
     assert bot.deleted == [(-100, 33)]
     assert messenger._fallback_deadlines == {}
+
+
+async def test_non_missing_bad_request_keeps_memory_fallback() -> None:
+    clock = MutableClock(at(0))
+    storage = FakeStorage()
+    storage.enqueue_error = RuntimeError("database unavailable")
+    bot = FakeBot()
+    bot.delete_results = [
+        TelegramBadRequest(
+            method=DeleteMessage(chat_id=-100, message_id=35),
+            message="message can't be deleted",
+        )
+    ]
+    messenger = EphemeralMessenger(bot, storage, clock=clock)  # type: ignore[arg-type]
+    await messenger.track_sent(FakeSentMessage(-100, 35))
+
+    clock.advance(30)
+    assert await messenger.process_due() == 0
+
+    assert messenger._fallback_deadlines == {(-100, 35): "2026-08-29T00:00:30.000000+00:00"}
+
+
+async def test_tracking_cancellation_preserves_memory_fallback() -> None:
+    clock = MutableClock(at(0))
+    storage = FakeStorage()
+    storage.enqueue_ephemeral = AsyncMock(  # type: ignore[method-assign]
+        side_effect=asyncio.CancelledError
+    )
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        FakeBot(),
+        storage,
+        clock=clock,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await messenger.track_sent(FakeSentMessage(-100, 36))
+
+    assert messenger._fallback_deadlines == {(-100, 36): "2026-08-29T00:00:30.000000+00:00"}
 
 
 async def test_edit_after_enqueue_recovery_persists_original_fallback_deadline() -> None:
@@ -589,6 +636,35 @@ async def test_start_recovers_due_records_and_shutdown_cancels_worker() -> None:
 
     await messenger.shutdown()
     assert messenger._worker_task is None
+
+
+async def test_unexpected_worker_exit_is_restarted() -> None:
+    runs = 0
+    restarted = asyncio.Event()
+
+    async def run_once_then_block() -> None:
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            return
+        restarted.set()
+        await asyncio.Event().wait()
+
+    messenger = EphemeralMessenger(  # type: ignore[arg-type]
+        FakeBot(),
+        FakeStorage(),
+        poll_interval=0.01,
+    )
+    messenger._run_worker = run_once_then_block  # type: ignore[method-assign]
+
+    await messenger.start()
+    await asyncio.wait_for(restarted.wait(), timeout=0.2)
+
+    assert runs == 2
+    assert messenger._worker_task is not None
+    assert not messenger._worker_task.done()
+
+    await messenger.shutdown()
 
 
 async def test_track_rejects_non_message_results_without_storing_content() -> None:

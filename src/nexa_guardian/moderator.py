@@ -2373,9 +2373,11 @@ class ModerationController:
 
     async def chat_member_changed(self, event: ChatMemberUpdated) -> None:
         user = event.new_chat_member.user
-        is_admin = event.new_chat_member.status in {
-            ChatMemberStatus.CREATOR,
-            ChatMemberStatus.ADMINISTRATOR,
+        raw_status = event.new_chat_member.status
+        status = str(getattr(raw_status, "value", raw_status))
+        is_admin = status in {
+            ChatMemberStatus.CREATOR.value,
+            ChatMemberStatus.ADMINISTRATOR.value,
         }
         self.admins.update_member(event.chat.id, user.id, is_admin=is_admin)
         if self.is_allowed_chat(event.chat.id) and not user.is_bot:
@@ -2384,7 +2386,7 @@ class ModerationController:
                     await self.storage.record_member_status(
                         event.chat.id,
                         user.id,
-                        event.new_chat_member.status.value,
+                        status,
                         observed_at=event.date.astimezone(UTC).isoformat(timespec="seconds"),
                     )
             except asyncio.CancelledError:
@@ -2396,7 +2398,7 @@ class ModerationController:
                     user.id,
                 )
         key = (event.chat.id, user.id)
-        if event.new_chat_member.status == ChatMemberStatus.KICKED:
+        if status == ChatMemberStatus.KICKED.value:
             self._remember_auto_banned(key)
         else:
             self._forget_auto_banned(key)

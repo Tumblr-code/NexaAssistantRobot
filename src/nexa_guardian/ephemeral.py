@@ -66,6 +66,11 @@ def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
+def _message_is_already_absent(error: TelegramBadRequest) -> bool:
+    """Return whether Telegram explicitly confirms that the message is gone."""
+    return "message to delete not found" in str(error).casefold()
+
+
 class EphemeralMessenger:
     """Send and remove non-private bot messages without retaining their contents.
 
@@ -119,6 +124,7 @@ class EphemeralMessenger:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep
         self._worker_task: asyncio.Task[None] | None = None
+        self._restart_handle: asyncio.TimerHandle | None = None
         self._stopping = False
         self._process_lock = asyncio.Lock()
         self._delete_semaphore = asyncio.Semaphore(delete_concurrency)
@@ -131,6 +137,12 @@ class EphemeralMessenger:
         if self._worker_task is not None and not self._worker_task.done():
             return
         self._stopping = False
+        if self._restart_handle is not None:
+            self._restart_handle.cancel()
+            self._restart_handle = None
+        self._spawn_worker()
+
+    def _spawn_worker(self) -> None:
         self._worker_task = asyncio.create_task(
             self._run_worker(),
             name="nexa-ephemeral-message-worker",
@@ -139,6 +151,9 @@ class EphemeralMessenger:
 
     async def shutdown(self) -> None:
         self._stopping = True
+        if self._restart_handle is not None:
+            self._restart_handle.cancel()
+            self._restart_handle = None
         task = self._worker_task
         self._worker_task = None
         if task is not None:
@@ -161,8 +176,14 @@ class EphemeralMessenger:
         delete_at = self._fallback_deadlines.get(key)
         if delete_at is None:
             delete_at = _utc_iso(self._clock() + timedelta(seconds=self.ttl_seconds))
+        # Register the in-memory fallback before awaiting SQLite. If the update
+        # handler is cancelled after Telegram has sent the message, the worker can
+        # still persist or delete it instead of losing the only cleanup record.
+        self._fallback_deadlines.setdefault(key, delete_at)
         try:
             await self.storage.enqueue_ephemeral(chat_id, message_id, delete_at)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception(
                 "failed to persist ephemeral message; using memory fallback "
@@ -170,7 +191,6 @@ class EphemeralMessenger:
                 chat_id,
                 message_id,
             )
-            self._fallback_deadlines.setdefault(key, delete_at)
         else:
             self._fallback_deadlines.pop(key, None)
         return message
@@ -225,38 +245,51 @@ class EphemeralMessenger:
                     raise RuntimeError("Telegram returned false while deleting a message")
             except asyncio.CancelledError:
                 raise
-            except (TelegramBadRequest, TelegramForbiddenError):
-                await self.storage.ack_ephemeral(record.chat_id, record.message_id)
-                self._retry_attempts.pop(key, None)
-                return 1
+            except TelegramBadRequest as exc:
+                if _message_is_already_absent(exc):
+                    await self.storage.ack_ephemeral(record.chat_id, record.message_id)
+                    self._retry_attempts.pop(key, None)
+                    return 1
+                return await self._reschedule_failure(record, key, now, exc)
+            except TelegramForbiddenError as exc:
+                return await self._reschedule_failure(record, key, now, exc)
             except Exception as exc:
-                attempts = min(self._retry_attempts.get(key, 0) + 1, 31)
-                self._retry_attempts[key] = attempts
-                retry_delay = min(
-                    self.max_retry_delay_seconds,
-                    self.retry_delay_seconds * (2 ** (attempts - 1)),
-                )
-                retry_at = now + timedelta(seconds=retry_delay)
-                logger.warning(
-                    "ephemeral deletion failed; retry scheduled chat_id=%s "
-                    "message_id=%s attempts=%s error=%s",
-                    record.chat_id,
-                    record.message_id,
-                    attempts,
-                    type(exc).__name__,
-                )
-                await self.storage.reschedule_ephemeral(
-                    record.chat_id,
-                    record.message_id,
-                    _utc_iso(retry_at),
-                )
-                return 0
+                return await self._reschedule_failure(record, key, now, exc)
             else:
                 await self.storage.ack_ephemeral(record.chat_id, record.message_id)
                 self._retry_attempts.pop(key, None)
                 return 1
         finally:
             self._inflight_deletions.discard(key)
+
+    async def _reschedule_failure(
+        self,
+        record: EphemeralRecordLike,
+        key: tuple[int, int],
+        now: datetime,
+        error: Exception,
+    ) -> int:
+        attempts = min(self._retry_attempts.get(key, 0) + 1, 31)
+        self._retry_attempts[key] = attempts
+        retry_delay = min(
+            self.max_retry_delay_seconds,
+            self.retry_delay_seconds * (2 ** (attempts - 1)),
+        )
+        retry_at = now + timedelta(seconds=retry_delay)
+        logger.warning(
+            "ephemeral deletion failed; retry scheduled chat_id=%s "
+            "message_id=%s attempts=%s error=%s",
+            record.chat_id,
+            record.message_id,
+            attempts,
+            type(error).__name__,
+        )
+        await self.storage.reschedule_ephemeral(
+            record.chat_id,
+            record.message_id,
+            _utc_iso(retry_at),
+        )
+        return 0
 
     async def _flush_fallback(self, now: datetime, *, force_delete: bool) -> int:
         completed = 0
@@ -274,9 +307,17 @@ class EphemeralMessenger:
                         raise RuntimeError("Telegram returned false while deleting a message")
                 except asyncio.CancelledError:
                     raise
-                except (TelegramBadRequest, TelegramForbiddenError):
-                    self._fallback_deadlines.pop(key, None)
-                    completed += 1
+                except TelegramBadRequest as exc:
+                    if _message_is_already_absent(exc):
+                        self._fallback_deadlines.pop(key, None)
+                        completed += 1
+                    else:
+                        logger.warning(
+                            "memory fallback deletion failed chat_id=%s message_id=%s error=%s",
+                            chat_id,
+                            message_id,
+                            type(exc).__name__,
+                        )
                 except Exception as exc:
                     logger.warning(
                         "memory fallback deletion failed chat_id=%s message_id=%s error=%s",
@@ -331,15 +372,34 @@ class EphemeralMessenger:
             return
         if task.cancelled():
             logger.error("ephemeral message worker stopped unexpectedly after cancellation")
+        else:
+            exception = task.exception()
+            if exception is None:
+                logger.error("ephemeral message worker stopped unexpectedly without an error")
+            else:
+                logger.critical(
+                    "ephemeral message worker stopped unexpectedly",
+                    exc_info=(type(exception), exception, exception.__traceback__),
+                )
+        self._schedule_worker_restart()
+
+    def _schedule_worker_restart(self) -> None:
+        if self._stopping or self._restart_handle is not None:
             return
-        exception = task.exception()
-        if exception is None:
-            logger.error("ephemeral message worker stopped unexpectedly without an error")
-            return
-        logger.critical(
-            "ephemeral message worker stopped unexpectedly",
-            exc_info=(type(exception), exception, exception.__traceback__),
+        loop = asyncio.get_running_loop()
+        self._restart_handle = loop.call_later(
+            self.poll_interval,
+            self._restart_worker,
         )
+
+    def _restart_worker(self) -> None:
+        self._restart_handle = None
+        if self._stopping:
+            return
+        if self._worker_task is not None and not self._worker_task.done():
+            return
+        logger.warning("restarting ephemeral message worker")
+        self._spawn_worker()
 
     async def _run_worker(self) -> None:
         while True:
