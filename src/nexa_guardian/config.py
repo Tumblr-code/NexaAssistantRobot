@@ -117,6 +117,13 @@ class Settings:
     ai_image_target_long_edge: int = 1280
     ai_image_download_timeout_seconds: float = 2.0
     ai_media_concurrency: int = 4
+    telegram_api_id: int | None = None
+    telegram_api_hash: str = ""
+    telegram_session_path: Path = Path("/var/lib/nexa-guardian/mtproto/admin")
+
+    @property
+    def mtproto_ready(self) -> bool:
+        return self.telegram_api_id is not None and bool(self.telegram_api_hash)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -174,6 +181,11 @@ class Settings:
         if ai_learn_threshold < ai_ad_threshold:
             raise ValueError("AI_LEARN_THRESHOLD 不能低于 AI_AD_THRESHOLD")
 
+        telegram_api_id = _optional_positive_integer("TELEGRAM_API_ID")
+        telegram_api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
+        if (telegram_api_id is None) != (not telegram_api_hash):
+            raise ValueError("TELEGRAM_API_ID 与 TELEGRAM_API_HASH 必须同时配置")
+
         return cls(
             bot_token=token,
             allowed_chat_ids=_int_csv("ALLOWED_CHAT_IDS", os.getenv("ALLOWED_CHAT_IDS")),
@@ -224,4 +236,12 @@ class Settings:
                 "AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", 2.0, minimum=0.25, maximum=30.0
             ),
             ai_media_concurrency=_integer("AI_MEDIA_CONCURRENCY", 4, minimum=1),
+            telegram_api_id=telegram_api_id,
+            telegram_api_hash=telegram_api_hash,
+            telegram_session_path=Path(
+                os.getenv(
+                    "TELEGRAM_SESSION_PATH",
+                    "/var/lib/nexa-guardian/mtproto/admin",
+                )
+            ).expanduser(),
         )

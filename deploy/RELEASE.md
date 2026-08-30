@@ -39,9 +39,9 @@
 
 ```bash
 sudo /path/to/repository/deploy/release.sh \
-  --wheel /root/releases/nexa_guardian-0.3.1-py3-none-any.whl \
+  --wheel /root/releases/nexa_guardian-0.4.0-py3-none-any.whl \
   --git-sha 0123456789abcdef0123456789abcdef01234567 \
-  --schema-version 6
+  --schema-version 7
 ```
 
 直接从已检出的源码构建：
@@ -49,11 +49,11 @@ sudo /path/to/repository/deploy/release.sh \
 ```bash
 sudo /path/to/repository/deploy/release.sh \
   --source /root/NexaAssistantRobot \
-  --schema-version 6
+  --schema-version 7
 ```
 
-当前版本的 `--schema-version` 必须明确传入 `6`，脚本会在启动后核对数据库的
-`PRAGMA user_version=6`。wheel 模式必须显式提供
+当前版本的 `--schema-version` 必须明确传入 `7`，脚本会在启动后核对数据库的
+`PRAGMA user_version=7`。wheel 模式必须显式提供
 完整 Git SHA；源码模式只接受无未提交或未跟踪文件的干净 Git worktree，默认读取 `HEAD`，
 也可通过 `--git-sha` 固定指定且必须与 `HEAD` 完全一致。
 
@@ -72,7 +72,7 @@ sudo /path/to/repository/deploy/release.sh \
    `/var/backups/nexa-guardian/manual/pre-release-<release-id>.db`，运行
    `PRAGMA quick_check`、`PRAGMA foreign_key_check` 并记录 SHA256。
 7. 将 `current` 软链接原子切换到 `<UTC timestamp>-<short SHA>` release，启动服务。
-8. 检查 systemd 启用/运行状态、主进程、退出状态、自动重启次数、数据库完整性和 schema 6；失败时执行下述数据库与代码回滚。
+8. 检查 systemd 启用/运行状态、主进程、退出状态、自动重启次数、数据库完整性和 schema 7；失败时执行下述数据库与代码回滚。
 9. 验证成功后，仅清理标准命名的旧代码 release，固定保留 `current` 和最近两个旧版本；
    备份目录、非标准目录及 `current` 指向的 release 不会被清理。
 

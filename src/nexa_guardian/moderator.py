@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import html
 import io
 import logging
@@ -15,16 +16,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, TypedDict, TypeVar
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
+    CallbackQuery,
     ChatMemberAdministrator,
     ChatMemberOwner,
     ChatMemberUpdated,
     ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Message,
     PhotoSize,
     User,
@@ -54,8 +58,17 @@ from nexa_guardian.detection import (
     extract_entity_urls,
     human_duration,
     normalize_domain,
+    parse_duration,
 )
-from nexa_guardian.storage import AIStats, ChatStats, LogOutboxRecord, MemberActivity, Storage
+from nexa_guardian.history_purge import HistoryPurgeError, HistoryPurger
+from nexa_guardian.storage import (
+    AIStats,
+    ChatStats,
+    LogOutboxRecord,
+    MemberActivity,
+    Raffle,
+    Storage,
+)
 
 logger = logging.getLogger(__name__)
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
@@ -70,10 +83,13 @@ INACTIVE_CLEANUP_LIMIT = 50
 INACTIVE_CONFIRM_TTL_SECONDS = 10 * 60
 INACTIVE_KICK_FALLBACK_SECONDS = 5 * 60
 INACTIVE_RETRY_AFTER_MAX_SECONDS = 15
+RAFFLE_MIN_SECONDS = 60
+RAFFLE_MAX_SECONDS = 30 * 24 * 60 * 60
+RAFFLE_WORKER_INTERVAL_SECONDS = 2
 BOT_PROFILE_NAME = "Nexa 群管助手"
 BOT_PROFILE_SHORT_DESCRIPTION = (
     "Nexa 官方群管理审核员：GPT-5.6 Sol 智能识别广告与刷屏，自动删除并警告；"
-    "第 3 次直接封禁，支持管理员筛选长期未发言成员。"
+    "第 3 次直接封禁，并支持安全透明的群抽奖。"
 )
 BOT_PROFILE_DESCRIPTION = """Nexa Guardian 是 @ExampleGroup 的官方群管理与安全审核员。
 
@@ -81,12 +97,12 @@ BOT_PROFILE_DESCRIPTION = """Nexa Guardian 是 @ExampleGroup 的官方群管理�
 • 自动清理广告、诈骗、恶意推广与刷屏；第 3 次警告直接封禁
 • 普通聊天静默处理；仅可疑消息显示审核状态
 • 持续学习高置信广告特征，提升后续拦截效率
-• 支持警告、禁言、解禁、移出、封禁、可信用户与域名白名单
-• 唯一授权管理员可私聊筛选并二次确认清理长期未发言的已观察成员
+• 极简管理入口：状态、删除、封禁与群抽奖
+• 抽奖支持按钮报名、定时开奖、取消及重抽
 • 群内机器人回复约 30 秒后清理；管理员私聊回复永久保留
 • 不保存群消息原文、图片或模型推理
 
-成员筛选依据机器人观察到的活动，不代表 Telegram 最后上线时间。发送 /help 查看管理命令。
+发送 /help 查看管理命令。
 
 官方服务：
 Example Store 商城：https://example.org
@@ -209,37 +225,18 @@ ACTION_LABELS = {
     "cleanup_inactive_unban_failed": "清理成员后解除封禁失败",
 }
 
-HELP_TEXT = """<b>Nexa Guardian 群管命令</b>
+HELP_TEXT = """<b>Nexa Guardian</b>
 
-自动功能：GPT-5.6 Sol 广告审核、AI 特征学习、累计 3 次警告自动封禁。
+广告由 GPT-5.6 Sol 自动审核；累计 3 次警告自动封禁。
 
-群内可回复成员消息；私聊机器人时，把数字用户 ID 放在命令后：
-<code>/warn</code>　警告
-<code>/mute [1m|2h|1d]</code>　禁言
-<code>/unmute</code>　解除禁言
-<code>/ban</code>　封禁并删除其历史消息
-<code>/unban 用户ID</code>　解除封禁
-<code>/kick</code>　移出但允许重新加入
-<code>/del</code>　群内删除被回复的消息
-<code>/warnings</code> / <code>/clearwarns</code>
+<code>/status</code>　查看机器人与抽奖状态
+<code>/ban</code>　回复成员消息后封禁
+<code>/del</code>　回复消息后删除
+<code>/del all</code>　清理全部群历史
+<code>/lottery 30m 1 奖品</code>　创建抽奖
+<code>/lottery end|cancel|reroll</code>　管理抽奖
 
-规则管理：
-<code>/trust</code> / <code>/untrust</code>　可信用户
-<code>/addomain example.com</code> / <code>/deldomain example.com</code>
-<code>/domains</code>　查看域名白名单
-<code>/words</code>　查看 AI 已学习特征
-<code>/delword 编号或完整特征</code>　停用误学特征
-<code>/aicandidates</code>　查看候选或拒绝特征
-<code>/aipause</code> / <code>/airesume</code>　暂停或恢复 AI
-
-检查：<code>/status</code> <code>/settings</code> <code>/stats</code>
-<code>/recent</code> <code>/aistats</code> <code>/airecent</code> <code>/chatid</code>
-<code>/inactive [30-365]</code>　私聊预览长期未发言成员
-<code>/cleanupinactive [30-365]</code>　私聊生成二次确认清理计划
-
-私聊示例：<code>/mute 123456789 2h</code>
-私聊仅唯一授权管理员可用，机器人私聊回复永久保留；群内回复约 30 秒后清理。
-成员筛选只依据机器人上线后观察到的群内活动，不代表 Telegram 最后上线时间。"""
+私聊仅唯一授权管理员可用；群内普通回复约 30 秒后清理。"""
 
 
 def display_user(user: User | None, user_id: int) -> str:
@@ -460,6 +457,15 @@ class ModerationController:
         )
         self._auto_banned_members: OrderedDict[tuple[int, int], float] = OrderedDict()
         self._inactive_cleanup_plans: dict[tuple[int, str], PendingInactiveCleanup] = {}
+        self._raffle_locks: dict[int, asyncio.Lock] = {}
+        self._raffle_worker_task: asyncio.Task[None] | None = None
+        self._stopping = False
+        self.history_purger = HistoryPurger(
+            api_id=settings.telegram_api_id,
+            api_hash=settings.telegram_api_hash,
+            session_path=settings.telegram_session_path,
+            authorized_user_ids=settings.authorized_admin_ids,
+        )
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -476,37 +482,12 @@ class ModerationController:
             self.moderate_message,
             self._ordinary_member_command,
         )
-        self.router.message.register(self.start, CommandStart())
         self.router.message.register(self.help, Command("help"))
-        self.router.message.register(self.chat_id, Command("chatid"))
         self.router.message.register(self.status, Command("status"))
-        self.router.message.register(self.settings_command, Command("settings"))
-        self.router.message.register(self.stats, Command("stats"))
-        self.router.message.register(self.recent, Command("recent"))
-        self.router.message.register(self.warn, Command("warn"))
-        self.router.message.register(self.mute, Command("mute"))
-        self.router.message.register(self.unmute, Command("unmute"))
         self.router.message.register(self.ban, Command("ban"))
-        self.router.message.register(self.unban, Command("unban"))
-        self.router.message.register(self.kick, Command("kick"))
         self.router.message.register(self.delete_replied, Command("del"))
-        self.router.message.register(self.warnings, Command("warnings"))
-        self.router.message.register(self.clear_warnings, Command("clearwarns"))
-        self.router.message.register(self.trust, Command("trust"))
-        self.router.message.register(self.untrust, Command("untrust"))
-        self.router.message.register(self.add_domain, Command("addomain"))
-        self.router.message.register(self.delete_domain, Command("deldomain"))
-        self.router.message.register(self.list_domains, Command("domains"))
-        self.router.message.register(self.add_word, Command("addword"))
-        self.router.message.register(self.delete_word, Command("delword"))
-        self.router.message.register(self.list_words, Command("words"))
-        self.router.message.register(self.ai_candidates, Command("aicandidates"))
-        self.router.message.register(self.ai_stats, Command("aistats"))
-        self.router.message.register(self.ai_recent, Command("airecent"))
-        self.router.message.register(self.ai_pause, Command("aipause"))
-        self.router.message.register(self.ai_resume, Command("airesume"))
-        self.router.message.register(self.inactive_members, Command("inactive"))
-        self.router.message.register(self.cleanup_inactive, Command("cleanupinactive"))
+        self.router.message.register(self.lottery, Command("lottery"))
+        self.router.callback_query.register(self.join_lottery, F.data.startswith("raffle:join:"))
         self.router.message.register(self.moderate_message)
         self.router.edited_message.register(self.moderate_message)
         self.router.chat_member.register(self.chat_member_changed)
@@ -547,35 +528,11 @@ class ModerationController:
 
     async def set_commands(self) -> None:
         commands = [
-            BotCommand(command="help", description="查看群内和私聊管理命令"),
-            BotCommand(command="status", description="检查机器人权限和状态"),
-            BotCommand(command="settings", description="查看当前群管规则"),
-            BotCommand(command="stats", description="查看今日、近7天和累计统计"),
-            BotCommand(command="recent", description="私聊查看最近管理操作"),
-            BotCommand(command="warn", description="警告：/warn 用户ID"),
-            BotCommand(command="mute", description="禁言：/mute 用户ID 2h"),
-            BotCommand(command="unmute", description="解禁：/unmute 用户ID"),
+            BotCommand(command="help", description="查看极简使用说明"),
+            BotCommand(command="status", description="查看机器人与抽奖状态"),
+            BotCommand(command="del", description="删除消息；all 清理群历史"),
             BotCommand(command="ban", description="封禁：/ban 用户ID"),
-            BotCommand(command="unban", description="解除封禁：/unban 用户ID"),
-            BotCommand(command="kick", description="移出：/kick 用户ID"),
-            BotCommand(command="del", description="删除回复的群消息"),
-            BotCommand(command="warnings", description="查询用户警告次数"),
-            BotCommand(command="clearwarns", description="清除用户警告"),
-            BotCommand(command="trust", description="添加可信用户"),
-            BotCommand(command="untrust", description="移除可信用户"),
-            BotCommand(command="delword", description="停用误学的 AI 特征"),
-            BotCommand(command="domains", description="查看域名白名单"),
-            BotCommand(command="addomain", description="添加域名白名单"),
-            BotCommand(command="deldomain", description="移除域名白名单"),
-            BotCommand(command="words", description="查看 AI 已学习特征"),
-            BotCommand(command="aicandidates", description="查看 AI 候选特征"),
-            BotCommand(command="aistats", description="查看 AI 审核统计"),
-            BotCommand(command="airecent", description="查看最近 AI 判断"),
-            BotCommand(command="aipause", description="紧急暂停 AI 审核"),
-            BotCommand(command="airesume", description="恢复 AI 审核"),
-            BotCommand(command="inactive", description="私聊预览长期未发言成员"),
-            BotCommand(command="cleanupinactive", description="私聊二次确认清理成员"),
-            BotCommand(command="chatid", description="查看目标群 ID"),
+            BotCommand(command="lottery", description="创建或管理群抽奖"),
         ]
         for language_code in (None, "zh"):
             await self.bot.set_my_commands(commands, language_code=language_code)
@@ -590,9 +547,19 @@ class ModerationController:
             )
 
     async def startup(self) -> None:
+        self._stopping = False
         await self.reporter.start()
+        self._raffle_worker_task = asyncio.create_task(
+            self._raffle_worker(), name="nexa-raffle-worker"
+        )
 
     async def shutdown(self) -> None:
+        self._stopping = True
+        if self._raffle_worker_task is not None:
+            self._raffle_worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._raffle_worker_task
+            self._raffle_worker_task = None
         await self.reporter.shutdown()
         close_reviewer = getattr(self.ai_reviewer, "close", None)
         if close_reviewer is not None:
@@ -832,6 +799,12 @@ class ModerationController:
         )
         allowed = self.is_allowed_chat(chat_id)
         mode = "观察模式（不执行自动动作）" if self.settings.dry_run else "执行模式"
+        raffle = await self.storage.active_raffle(chat_id)
+        raffle_status = (
+            f"进行中 #{raffle.id}，{await self.storage.raffle_entry_count(raffle.id)} 人参与"
+            if raffle is not None
+            else "无进行中抽奖"
+        )
         await message.answer(
             f"<b>运行状态</b>\n"
             f"机器人：@{html.escape(me.username or str(me.id))}\n"
@@ -841,8 +814,273 @@ class ModerationController:
             f"模式：{mode}\n"
             f"机器人管理员：{'是' if is_admin else '否'}\n"
             f"删除消息权限：{'有' if can_delete else '缺少'}\n"
-            f"限制成员权限：{'有' if can_restrict else '缺少'}"
+            f"限制成员权限：{'有' if can_restrict else '缺少'}\n"
+            f"AI 审核：{'开' if self.settings.ai_enabled else '关'}\n"
+            f"抽奖：{raffle_status}\n"
+            f"全群清理：{'已配置' if self.settings.mtproto_ready else '待配置 Telegram API 凭据'}"
         )
+
+    @staticmethod
+    def _raffle_keyboard(raffle_id: int, count: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=f"参加抽奖 · {count}人",
+                        callback_data=f"raffle:join:{raffle_id}",
+                    )
+                ]
+            ]
+        )
+
+    @staticmethod
+    def _raffle_card(raffle: Raffle, count: int) -> str:
+        ends = action_time(raffle.ends_at)
+        return (
+            "<b>🎁 Nexa 群抽奖</b>\n\n"
+            f"奖品：{html.escape(raffle.prize)}\n"
+            f"中奖人数：{raffle.winner_count}\n"
+            f"参与人数：{count}\n"
+            f"开奖时间：{ends}（北京时间）"
+        )
+
+    async def lottery(self, message: Message) -> None:
+        actor = await self._group_admin(message)
+        if actor is None:
+            return
+        payload = command_payload(message)
+        if not payload:
+            await message.answer(
+                "用法：<code>/lottery 30m 1 奖品</code>\n"
+                "管理：<code>/lottery end|cancel|reroll</code>"
+            )
+            return
+        operation = payload.casefold()
+        if operation in {"end", "cancel", "reroll"}:
+            if operation == "end":
+                raffle = await self.storage.active_raffle(actor[2])
+                if raffle is None:
+                    await message.answer("当前没有进行中的抽奖。")
+                    return
+                await self._finalize_raffle(raffle, notify_admin=True)
+                return
+            if operation == "cancel":
+                await self._cancel_active_raffle(actor[2])
+                return
+            await self._reroll_latest(actor[2])
+            return
+
+        parts = payload.split(maxsplit=2)
+        if len(parts) != 3:
+            await message.answer("格式：<code>/lottery 30m 1 奖品名称</code>")
+            return
+        try:
+            duration = parse_duration(parts[0])
+            winner_count = int(parts[1])
+        except ValueError:
+            await message.answer("持续时间或中奖人数格式不正确。")
+            return
+        if not RAFFLE_MIN_SECONDS <= duration <= RAFFLE_MAX_SECONDS:
+            await message.answer("抽奖持续时间必须为 1 分钟至 30 天。")
+            return
+        try:
+            raffle = await self.storage.create_raffle(
+                chat_id=actor[2],
+                creator_id=actor[0],
+                prize=parts[2],
+                winner_count=winner_count,
+                ends_at=(datetime.now(UTC) + timedelta(seconds=duration)).isoformat(
+                    timespec="seconds"
+                ),
+            )
+        except ValueError as exc:
+            await message.answer(html.escape(str(exc)))
+            return
+        try:
+            card = await self.bot.send_message(
+                actor[2],
+                self._raffle_card(raffle, 0),
+                reply_markup=self._raffle_keyboard(raffle.id, 0),
+            )
+            await self.storage.ack_ephemeral(actor[2], card.message_id)
+            await self.storage.set_raffle_message(raffle.id, card.message_id)
+        except TelegramAPIError:
+            await self.storage.cancel_raffle(raffle.id)
+            logger.exception("发布抽奖卡片失败 chat_id=%s raffle_id=%s", actor[2], raffle.id)
+            await message.answer("抽奖发布失败，已安全取消。")
+            return
+        await message.answer(f"抽奖 #{raffle.id} 已创建。")
+
+    async def join_lottery(self, callback: CallbackQuery) -> None:
+        data = callback.data or ""
+        try:
+            raffle_id = int(data.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            await callback.answer("抽奖标识无效。", show_alert=True)
+            return
+        raffle = await self.storage.raffle(raffle_id)
+        if raffle is None or raffle.status != "running":
+            await callback.answer("该抽奖已结束。", show_alert=True)
+            return
+        if callback.from_user.is_bot:
+            await callback.answer("机器人不能参加抽奖。", show_alert=True)
+            return
+        try:
+            member = await self.bot.get_chat_member(raffle.chat_id, callback.from_user.id)
+        except TelegramAPIError:
+            await callback.answer("暂时无法核验群成员身份。", show_alert=True)
+            return
+        if member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} or (
+            member.status == ChatMemberStatus.RESTRICTED
+            and not bool(getattr(member, "is_member", False))
+        ):
+            await callback.answer("只有当前群成员可以参加。", show_alert=True)
+            return
+        joined, count = await self.storage.join_raffle(raffle_id, callback.from_user.id)
+        if count == 0:
+            await callback.answer("该抽奖已结束。", show_alert=True)
+            return
+        await callback.answer("报名成功。" if joined else "你已经参加过了。")
+        if joined and raffle.message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    self._raffle_card(raffle, count),
+                    chat_id=raffle.chat_id,
+                    message_id=raffle.message_id,
+                    reply_markup=self._raffle_keyboard(raffle.id, count),
+                )
+                await self.storage.ack_ephemeral(raffle.chat_id, raffle.message_id)
+            except TelegramAPIError:
+                logger.debug("更新抽奖人数失败 raffle_id=%s", raffle.id)
+
+    async def _valid_raffle_entries(self, raffle: Raffle) -> tuple[int, ...]:
+        user_ids = await self.storage.raffle_entry_ids(raffle.id)
+        semaphore = asyncio.Semaphore(8)
+
+        async def valid(user_id: int) -> int | None:
+            async with semaphore:
+                try:
+                    member = await self.bot.get_chat_member(raffle.chat_id, user_id)
+                except TelegramAPIError:
+                    return None
+                user = getattr(member, "user", None)
+                if getattr(user, "is_bot", False):
+                    return None
+                if member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} or (
+                    member.status == ChatMemberStatus.RESTRICTED
+                    and not bool(getattr(member, "is_member", False))
+                ):
+                    return None
+                return user_id
+
+        checked = await asyncio.gather(*(valid(user_id) for user_id in user_ids))
+        return tuple(user_id for user_id in checked if user_id is not None)
+
+    async def _finalize_raffle(self, raffle: Raffle, *, notify_admin: bool) -> None:
+        lock = self._raffle_locks.setdefault(raffle.id, asyncio.Lock())
+        async with lock:
+            current = await self.storage.raffle(raffle.id)
+            if current is None or current.status != "running":
+                return
+            candidates = await self._valid_raffle_entries(current)
+            winner_total = min(current.winner_count, len(candidates))
+            winners = tuple(secrets.SystemRandom().sample(candidates, winner_total))
+            if not await self.storage.finish_raffle(current.id, winners):
+                return
+            await self._publish_raffle_result(current, winners, round_number=1)
+            if notify_admin:
+                await self._send_raffle_admin_result(current, winners, round_number=1)
+
+    async def _publish_raffle_result(
+        self, raffle: Raffle, winners: tuple[int, ...], *, round_number: int
+    ) -> None:
+        if winners:
+            lines = [
+                f'{position}. <a href="tg://user?id={user_id}">中奖成员</a>'
+                for position, user_id in enumerate(winners, start=1)
+            ]
+            result = (
+                f"<b>🎉 抽奖结果 · 第 {round_number} 轮</b>\n\n"
+                f"奖品：{html.escape(raffle.prize)}\n" + "\n".join(lines)
+            )
+        else:
+            result = f"<b>抽奖已结束</b>\n\n奖品：{html.escape(raffle.prize)}\n无人符合条件。"
+        if raffle.message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    result,
+                    chat_id=raffle.chat_id,
+                    message_id=raffle.message_id,
+                    reply_markup=None,
+                )
+                return
+            except TelegramAPIError:
+                logger.debug("编辑抽奖结果失败 raffle_id=%s", raffle.id)
+        await self.bot.send_message(raffle.chat_id, result)
+
+    async def _send_raffle_admin_result(
+        self, raffle: Raffle, winners: tuple[int, ...], *, round_number: int
+    ) -> None:
+        if len(self.settings.authorized_admin_ids) != 1:
+            return
+        admin_id = next(iter(self.settings.authorized_admin_ids))
+        ids = "、".join(str(user_id) for user_id in winners) if winners else "无"
+        try:
+            await self.bot.send_message(
+                admin_id,
+                f"抽奖 #{raffle.id} 第 {round_number} 轮完成。\n"
+                f"奖品：{html.escape(raffle.prize)}\n中奖用户 ID：<code>{ids}</code>",
+            )
+        except TelegramAPIError:
+            logger.debug("私聊发送抽奖结果失败 raffle_id=%s", raffle.id)
+
+    async def _cancel_active_raffle(self, chat_id: int) -> None:
+        raffle = await self.storage.active_raffle(chat_id)
+        if raffle is None:
+            await self.bot.send_message(chat_id, "当前没有进行中的抽奖。")
+            return
+        if not await self.storage.cancel_raffle(raffle.id):
+            return
+        text = f"<b>抽奖已取消</b>\n\n奖品：{html.escape(raffle.prize)}"
+        if raffle.message_id is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=raffle.message_id, reply_markup=None
+                )
+                return
+            except TelegramAPIError:
+                pass
+        await self.bot.send_message(chat_id, text)
+
+    async def _reroll_latest(self, chat_id: int) -> None:
+        raffle = await self.storage.latest_finished_raffle(chat_id)
+        if raffle is None:
+            await self.bot.send_message(chat_id, "没有可重抽的历史抽奖。")
+            return
+        candidates = list(await self._valid_raffle_entries(raffle))
+        previous = {winner.user_id for winner in await self.storage.raffle_winners(raffle.id)}
+        preferred = [user_id for user_id in candidates if user_id not in previous]
+        pool = preferred if len(preferred) >= raffle.winner_count else candidates
+        winners = tuple(secrets.SystemRandom().sample(pool, min(raffle.winner_count, len(pool))))
+        round_number = await self.storage.add_reroll(raffle.id, winners)
+        await self._publish_raffle_result(raffle, winners, round_number=round_number)
+        await self._send_raffle_admin_result(raffle, winners, round_number=round_number)
+
+    async def _raffle_worker(self) -> None:
+        while True:
+            try:
+                due = await self.storage.due_raffles(
+                    datetime.now(UTC).isoformat(timespec="seconds")
+                )
+                for raffle in due:
+                    await self._finalize_raffle(raffle, notify_admin=True)
+                await asyncio.sleep(RAFFLE_WORKER_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                if self._stopping:
+                    raise
+            except Exception:
+                logger.exception("抽奖后台任务执行失败")
+                await asyncio.sleep(RAFFLE_WORKER_INTERVAL_SECONDS)
 
     async def settings_command(self, message: Message) -> None:
         actor = await self._group_admin(message)
@@ -1071,12 +1309,24 @@ class ModerationController:
         if actor is None:
             return
         chat_id = actor[2]
+        arguments = command_arguments(message)
+        if arguments and arguments[0].casefold() == "all":
+            await message.answer("正在清理群历史，期间群聊保持开放。")
+            try:
+                result = await self.history_purger.purge(chat_id)
+            except HistoryPurgeError as exc:
+                await message.answer(html.escape(str(exc)))
+                return
+            await message.answer(
+                f"群历史清理完成：删除 {result.deleted}，"
+                f"跳过 {result.skipped}，失败 {result.failed}。"
+            )
+            return
         target_message = message.reply_to_message
         if target_message is not None and message.chat.type in GROUP_TYPES:
             target_message_id = target_message.message_id
             target_user_id = target_message.from_user.id if target_message.from_user else None
         else:
-            arguments = command_arguments(message)
             try:
                 target_message_id = int(arguments[0])
                 if target_message_id <= 0:

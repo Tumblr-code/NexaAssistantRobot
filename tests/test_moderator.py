@@ -389,12 +389,12 @@ async def test_set_commands_syncs_default_and_chinese_profile(
         "zh",
     ]
     commands = bot.set_my_commands.await_args_list[0].args[0]
-    assert {command.command for command in commands} >= {
+    assert {command.command for command in commands} == {
         "help",
-        "recent",
-        "aistats",
-        "inactive",
-        "cleanupinactive",
+        "status",
+        "del",
+        "ban",
+        "lottery",
     }
     assert bot.set_my_name.await_args_list[0].args == (BOT_PROFILE_NAME,)
     assert bot.set_my_name.await_args_list[1].kwargs["language_code"] == "zh"

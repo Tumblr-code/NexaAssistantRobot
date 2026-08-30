@@ -17,7 +17,7 @@ readonly BACKUP_ROOT="/var/backups/nexa-guardian"
 readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
 readonly PYTHON_BIN="/usr/bin/python3"
-readonly CODE_SCHEMA_VERSION="6"
+readonly CODE_SCHEMA_VERSION="7"
 
 artifact_mode=""
 artifact_path=""
