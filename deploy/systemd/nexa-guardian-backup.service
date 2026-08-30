@@ -1,5 +1,5 @@
 [Unit]
-Description=Back up the Nexa Guardian SQLite database
+Description=Back up Nexa Guardian SQLite state
 ConditionPathExists=/var/lib/nexa-guardian/guardian.db
 
 [Service]
@@ -8,7 +8,8 @@ User=nexa-guardian
 Group=nexa-guardian
 WorkingDirectory=/opt/nexa-guardian/current
 Environment=DATABASE_PATH=/var/lib/nexa-guardian/guardian.db
-ExecStart=/opt/nexa-guardian/current/.venv/bin/python -m nexa_guardian.backup /var/backups/nexa-guardian --retention-days 30
+Environment=TELEGRAM_SESSION_PATH=/var/lib/nexa-guardian/mtproto/admin
+ExecStart=/opt/nexa-guardian/current/.venv/bin/python -m nexa_guardian.backup /var/backups/nexa-guardian --retention-days 30 --session-path /var/lib/nexa-guardian/mtproto/admin
 UMask=0077
 
 NoNewPrivileges=true
@@ -27,6 +28,6 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX
-# SQLite WAL readers need write access to the shared-memory sidecar; the source
-# connection itself is still opened with mode=ro by the backup program.
+# SQLite WAL readers need write access to shared-memory sidecars; source
+# connections are still opened with mode=ro by the backup program.
 ReadWritePaths=/var/lib/nexa-guardian /var/backups/nexa-guardian

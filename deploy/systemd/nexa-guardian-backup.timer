@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the Nexa Guardian database backup daily
+Description=Run the Nexa Guardian SQLite state backup daily
 
 [Timer]
 OnCalendar=*-*-* 03:30:00 Asia/Shanghai

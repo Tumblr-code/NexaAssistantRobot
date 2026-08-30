@@ -7,7 +7,6 @@ from nexa_guardian.detection import (
     FloodGuard,
     domain_from_url,
     extract_entity_urls,
-    human_duration,
     is_allowed_domain,
     normalize_domain,
     parse_duration,
@@ -168,7 +167,6 @@ def test_duration_parser_and_display() -> None:
     assert parse_duration("10分钟") == 600
     assert parse_duration("2h") == 7200
     assert parse_duration("1天") == 86400
-    assert human_duration(7200) == "2 小时"
 
 
 def test_duration_rejects_telegram_forever_boundaries() -> None:

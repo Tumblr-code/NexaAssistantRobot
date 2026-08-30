@@ -13,6 +13,7 @@ readonly RELEASES_ROOT="${APP_ROOT}/releases"
 readonly CURRENT_LINK="${APP_ROOT}/current"
 readonly CONFIG_PATH="/etc/nexa-guardian/guardian.env"
 readonly DATABASE_PATH="/var/lib/nexa-guardian/guardian.db"
+readonly TELEGRAM_SESSION_PATH="/var/lib/nexa-guardian/mtproto/admin.session"
 readonly BACKUP_ROOT="/var/backups/nexa-guardian"
 readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
@@ -31,6 +32,7 @@ config_backup_staging=""
 backup_path=""
 database_backup_sha256=""
 database_backup_validated=0
+session_backup_sha256=""
 database_metadata_captured=0
 database_owner_uid=""
 database_owner_gid=""
@@ -509,6 +511,7 @@ readonly release_id="${timestamp}-${short_sha}"
 readonly final_release="${RELEASES_ROOT}/${release_id}"
 backup_path="${MANUAL_BACKUP_ROOT}/pre-release-${release_id}.db"
 readonly backup_path
+readonly session_backup_path="${MANUAL_BACKUP_ROOT}/pre-release-${release_id}.session"
 readonly config_backup_path="${MANUAL_BACKUP_ROOT}/pre-release-${release_id}.env"
 
 [[ ! -L "${APP_ROOT}" ]] || die "application root must not be a symlink: ${APP_ROOT}"
@@ -538,6 +541,8 @@ chmod 0700 -- "${MANUAL_BACKUP_ROOT}"
   || die "release already exists: ${final_release}"
 [[ ! -e "${backup_path}" && ! -L "${backup_path}" ]] \
   || die "database backup already exists: ${backup_path}"
+[[ ! -e "${session_backup_path}" && ! -L "${session_backup_path}" ]] \
+  || die "Telegram session backup already exists: ${session_backup_path}"
 [[ ! -e "${config_backup_path}" && ! -L "${config_backup_path}" ]] \
   || die "configuration backup already exists: ${config_backup_path}"
 
@@ -569,6 +574,16 @@ database_mode="$(stat -c '%a' -- "${DATABASE_PATH}")"
 [[ "${database_mode}" =~ ^[0-7]{3,4}$ ]] \
   || die "production database permissions could not be determined"
 database_metadata_captured=1
+
+[[ -f "${TELEGRAM_SESSION_PATH}" && ! -L "${TELEGRAM_SESSION_PATH}" ]] \
+  || die "Telegram session must be a regular non-symlink file: ${TELEGRAM_SESSION_PATH}"
+[[ "$(canonical_path "${TELEGRAM_SESSION_PATH}")" == "${TELEGRAM_SESSION_PATH}" ]] \
+  || die "Telegram session path resolved unexpectedly: ${TELEGRAM_SESSION_PATH}"
+session_mode="$(stat -c '%a' -- "${TELEGRAM_SESSION_PATH}")"
+[[ "${session_mode}" =~ ^[0-7]{3,4}$ ]] \
+  || die "Telegram session permissions could not be determined"
+(( (8#${session_mode} & ~8#600) == 0 )) \
+  || die "Telegram session permissions must not be wider than 0600"
 
 [[ -f "${CONFIG_PATH}" && ! -L "${CONFIG_PATH}" ]] \
   || die "configuration must be a regular non-symlink file: ${CONFIG_PATH}"
@@ -773,6 +788,52 @@ database_backup_sha256="$(sha256sum -- "${backup_path}" | awk '{print $1}')"
   || die "database backup checksum verification failed"
 database_backup_validated=1
 
+log "creating validated Telegram session backup at ${session_backup_path}"
+"${PYTHON_BIN}" - "${TELEGRAM_SESSION_PATH}" "${session_backup_path}" <<'PY'
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+source_path, backup_path = sys.argv[1:]
+source_uri = f"{Path(source_path).resolve().as_uri()}?mode=ro"
+source = None
+target = None
+try:
+    source = sqlite3.connect(source_uri, uri=True, timeout=15)
+    target = sqlite3.connect(backup_path, timeout=15)
+    source.execute("PRAGMA busy_timeout = 15000")
+    source.backup(target)
+    target.commit()
+    quick_check = target.execute("PRAGMA quick_check").fetchone()
+    if quick_check is None or quick_check[0] != "ok":
+        raise RuntimeError(f"session backup quick_check failed: {quick_check!r}")
+    foreign_keys = target.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_keys:
+        raise RuntimeError("session backup foreign_key_check failed")
+except BaseException:
+    if target is not None:
+        target.close()
+    if source is not None:
+        source.close()
+    try:
+        os.unlink(backup_path)
+    except FileNotFoundError:
+        pass
+    raise
+else:
+    target.close()
+    source.close()
+os.chmod(backup_path, 0o600)
+PY
+[[ -f "${session_backup_path}" && ! -L "${session_backup_path}" ]] \
+  || die "validated Telegram session backup is unavailable: ${session_backup_path}"
+[[ "$(stat -c '%u:%g:%a' -- "${session_backup_path}")" == "0:0:600" ]] \
+  || die "Telegram session backup ownership or permissions verification failed"
+session_backup_sha256="$(sha256sum -- "${session_backup_path}" | awk '{print $1}')"
+[[ "${session_backup_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Telegram session backup checksum verification failed"
+
 log "switching current to ${final_release}"
 switch_current_to "${final_release}"
 
@@ -828,7 +889,8 @@ finally:
     connection.close()
 PY
 
-log "running one verified database backup with the new release"
+log "running one verified database and Telegram session backup with the new release"
+backup_started_epoch="$(date +%s)"
 systemctl start "${BACKUP_SERVICE_NAME}" || die "new release database backup failed"
 wait_for_backup_service_idle \
   || die "new release database backup did not return to idle"
@@ -838,6 +900,45 @@ backup_exec_status="$(
 )"
 [[ "${backup_result}" == "success" && "${backup_exec_status}" == "0" ]] \
   || die "new release database backup did not complete successfully"
+"${PYTHON_BIN}" - "${BACKUP_ROOT}" "${backup_started_epoch}" <<'PY'
+import os
+import re
+import sqlite3
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+started_at = int(sys.argv[2])
+pattern = re.compile(r"(guardian|telegram-session)-(\d{8}T\d{6}Z)\.(db|session)")
+pairs: dict[str, dict[str, Path]] = {}
+for path in root.iterdir():
+    match = pattern.fullmatch(path.name)
+    if match is None or path.is_symlink() or not path.is_file():
+        continue
+    if path.stat().st_mtime < started_at - 1:
+        continue
+    pairs.setdefault(match.group(2), {})[match.group(1)] = path
+
+complete = [(stamp, files) for stamp, files in pairs.items() if len(files) == 2]
+if not complete:
+    raise RuntimeError("new backup did not create a matching database/session pair")
+stamp, files = max(complete)
+for label in ("guardian", "telegram-session"):
+    path = files[label]
+    if stat.S_IMODE(path.stat().st_mode) != 0o600:
+        raise RuntimeError(f"backup permissions are not 0600: {path}")
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=15)
+    try:
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()
+        if quick_check is None or quick_check[0] != "ok":
+            raise RuntimeError(f"backup quick_check failed: {path}")
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise RuntimeError(f"backup foreign_key_check failed: {path}")
+    finally:
+        connection.close()
+print(f"[release] verified daily backup pair: {stamp}")
+PY
 
 systemctl start "${BACKUP_TIMER_NAME}" || die "failed to resume backup timer"
 systemctl is-enabled --quiet "${BACKUP_TIMER_NAME}" || die "backup timer is not enabled"
@@ -883,4 +984,5 @@ fi
 log "deployed ${release_id}"
 log "configuration backup: ${config_backup_path}"
 log "database backup: ${backup_path}"
+log "Telegram session backup: ${session_backup_path}"
 log "wheel sha256: ${wheel_sha256}"

@@ -6,6 +6,7 @@ services:
       - .env
     environment:
       DATABASE_PATH: /data/guardian.db
+      TELEGRAM_SESSION_PATH: /data/mtproto/admin
     restart: unless-stopped
     init: true
     read_only: true

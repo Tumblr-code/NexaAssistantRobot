@@ -249,15 +249,5 @@ def parse_duration(value: str) -> int:
     }[unit]
     seconds = amount * multiplier
     if seconds < 60 or seconds > 366 * 24 * 60 * 60:
-        raise ValueError("禁言时长必须在 1 分钟到 366 天之间")
+        raise ValueError("时长必须在 1 分钟到 366 天之间")
     return seconds
-
-
-def human_duration(seconds: int) -> str:
-    if seconds % 86400 == 0:
-        return f"{seconds // 86400} 天"
-    if seconds % 3600 == 0:
-        return f"{seconds // 3600} 小时"
-    if seconds % 60 == 0:
-        return f"{seconds // 60} 分钟"
-    return f"{seconds} 秒"

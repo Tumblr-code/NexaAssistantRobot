@@ -2,17 +2,19 @@
 
 `deploy/release.sh` 仅用于生产 VM，以 root 身份把一个已构建 wheel 或源码目录发布到
 `/opt/nexa-guardian/releases/`。脚本不会修改或输出 `/etc/nexa-guardian/guardian.env`
-的内容，但会在切换代码前创建一份 root 专用备份；脚本不会删除
-`/var/backups/nexa-guardian/` 下的任何备份。
+的内容，但会在切换代码前创建一份 root 专用备份；脚本不会删除 `manual/` 下的手工和
+发布前备份，根目录的标准每日备份仍会按 30 天策略轮换。
 
 ## 前置条件
 
 - `nexa-guardian.service` 已按 `deploy/systemd/` 中的 unit 安装并启用。
 - `/etc/nexa-guardian/guardian.env` 是 `root:root` 所有的普通文件，权限为 `0600` 或更严格的 `0400`，且不是符号链接。
 - `/var/lib/nexa-guardian/guardian.db` 存在且可由 root 读取。
+- `/var/lib/nexa-guardian/mtproto/admin.session` 是已授权的唯一管理员 Telethon SQLite
+  会话，必须是普通非符号链接文件，且权限不得宽于 `0600`。
 - `/var/backups/nexa-guardian/` 由 root 持有，`nexa-guardian` 服务组只用于写入和清理
   标准命名的每日备份；目录带 sticky bit，`manual/` 保持 `root:root 0700`。发布脚本会
-  校正这些权限，不会移动或删除已有备份。
+  校正这些权限，不会移动或删除 `manual/` 下的已有备份。
 - VM 已创建 `nexa-guardian` 用户和组，并安装 `/usr/bin/python3`、Python `venv`、`flock`、
   `getent`、`sha256sum` 和 systemd；源码模式还需要 `git`。
 - 使用 `--source` 时，还需安装 Python `build`、`uv` 或可用的 `python3 -m pip`；生产发布优先使用 CI 构建的 wheel。
@@ -39,7 +41,7 @@
 
 ```bash
 sudo /path/to/repository/deploy/release.sh \
-  --wheel /root/releases/nexa_guardian-0.5.0-py3-none-any.whl \
+  --wheel /root/releases/nexa_guardian-0.6.0-py3-none-any.whl \
   --git-sha 0123456789abcdef0123456789abcdef01234567 \
   --schema-version 8
 ```
@@ -70,11 +72,12 @@ sudo /path/to/repository/deploy/release.sh \
 5. 写入 `release.json` 并完成候选 release 后，停止服务并确认它不再写库。
    若数据库需要升级且仍有进行中的旧版抽奖，发布会停止并恢复原服务；同一 schema 的
    文案或代码补丁会保留活动抽奖并在新进程中继续。
-6. 使用 SQLite 在线备份 API 创建最终一致的
-   `/var/backups/nexa-guardian/manual/pre-release-<release-id>.db`，运行
-   `PRAGMA quick_check`、`PRAGMA foreign_key_check` 并记录 SHA256。
+6. 使用 SQLite 在线备份 API 创建最终一致的主数据库和 MTProto 会话备份：
+   `/var/backups/nexa-guardian/manual/pre-release-<release-id>.db` 与同名 `.session`。
+   两者均运行 `PRAGMA quick_check`、`PRAGMA foreign_key_check`，固定为
+   `root:root 0600` 并记录 SHA256；日志仅显示路径，不读取或输出会话内容。
 7. 将 `current` 软链接原子切换到 `<UTC timestamp>-<short SHA>` release，启动服务。
-8. 检查 systemd 启用/运行状态、主进程、退出状态、自动重启次数、数据库完整性和 schema 8；失败时执行下述数据库与代码回滚。
+8. 检查 systemd 启用/运行状态、主进程、退出状态、自动重启次数、数据库完整性和 schema 8；再运行一次每日备份并核验同时间戳的主数据库/会话数据库备份对、`0600` 权限及 SQLite 完整性。失败时执行下述数据库与代码回滚。
 9. 验证成功后，仅清理标准命名的旧代码 release，固定保留 `current` 和最近两个旧版本；
    备份目录、非标准目录及 `current` 指向的 release 不会被清理。
 
@@ -94,7 +97,9 @@ wheel 文件名，可用于把 VM release 对应回 GitHub 版本与构建产物
 会重新启动原服务。若有效备份不存在、服务无法确认停止、数据库恢复失败或旧 release 无法
 恢复，脚本不会盲目改写数据库或启动不兼容的代码，并会输出明确的 CRITICAL 错误供人工处理。
 只有无法安全恢复或启动旧版本时，服务才会保持停止状态等待人工处理。
-上线前的数据库和配置备份均会保留。
+上线前的数据库、MTProto 会话和配置备份均会保留。自动回滚只替换本次发布可能迁移的
+主数据库；MTProto 会话备份作为人工灾难恢复副本保留，不会在普通代码回滚时覆盖仍有效的
+线上会话。
 
 ## 上线后核验
 
@@ -108,6 +113,11 @@ cat /opt/nexa-guardian/current/release.json
 systemctl status nexa-guardian-backup.timer --no-pager
 ```
 
+每日备份服务会使用同一时间戳分别生成 `guardian-*.db` 和
+`telegram-session-*.session`，两类 SQLite 备份均通过完整性校验、权限为 `0600`，并共同按
+30 天策略清理。Docker 部署固定使用持久卷内的 `/data/mtproto/admin.session`；systemd 部署
+固定使用 `/var/lib/nexa-guardian/mtproto/admin.session`。
+
 脚本只验证服务和 SQLite 的基础健康状态。Telegram 权限、管理员私聊、Nexa Guardian 官方
 群管理审核员身份、三个一方站点的精确域名行为、AI 网关 Sol/low-high/default 响应契约、
 群内与日志群 30 秒消息清理、授权管理员私聊永久保留、日志 outbox 重试及真实群组审核行为
@@ -117,7 +127,7 @@ systemctl status nexa-guardian-backup.timer --no-pager
 与命令菜单。上线后应通过 Telegram API 回读两套资料，确认成员筛选、群内 30 秒清理及唯一
 管理员私聊永久保留的说明均已生效；头像不由服务自动覆盖。
 
-v0.5.0 的 `/del members` 使用已授权的 MTProto 用户会话分页读取目标群成员，并只扫描一次最近
+v0.6.0 的 `/del members` 使用已授权的 MTProto 用户会话分页读取目标群成员，并只扫描一次最近
 30 天群历史。已注销、精确离线超过 30 天、`LastMonth` 或入群满 30 天且无发言，任一命中即
 进入候选；`LastMonth` 受隐私设置影响，会在预览中单独标识；官方没有独立的 `LongAgo` 类型，
 `UserStatusEmpty` 不作为离线依据。历史未跨过 30 天边界时不使用“无发言”条件。上线验收只在唯一管理员私聊中运行 `/del members` 查看预览，

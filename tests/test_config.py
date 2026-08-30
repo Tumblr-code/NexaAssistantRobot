@@ -22,6 +22,7 @@ def _base_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "AI_SERVICE_TIER",
         "AI_AD_THRESHOLD",
         "AI_LEARN_THRESHOLD",
+        "DEFAULT_MUTE_SECONDS",
         "NOTICE_TTL_SECONDS",
         "EXPECTED_BOT_ID",
         "EXPECTED_BOT_USERNAME",
@@ -44,6 +45,15 @@ def test_ai_is_disabled_safely_without_credentials(monkeypatch: pytest.MonkeyPat
     assert settings.ai_service_tier == AI_SERVICE_TIER
     assert settings.notice_ttl_seconds == 30
     assert settings.database_path == Path("data/test.db")
+
+
+def test_retired_default_mute_setting_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("DEFAULT_MUTE_SECONDS", "retired-value")
+
+    settings = Settings.from_env()
+
+    assert not hasattr(settings, "default_mute_seconds")
 
 
 def test_adaptive_reasoning_and_runtime_limits(monkeypatch: pytest.MonkeyPatch) -> None:

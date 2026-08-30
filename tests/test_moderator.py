@@ -13,7 +13,6 @@ from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User, Video
 from aiohttp import ClientPayloadError
 
 import nexa_guardian.moderator as moderator_module
-from nexa_guardian.ai_contract import AI_MODEL
 from nexa_guardian.ai_review import AIReviewResult, AIReviewTimeout
 from nexa_guardian.config import Settings
 from nexa_guardian.detection import Violation
@@ -23,10 +22,10 @@ from nexa_guardian.moderator import (
     BOT_PROFILE_NAME,
     BOT_PROFILE_SHORT_DESCRIPTION,
     ModerationController,
-    muted_permissions,
     select_photo_preview,
-    stats_cutoffs,
 )
+from nexa_guardian.raffle_service import RaffleService
+from nexa_guardian.status_service import stats_cutoffs
 from nexa_guardian.storage import Storage
 
 UTC = timezone.utc
@@ -150,7 +149,6 @@ def settings(tmp_path: Path, **overrides) -> Settings:
         "block_forwards": False,
         "block_channel_mentions": False,
         "warn_limit": 3,
-        "default_mute_seconds": 3600,
         "notice_ttl_seconds": 0,
         "flood_window_seconds": 8,
         "flood_max_messages": 6,
@@ -206,6 +204,61 @@ async def storage(tmp_path: Path):
     await instance.close()
 
 
+async def warning_count(storage: Storage, chat_id: int, user_id: int) -> int:
+    cursor = await storage.db.execute(
+        "SELECT count FROM warnings WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id),
+    )
+    row = await cursor.fetchone()
+    return int(row["count"]) if row is not None else 0
+
+
+async def recent_ai_decisions(
+    storage: Storage,
+    chat_id: int,
+    *,
+    limit: int,
+) -> tuple[SimpleNamespace, ...]:
+    rows = await storage.db.execute_fetchall(
+        "SELECT * FROM ai_decisions WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+        (chat_id, limit),
+    )
+    items: list[SimpleNamespace] = []
+    for row in rows:
+        values = dict(row)
+        values["is_ad"] = None if values["is_ad"] is None else bool(values["is_ad"])
+        values["cached"] = bool(values["cached"])
+        values["enforced"] = bool(values["enforced"])
+        items.append(SimpleNamespace(**values))
+    return tuple(items)
+
+
+async def seed_trusted_user(
+    storage: Storage,
+    chat_id: int,
+    user_id: int,
+    added_by: int,
+) -> None:
+    await storage.db.execute(
+        "INSERT INTO trusted_users (chat_id, user_id, added_by, created_at) VALUES (?, ?, ?, ?)",
+        (chat_id, user_id, added_by, "2026-08-30T00:00:00+00:00"),
+    )
+    await storage.db.commit()
+
+
+async def seed_allowed_domain(
+    storage: Storage,
+    chat_id: int,
+    domain: str,
+    added_by: int,
+) -> None:
+    await storage.db.execute(
+        "INSERT INTO allowed_domains (chat_id, domain, added_by, created_at) VALUES (?, ?, ?, ?)",
+        (chat_id, domain, added_by, "2026-08-30T00:00:00+00:00"),
+    )
+    await storage.db.commit()
+
+
 async def test_external_link_is_deleted_and_warned(tmp_path: Path, storage: Storage) -> None:
     bot = FakeBot()
     controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
@@ -214,7 +267,7 @@ async def test_external_link_is_deleted_and_warned(tmp_path: Path, storage: Stor
     await controller.moderate_message(group_message(42, "https://evil.example"))
 
     assert bot.deleted == [(-100, 1)]
-    assert await storage.warning_count(-100, 42) == 1
+    assert await warning_count(storage, -100, 42) == 1
     stats = await storage.chat_stats(-100)
     assert stats.deleted == 1
     controller._notice.assert_awaited_once()
@@ -246,46 +299,13 @@ async def test_warn_limit_triggers_automatic_ban(tmp_path: Path, storage: Storag
 
     assert bot.banned == [(-100, 42, True)]
     assert bot.restricted == []
-    assert await storage.warning_count(-100, 42) == 0
+    assert await warning_count(storage, -100, 42) == 0
     stats = await storage.chat_stats(-100)
     assert stats.banned == 1
     assert stats.warned == 1
     notice = controller._notice.await_args.args[1]
     assert "用户已封禁" in notice
     assert "禁言" not in notice
-
-
-async def test_manual_third_warning_bans_and_clears_warning(
-    tmp_path: Path, storage: Storage
-) -> None:
-    admin_id = 7873158072
-    bot = FakeBot(admin_ids={admin_id})
-    controller = ModerationController(
-        bot,
-        settings(
-            tmp_path,
-            authorized_admin_ids=frozenset({admin_id}),
-            warn_limit=1,
-        ),  # type: ignore[arg-type]
-        storage,
-    )
-    message = SimpleNamespace(
-        chat=SimpleNamespace(id=admin_id, type=ChatType.PRIVATE),
-        from_user=SimpleNamespace(id=admin_id),
-        sender_chat=None,
-        text="/warn 42",
-        reply_to_message=None,
-        answer=AsyncMock(),
-    )
-
-    await controller.warn(message)  # type: ignore[arg-type]
-
-    assert bot.banned == [(-100, 42, True)]
-    assert await storage.warning_count(-100, 42) == 0
-    message.answer.assert_awaited_once_with("已警告 <code>42</code>；达到阈值，已封禁。")
-    stats = await storage.chat_stats(-100)
-    assert stats.warned == 1
-    assert stats.banned == 1
 
 
 async def test_admin_and_dry_run_are_not_mutated(tmp_path: Path, storage: Storage) -> None:
@@ -306,25 +326,7 @@ async def test_admin_and_dry_run_are_not_mutated(tmp_path: Path, storage: Storag
     )
     await dry_controller.moderate_message(group_message(43, "https://evil.example", message_id=2))
     assert dry_bot.deleted == []
-    assert await storage.warning_count(-100, 43) == 0
-
-
-def test_muted_permissions_disable_every_sending_capability() -> None:
-    permissions = muted_permissions()
-    sending_fields = (
-        "can_send_messages",
-        "can_send_audios",
-        "can_send_documents",
-        "can_send_photos",
-        "can_send_videos",
-        "can_send_video_notes",
-        "can_send_voice_notes",
-        "can_send_polls",
-        "can_send_other_messages",
-        "can_add_web_page_previews",
-        "can_react_to_messages",
-    )
-    assert all(getattr(permissions, field) is False for field in sending_fields)
+    assert await warning_count(storage, -100, 43) == 0
 
 
 async def test_manual_commands_allow_unique_authorized_anonymous_admin(
@@ -390,34 +392,6 @@ async def test_manual_commands_reject_ambiguous_anonymous_admins(
     anonymous.answer.assert_awaited_once()
 
 
-async def test_private_admin_command_targets_the_only_allowed_group(
-    tmp_path: Path, storage: Storage
-) -> None:
-    admin_id = 7873158072
-    bot = FakeBot(admin_ids={admin_id})
-    controller = ModerationController(
-        bot,
-        settings(tmp_path, authorized_admin_ids=frozenset({admin_id})),  # type: ignore[arg-type]
-        storage,
-    )
-    private_message = SimpleNamespace(
-        chat=SimpleNamespace(id=admin_id, type=ChatType.PRIVATE),
-        from_user=SimpleNamespace(id=admin_id),
-        sender_chat=None,
-        text="/mute 42 2h 私聊管理测试",
-        reply_to_message=None,
-        answer=AsyncMock(),
-    )
-
-    await controller.mute(private_message)  # type: ignore[arg-type]
-
-    assert bot.restricted == [(-100, 42)]
-    private_message.answer.assert_awaited_once_with("已禁言 <code>42</code> 2 小时。")
-    stats = await storage.chat_stats(-100)
-    assert stats.muted == 1
-    assert stats.total_actions == 1
-
-
 async def test_set_commands_syncs_default_and_chinese_profile(
     tmp_path: Path, storage: Storage
 ) -> None:
@@ -461,10 +435,10 @@ async def test_set_commands_does_not_write_matching_profile(
 ) -> None:
     commands = [
         SimpleNamespace(command="help", description="查看极简使用说明"),
-        SimpleNamespace(command="status", description="查看机器人与抽奖状态"),
-        SimpleNamespace(command="del", description="删除消息；all 清理群历史"),
-        SimpleNamespace(command="ban", description="封禁：/ban 用户ID"),
-        SimpleNamespace(command="lottery", description="创建或管理群抽奖"),
+        SimpleNamespace(command="status", description="查看运行状态与管理统计"),
+        SimpleNamespace(command="del", description="删除消息、群历史或成员"),
+        SimpleNamespace(command="ban", description="回复消息或填写用户 ID 封禁"),
+        SimpleNamespace(command="lottery", description="创建或管理关键词抽奖"),
     ]
     bot = SimpleNamespace(
         get_my_commands=AsyncMock(return_value=commands),
@@ -580,17 +554,19 @@ async def test_raffle_keyword_join_is_exact_deletes_source_and_confirms(
     )
     assert await storage.set_raffle_message(raffle.id, 88)
     assert await storage.activate_raffle(raffle.id)
-    original_lookup = storage.active_raffle_for_keyword
-    storage.active_raffle_for_keyword = AsyncMock(wraps=original_lookup)  # type: ignore[method-assign]
+    raffle = await controller.raffle_service.runtime.sync(-100)
+    assert raffle is not None
+    active_lookup = AsyncMock(wraps=storage.active_raffle)
+    storage.active_raffle = active_lookup  # type: ignore[method-assign]
     exact = group_message(42, "  ＮＥＸＡ\u200b  ", message_id=5)
 
-    matched = await controller._raffle_keyword_message(exact)
+    matched = await controller.raffle_service.keyword_filter(exact)
     assert isinstance(matched, dict)
-    assert not await controller._raffle_keyword_message(
+    assert not await controller.raffle_service.keyword_filter(
         group_message(42, "Nexa 参加", message_id=6)
     )
-    await controller.join_lottery_keyword(exact, matched["raffle"])
-    await controller._flush_raffle_card_updates()
+    await controller.raffle_service.join(exact, matched["raffle"])
+    await controller.raffle_service.flush_card_updates()
 
     assert await storage.raffle_entry_ids(raffle.id) == (42,)
     assert bot.deleted == [(-100, 5)]
@@ -600,18 +576,31 @@ async def test_raffle_keyword_join_is_exact_deletes_source_and_confirms(
     )
     assert bot.edited[-1][1] == 88
     assert bot.member_checks == []
-    assert storage.active_raffle_for_keyword.await_count == 1
+    active_lookup.assert_not_awaited()
 
     duplicate = group_message(42, "nexa", message_id=7)
-    duplicate_match = await controller._raffle_keyword_message(duplicate)
+    duplicate_match = await controller.raffle_service.keyword_filter(duplicate)
     assert isinstance(duplicate_match, dict)
-    await controller.join_lottery_keyword(duplicate, duplicate_match["raffle"])
+    await controller.raffle_service.join(duplicate, duplicate_match["raffle"])
     assert await storage.raffle_entry_ids(raffle.id) == (42,)
     assert bot.deleted[-1] == (-100, 7)
     assert bot.sent[-1] == (
         -100,
         '<a href="tg://user?id=42">Member</a>，你已经参与过啦，本次不会重复登记。',
     )
+
+
+async def test_ordinary_short_message_does_not_query_raffle_storage(
+    tmp_path: Path, storage: Storage
+) -> None:
+    controller = ModerationController(RaffleBot(), settings(tmp_path), storage)  # type: ignore[arg-type]
+    active_lookup = AsyncMock(wraps=storage.active_raffle)
+    storage.active_raffle = active_lookup  # type: ignore[method-assign]
+
+    matched = await controller.raffle_service.keyword_filter(group_message(42, "正常聊天"))
+
+    assert matched is False
+    active_lookup.assert_not_awaited()
 
 
 async def test_five_hundred_raffle_joins_coalesce_card_edits(
@@ -630,15 +619,15 @@ async def test_five_hundred_raffle_joins_coalesce_card_edits(
     )
     assert await storage.set_raffle_message(created.id, 88)
     assert await storage.activate_raffle(created.id)
-    raffle = await storage.active_raffle(-100)
+    raffle = await controller.raffle_service.runtime.sync(-100)
     assert raffle is not None
 
     for user_id in range(1_000, 1_500):
-        await controller.join_lottery_keyword(
+        await controller.raffle_service.join(
             group_message(user_id, "参与", message_id=user_id),
             raffle,
         )
-    await controller._flush_raffle_card_updates()
+    await controller.raffle_service.flush_card_updates()
 
     assert await storage.raffle_entry_count(raffle.id) == 500
     assert len(bot.edited) == 1
@@ -649,7 +638,7 @@ async def test_five_hundred_raffle_joins_coalesce_card_edits(
 def test_raffle_participant_mention_prefers_public_username() -> None:
     user = User(id=42, is_bot=False, first_name="Member", username="nexa_member")
 
-    assert ModerationController._raffle_participant_mention(user, 42) == "@nexa_member"
+    assert RaffleService.participant_mention(user, 42) == "@nexa_member"
 
 
 async def test_unique_authorized_anonymous_admin_can_join_keyword_raffle(
@@ -671,6 +660,8 @@ async def test_unique_authorized_anonymous_admin_can_join_keyword_raffle(
     )
     assert await storage.set_raffle_message(raffle.id, 88)
     assert await storage.activate_raffle(raffle.id)
+    raffle = await controller.raffle_service.runtime.sync(-100)
+    assert raffle is not None
     anonymous = Message(
         message_id=9,
         date=datetime.now(UTC),
@@ -680,10 +671,10 @@ async def test_unique_authorized_anonymous_admin_can_join_keyword_raffle(
         text="参与",
     )
 
-    matched = await controller._raffle_keyword_message(anonymous)
+    matched = await controller.raffle_service.keyword_filter(anonymous)
     assert isinstance(matched, dict)
-    await controller.join_lottery_keyword(anonymous, matched["raffle"])
-    await controller._flush_raffle_card_updates()
+    await controller.raffle_service.join(anonymous, matched["raffle"])
+    await controller.raffle_service.flush_card_updates()
 
     assert await storage.raffle_entry_ids(raffle.id) == (7,)
     assert bot.deleted == [(-100, 9)]
@@ -709,11 +700,13 @@ async def test_raffle_end_and_cancel_unpin_exact_card(
     )
     assert await storage.set_raffle_message(raffle.id, 88)
     assert await storage.activate_raffle(raffle.id)
+    raffle = await controller.raffle_service.runtime.sync(-100)
+    assert raffle is not None
 
     if operation == "end":
-        await controller._finalize_raffle(raffle, notify_admin=False)
+        await controller.raffle_service.finalize(raffle, notify_admin=False)
     else:
-        await controller._cancel_active_raffle(-100)
+        await controller.raffle_service.cancel_active(-100)
 
     assert bot.unpinned == [(-100, 88)]
     assert bot.edited[-1][1] == 88
@@ -796,9 +789,7 @@ async def test_private_commands_fail_closed_when_multiple_admins_are_configured(
     private_message.answer.assert_awaited_once_with("私聊管理要求恰好配置一位授权管理员。")
 
 
-async def test_manual_ban_and_kick_ignore_legacy_reason_text(
-    tmp_path: Path, storage: Storage
-) -> None:
+async def test_manual_ban_ignores_legacy_reason_text(tmp_path: Path, storage: Storage) -> None:
     admin_id = 7873158072
     bot = FakeBot(admin_ids={admin_id})
     controller = ModerationController(
@@ -814,45 +805,15 @@ async def test_manual_ban_and_kick_ignore_legacy_reason_text(
         reply_to_message=None,
         answer=AsyncMock(),
     )
-    kick_message = SimpleNamespace(
-        chat=SimpleNamespace(id=admin_id, type=ChatType.PRIVATE),
-        from_user=SimpleNamespace(id=admin_id),
-        sender_chat=None,
-        text="/kick 43 旧原因文本",
-        reply_to_message=None,
-        answer=AsyncMock(),
-    )
-
     await controller.ban(ban_message)  # type: ignore[arg-type]
-    await controller.kick(kick_message)  # type: ignore[arg-type]
 
-    assert bot.banned == [(-100, 42, True), (-100, 43, False)]
-    assert bot.unbanned == [(-100, 43)]
+    assert bot.banned == [(-100, 42, True)]
+    assert bot.unbanned == []
     ban_message.answer.assert_awaited_once_with("已封禁 <code>42</code>。")
-    kick_message.answer.assert_awaited_once_with("已移出 <code>43</code>。")
     rows = await storage.db.execute_fetchall(
         "SELECT reason FROM moderation_log ORDER BY id",
     )
-    assert [row["reason"] for row in rows] == ["", ""]
-
-
-async def test_group_warning_message_has_no_reason(tmp_path: Path, storage: Storage) -> None:
-    admin_id = 7
-    bot = FakeBot(admin_ids={admin_id})
-    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
-    target = SimpleNamespace(id=42, full_name="晴天")
-    message = SimpleNamespace(
-        chat=SimpleNamespace(id=-100, type=ChatType.SUPERGROUP),
-        from_user=SimpleNamespace(id=admin_id),
-        sender_chat=None,
-        text="/warn 旧原因文本",
-        reply_to_message=SimpleNamespace(from_user=target),
-        answer=AsyncMock(),
-    )
-
-    await controller.warn(message)  # type: ignore[arg-type]
-
-    message.answer.assert_awaited_once_with('已警告 <a href="tg://user?id=42">晴天</a>（1/3）。')
+    assert [row["reason"] for row in rows] == [""]
 
 
 def test_stats_cutoffs_use_beijing_calendar_days() -> None:
@@ -860,120 +821,6 @@ def test_stats_cutoffs_use_beijing_calendar_days() -> None:
     today, week = stats_cutoffs(now)
     assert today == "2026-08-26T16:00:00+00:00"
     assert week == "2026-08-20T16:00:00+00:00"
-
-
-async def test_recent_is_private_only_and_contains_no_reason(
-    tmp_path: Path, storage: Storage
-) -> None:
-    admin_id = 7
-    bot = FakeBot(admin_ids={admin_id})
-    controller = ModerationController(
-        bot,
-        settings(tmp_path, authorized_admin_ids=frozenset({admin_id})),  # type: ignore[arg-type]
-        storage,
-    )
-    await storage.record_action(chat_id=-100, action="ban", actor_id=admin_id, target_id=42)
-    group = SimpleNamespace(
-        chat=SimpleNamespace(id=-100, type=ChatType.SUPERGROUP),
-        from_user=SimpleNamespace(id=admin_id),
-        sender_chat=None,
-        text="/recent",
-        answer=AsyncMock(),
-    )
-    private = SimpleNamespace(
-        chat=SimpleNamespace(id=admin_id, type=ChatType.PRIVATE),
-        from_user=SimpleNamespace(id=admin_id),
-        sender_chat=None,
-        text="/recent 1",
-        answer=AsyncMock(),
-    )
-
-    await controller.recent(group)  # type: ignore[arg-type]
-    await controller.recent(private)  # type: ignore[arg-type]
-
-    group.answer.assert_awaited_once_with("为避免公开用户 ID，请私聊机器人使用 /recent。")
-    output = private.answer.await_args.args[0]
-    assert "封禁" in output
-    assert "42" in output
-    assert "原因" not in output
-
-
-async def test_recent_rejects_limit_outside_range(tmp_path: Path, storage: Storage) -> None:
-    admin_id = 7
-    controller = ModerationController(
-        FakeBot(admin_ids={admin_id}),
-        settings(tmp_path, authorized_admin_ids=frozenset({admin_id})),  # type: ignore[arg-type]
-        storage,
-    )
-    message = SimpleNamespace(
-        chat=SimpleNamespace(id=admin_id, type=ChatType.PRIVATE),
-        from_user=SimpleNamespace(id=admin_id),
-        sender_chat=None,
-        text="/recent 31",
-        answer=AsyncMock(),
-    )
-
-    await controller.recent(message)  # type: ignore[arg-type]
-
-    message.answer.assert_awaited_once_with("最近操作数量必须在 1–30 之间。")
-
-
-async def test_manual_word_addition_is_disabled_in_ai_mode(
-    tmp_path: Path, storage: Storage
-) -> None:
-    admin_id = 7
-    controller = ModerationController(
-        FakeBot(admin_ids={admin_id}),
-        settings(tmp_path, authorized_admin_ids=frozenset({admin_id})),  # type: ignore[arg-type]
-        storage,
-    )
-    add = SimpleNamespace(
-        chat=SimpleNamespace(id=admin_id, type=ChatType.PRIVATE),
-        from_user=SimpleNamespace(id=admin_id),
-        sender_chat=None,
-        text='/addword 词语一，"guaranteed profit"\n词语二',
-        answer=AsyncMock(),
-    )
-    await controller.add_word(add)  # type: ignore[arg-type]
-
-    assert await storage.blocked_words(-100) == set()
-    add.answer.assert_awaited_once_with("当前使用 AI 自动学习模式，不接受人工添加拦截词。")
-
-
-async def test_chunked_list_stays_under_telegram_limit(tmp_path: Path, storage: Storage) -> None:
-    controller = ModerationController(FakeBot(), settings(tmp_path), storage)  # type: ignore[arg-type]
-    message = SimpleNamespace(answer=AsyncMock())
-    items = [f"拦截词{index}-" + "长" * 60 for index in range(100)]
-
-    await controller._send_chunked_list(  # type: ignore[arg-type]
-        message,
-        title="拦截词",
-        items=items,
-    )
-
-    assert message.answer.await_count > 1
-    assert all(len(call.args[0]) < 4096 for call in message.answer.await_args_list)
-    assert all("拦截词（100）" in call.args[0] for call in message.answer.await_args_list)
-
-
-async def test_inline_list_displays_words_horizontally(tmp_path: Path, storage: Storage) -> None:
-    controller = ModerationController(FakeBot(), settings(tmp_path), storage)  # type: ignore[arg-type]
-    message = SimpleNamespace(answer=AsyncMock())
-
-    await controller._send_chunked_list(  # type: ignore[arg-type]
-        message,
-        title="拦截词",
-        items=["号池", "供应", "合作", "长期"],
-        inline=True,
-    )
-
-    output = message.answer.await_args.args[0]
-    assert output == (
-        "<b>拦截词（4）</b>\n"
-        "<code>号池</code> · <code>供应</code> · "
-        "<code>合作</code> · <code>长期</code>"
-    )
-    assert "•" not in output
 
 
 async def test_reporter_log_message_contains_no_reason(
@@ -1079,7 +926,7 @@ async def test_member_command_guard_exempts_admin_trusted_and_anonymous_admin(
 ) -> None:
     bot = FakeBot(admin_ids={42})
     controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
-    await storage.add_trusted_user(-100, 43, 42)
+    await seed_trusted_user(storage, -100, 43, 42)
 
     assert await controller._ordinary_member_command(group_message(42, "/help")) is False
     assert await controller._ordinary_member_command(group_message(43, "/help")) is False
@@ -1153,7 +1000,7 @@ async def test_edited_message_changed_to_ad_is_deleted(tmp_path: Path, storage: 
 
     reviewer.review.assert_awaited_once()
     assert bot.deleted == [(-100, 1)]
-    assert await storage.warning_count(-100, 42) == 1
+    assert await warning_count(storage, -100, 42) == 1
 
 
 async def test_ai_exempts_admin_trusted_and_linked_channel_messages(
@@ -1167,7 +1014,7 @@ async def test_ai_exempts_admin_trusted_and_linked_channel_messages(
         storage,
         ai_reviewer=reviewer,  # type: ignore[arg-type]
     )
-    await storage.add_trusted_user(-100, 43, 42)
+    await seed_trusted_user(storage, -100, 43, 42)
 
     await controller.moderate_message(group_message(42, "管理员消息"))
     await controller.moderate_message(group_message(43, "可信用户消息", message_id=2))
@@ -1216,7 +1063,7 @@ async def test_ai_suspicious_ad_shows_review_and_records_warning(
 
     controller._processing_notice.assert_awaited_once()
     assert bot.deleted == [(-100, 1)]
-    assert await storage.warning_count(-100, 42) == 1
+    assert await warning_count(storage, -100, 42) == 1
     moderation = await storage.chat_stats(-100)
     assert moderation.deleted == 1
     assert moderation.warned == 1
@@ -1256,14 +1103,14 @@ async def test_every_successful_ad_persists_safe_candidates_before_enforcement(
     await controller.moderate_message(group_message(42, "免费领取 USDT，合作", message_id=2))
 
     assert bot.deleted == []
-    assert await storage.warning_count(-100, 42) == 0
+    assert await warning_count(storage, -100, 42) == 0
     candidates = await storage.ai_signatures(-100, statuses=("candidate",))
     assert [(item.display_signature, item.hit_count) for item in candidates] == [
         ("免费领取 usdt", 2)
     ]
     rejected = await storage.ai_signatures(-100, statuses=("rejected",))
     assert [(item.display_signature, item.hit_count) for item in rejected] == [("合作", 2)]
-    decisions = await storage.recent_ai_decisions(-100, limit=2)
+    decisions = await recent_ai_decisions(storage, -100, limit=2)
     assert len(decisions) == 2
     assert all(item.is_ad is True and item.enforced is False for item in decisions)
     learning = await storage.ai_learning_memory(-100)
@@ -1469,7 +1316,7 @@ async def test_active_ai_signature_bypasses_gateway(tmp_path: Path, storage: Sto
 
     reviewer.review.assert_not_awaited()
     assert bot.deleted == [(-100, 1)]
-    decisions = await storage.recent_ai_decisions(-100, limit=1)
+    decisions = await recent_ai_decisions(storage, -100, limit=1)
     assert decisions[0].model == "local-signature"
     assert decisions[0].enforced is True
     signatures = await storage.ai_signatures(-100)
@@ -1491,86 +1338,13 @@ async def test_ai_failure_deletes_without_warning(tmp_path: Path, storage: Stora
     await controller.moderate_message(group_message(42, "普通消息"))
 
     assert bot.deleted == [(-100, 1)]
-    assert await storage.warning_count(-100, 42) == 0
+    assert await warning_count(storage, -100, 42) == 0
     assert (await storage.chat_stats(-100)).warned == 0
     assert (await storage.ai_stats(-100)).failed == 1
     controller._notice.assert_awaited_once_with(ANY, "审核服务异常，消息已删除。")
 
 
-async def test_private_ai_management_commands(tmp_path: Path, storage: Storage) -> None:
-    admin_id = 7
-    controller = ModerationController(
-        FakeBot(admin_ids={admin_id}),
-        settings(tmp_path, authorized_admin_ids=frozenset({admin_id})),  # type: ignore[arg-type]
-        storage,
-    )
-    active = await storage.upsert_ai_signature(
-        chat_id=-100,
-        normalized_signature="免费领取 usdt",
-        display_signature="免费领取 USDT",
-        category="crypto_ad",
-        status="active",
-        confidence=0.99,
-    )
-    await storage.upsert_ai_signature(
-        chat_id=-100,
-        normalized_signature="扫码进入广告群",
-        display_signature="扫码进入广告群",
-        category="group_ad",
-        status="candidate",
-        confidence=0.94,
-    )
-    await storage.record_ai_decision(
-        chat_id=-100,
-        message_id=1,
-        target_id=42,
-        is_ad=True,
-        confidence=0.98,
-        category="crypto_ad",
-        model=AI_MODEL,
-        latency_ms=40,
-        cached=False,
-        enforced=True,
-    )
-
-    def private(text: str) -> SimpleNamespace:
-        return SimpleNamespace(
-            chat=SimpleNamespace(id=admin_id, type=ChatType.PRIVATE),
-            from_user=SimpleNamespace(id=admin_id),
-            sender_chat=None,
-            text=text,
-            answer=AsyncMock(),
-        )
-
-    words = private("/words")
-    candidates = private("/aicandidates")
-    stats = private("/aistats")
-    recent = private("/airecent 1")
-    pause = private("/aipause")
-    resume = private("/airesume")
-    delete = private(f"/delword {active.id}")
-
-    await controller.list_words(words)  # type: ignore[arg-type]
-    await controller.ai_candidates(candidates)  # type: ignore[arg-type]
-    await controller.ai_stats(stats)  # type: ignore[arg-type]
-    await controller.ai_recent(recent)  # type: ignore[arg-type]
-    await controller.ai_pause(pause)  # type: ignore[arg-type]
-    assert await storage.runtime_setting(-100, "ai_paused") == "1"
-    await controller.ai_resume(resume)  # type: ignore[arg-type]
-    assert await storage.runtime_setting(-100, "ai_paused") == "0"
-    await controller.delete_word(delete)  # type: ignore[arg-type]
-
-    assert "AI 已学习特征（1）" in words.answer.await_args.args[0]
-    assert "扫码进入广告群" in candidates.answer.await_args.args[0]
-    assert "判断 1｜调用 1" in stats.answer.await_args.args[0]
-    assert "失败率 0.0%" in stats.answer.await_args.args[0]
-    assert "广告" in recent.answer.await_args.args[0]
-    assert AI_MODEL not in recent.answer.await_args.args[0]
-    delete.answer.assert_awaited_once_with("已停用该 AI 特征。")
-    assert await storage.active_ai_signatures(-100) == set()
-
-
-async def test_moderation_policy_and_trust_caches_invalidate_on_change(
+async def test_moderation_policy_cache_invalidates_on_runtime_change(
     tmp_path: Path, storage: Storage
 ) -> None:
     controller = ModerationController(  # type: ignore[arg-type]
@@ -1578,7 +1352,7 @@ async def test_moderation_policy_and_trust_caches_invalidate_on_change(
         settings(tmp_path),
         storage,
     )
-    await storage.add_allowed_domain(-100, "example.com", 7)
+    await seed_allowed_domain(storage, -100, "example.com", 7)
     await storage.upsert_ai_signature(
         chat_id=-100,
         normalized_signature="免费领取 usdt",
@@ -1598,12 +1372,6 @@ async def test_moderation_policy_and_trust_caches_invalidate_on_change(
     await storage.set_runtime_setting(-100, "ai_paused", "1")
     controller._invalidate_policy(-100)
     assert (await controller._moderation_policy(-100)).paused
-
-    assert not await controller._is_trusted(-100, 42)
-    await storage.add_trusted_user(-100, 42, 7)
-    assert not await controller._is_trusted(-100, 42)
-    controller._invalidate_trusted(-100, 42)
-    assert await controller._is_trusted(-100, 42)
 
 
 async def test_policy_invalidation_during_load_retries_with_fresh_state(
@@ -1850,7 +1618,7 @@ async def test_ai_mode_sends_flood_signal_to_gateway_without_local_enforcement(
     assert reviewer.review.await_args_list[0].kwargs["risk_signals"] == ()
     assert reviewer.review.await_args_list[1].kwargs["risk_signals"] == ("flood",)
     assert bot.deleted == []
-    assert await storage.warning_count(-100, 42) == 0
+    assert await warning_count(storage, -100, 42) == 0
     controller._processing_notice.assert_awaited_once()
 
 
@@ -1889,7 +1657,7 @@ async def test_ai_mode_sends_duplicate_signal_to_gateway_without_local_enforceme
     assert reviewer.review.await_count == 2
     assert reviewer.review.await_args_list[1].kwargs["risk_signals"] == ("duplicate",)
     assert bot.deleted == []
-    assert await storage.warning_count(-100, 42) == 0
+    assert await warning_count(storage, -100, 42) == 0
     controller._processing_notice.assert_awaited_once()
 
 
@@ -1942,7 +1710,7 @@ async def test_concurrent_threshold_hits_only_ban_and_clear_once(
 
     assert bot.banned == [(-100, 42, True)]
     assert bot.deleted == [(-100, 1), (-100, 2)]
-    assert await storage.warning_count(-100, 42) == 0
+    assert await warning_count(storage, -100, 42) == 0
     stats = await storage.chat_stats(-100)
     assert stats.warned == 1
     assert stats.banned == 1
@@ -2031,9 +1799,9 @@ async def test_pause_while_ai_is_in_flight_preserves_learning_but_prevents_enfor
     await task
 
     assert bot.deleted == []
-    assert await storage.warning_count(-100, 42) == 0
+    assert await warning_count(storage, -100, 42) == 0
     assert await storage.active_ai_signatures(-100) == {"免费领取 usdt"}
-    decisions = await storage.recent_ai_decisions(-100, limit=1)
+    decisions = await recent_ai_decisions(storage, -100, limit=1)
     assert decisions[0].enforced is False
     processing.edit_text.assert_awaited_once_with("AI 审核已暂停，消息已保留。")
 
@@ -2073,7 +1841,7 @@ async def test_pause_while_gateway_fails_prevents_failure_delete(
     await task
 
     assert bot.deleted == []
-    assert await storage.warning_count(-100, 42) == 0
+    assert await warning_count(storage, -100, 42) == 0
     processing.edit_text.assert_awaited_once_with("AI 审核已暂停，消息已保留。")
 
 
@@ -2165,8 +1933,8 @@ async def test_unavailable_photo_falls_back_to_caption_without_failure_policy(
     assert reviewer.review.await_args.kwargs["image_data_url"] is None
     assert controller._ai_failure_streak == 0
     assert bot.deleted == []
-    assert await storage.warning_count(-100, 42) == 0
-    decision = (await storage.recent_ai_decisions(-100, limit=1))[0]
+    assert await warning_count(storage, -100, 42) == 0
+    decision = (await recent_ai_decisions(storage, -100, limit=1))[0]
     assert decision.is_ad is False
     assert decision.error_type == ""
 
@@ -2190,7 +1958,7 @@ async def test_unavailable_photo_without_caption_is_silently_retained(
     reviewer.review.assert_not_awaited()
     controller._processing_notice.assert_not_awaited()
     assert bot.deleted == []
-    assert await storage.recent_ai_decisions(-100, limit=1) == ()
+    assert await recent_ai_decisions(storage, -100, limit=1) == ()
 
 
 async def test_aiohttp_payload_error_uses_gateway_failure_policy(
@@ -2209,7 +1977,7 @@ async def test_aiohttp_payload_error_uses_gateway_failure_policy(
     await controller.moderate_message(group_message(42, "普通消息"))
 
     assert bot.deleted == [(-100, 1)]
-    decision = (await storage.recent_ai_decisions(-100, limit=1))[0]
+    decision = (await recent_ai_decisions(storage, -100, limit=1))[0]
     assert decision.error_type == "ClientPayloadError"
 
 
@@ -2323,7 +2091,7 @@ async def test_uncertain_low_reasoning_result_is_confirmed_with_high_reasoning(
         "low",
         "high",
     ]
-    decision = (await storage.recent_ai_decisions(-100, limit=1))[0]
+    decision = (await recent_ai_decisions(storage, -100, limit=1))[0]
     assert decision.review_path == "low_to_high"
     assert decision.latency_ms == 40
 
@@ -2382,7 +2150,7 @@ async def test_already_deleted_ad_still_receives_warning(tmp_path: Path, storage
     )
 
     assert enforced is True
-    assert await storage.warning_count(-100, 42) == 1
+    assert await warning_count(storage, -100, 42) == 1
     stats = await storage.chat_stats(-100)
     assert stats.deleted == 1
     assert stats.warned == 1
@@ -2417,33 +2185,7 @@ async def test_learning_write_failure_does_not_undo_ad_enforcement(
     await controller.moderate_message(group_message(42, "免费领取 USDT"))
 
     assert bot.deleted == [(-100, 1)]
-    assert await storage.warning_count(-100, 42) == 1
-
-
-async def test_chat_member_status_accepts_telegram_string_value(
-    tmp_path: Path,
-    storage: Storage,
-) -> None:
-    controller = ModerationController(  # type: ignore[arg-type]
-        FakeBot(),
-        settings(tmp_path),
-        storage,
-    )
-    event = SimpleNamespace(
-        chat=SimpleNamespace(id=-100),
-        date=datetime(2026, 8, 30, 6, 38, 25, tzinfo=UTC),
-        new_chat_member=SimpleNamespace(
-            user=SimpleNamespace(id=42, is_bot=False),
-            status="restricted",
-        ),
-    )
-
-    await controller.chat_member_changed(event)  # type: ignore[arg-type]
-
-    activity = await storage.member_activity(-100, 42)
-    assert activity is not None
-    assert activity.last_status == "restricted"
-    assert activity.last_membership_at == "2026-08-30T06:38:25+00:00"
+    assert await warning_count(storage, -100, 42) == 1
 
 
 def test_photo_preview_uses_smallest_safe_size_at_target() -> None:
