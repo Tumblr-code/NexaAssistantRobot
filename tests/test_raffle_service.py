@@ -335,10 +335,7 @@ async def test_finished_result_is_retried_from_persistent_marker(
         method=EditMessageText(chat_id=GROUP_ID, message_id=88, text="result"),
         message="temporary edit failure",
     )
-    bot.send_message.side_effect = TelegramBadRequest(
-        method=DeleteMessage(chat_id=GROUP_ID, message_id=88),
-        message="temporary send failure",
-    )
+    bot.send_message.return_value = SimpleNamespace(message_id=99)
     runtime_service = service(tmp_path, storage, bot)
 
     await runtime_service.finalize(raffle, notify_admin=False)
@@ -349,12 +346,137 @@ async def test_finished_result_is_retried_from_persistent_marker(
     assert [(item.raffle.id, item.round_number, item.stage) for item in pending] == [
         (raffle.id, 1, "group_only")
     ]
+    assert pending[0].group_message_id == 88
+    assert bot.send_message.await_count == 0
 
     bot.edit_message_text.side_effect = None
     bot.send_message.side_effect = None
     await runtime_service._reroll_latest(GROUP_ID)
 
     assert await storage.pending_raffle_results(chat_ids={GROUP_ID}) == ()
+    assert bot.send_message.await_count == 0
+    assert [call.kwargs["message_id"] for call in bot.edit_message_text.await_args_list] == [
+        88,
+        88,
+    ]
+
+
+async def test_missing_group_result_anchor_is_replaced_without_sending_result_twice(
+    tmp_path: Path,
+    storage: Storage,
+) -> None:
+    raffle = await active_raffle(storage, 41)
+    bot = AsyncMock()
+    bot.get_chat_member.return_value = SimpleNamespace(
+        status=ChatMemberStatus.MEMBER,
+        user=SimpleNamespace(is_bot=False),
+    )
+    bot.unpin_chat_message.return_value = True
+    bot.send_message.return_value = SimpleNamespace(message_id=99)
+
+    async def edit_result(_text: str, *, message_id: int, **_kwargs: object) -> object:
+        if message_id == 88:
+            raise TelegramBadRequest(
+                method=EditMessageText(chat_id=GROUP_ID, message_id=88, text="result"),
+                message="message to edit not found",
+            )
+        return SimpleNamespace(message_id=message_id)
+
+    bot.edit_message_text.side_effect = edit_result
+    runtime_service = service(tmp_path, storage, bot)
+
+    await runtime_service.finalize(raffle, notify_admin=False)
+
+    assert await storage.pending_raffle_results(chat_ids={GROUP_ID}) == ()
+    assert [call.kwargs["message_id"] for call in bot.edit_message_text.await_args_list] == [
+        88,
+        99,
+    ]
+    assert [call.args[1] for call in bot.send_message.await_args_list] == [
+        "🎲 正在生成抽奖结果…",
+    ]
+    queued = await storage.due_ephemeral("2100-01-01T00:00:00+00:00")
+    assert {(item.chat_id, item.message_id) for item in queued} == {
+        (GROUP_ID, 88),
+        (GROUP_ID, 99),
+    }
+
+
+async def test_missing_admin_result_anchor_is_replaced_before_completing_marker(
+    tmp_path: Path,
+    storage: Storage,
+) -> None:
+    raffle = await active_raffle(storage, 41)
+    bot = AsyncMock()
+    bot.get_chat_member.return_value = SimpleNamespace(
+        status=ChatMemberStatus.MEMBER,
+        user=SimpleNamespace(is_bot=False),
+    )
+    bot.unpin_chat_message.return_value = True
+    bot.send_message.side_effect = (
+        SimpleNamespace(message_id=99),
+        SimpleNamespace(message_id=100),
+    )
+
+    async def edit_result(
+        _text: str,
+        *,
+        chat_id: int,
+        message_id: int,
+        **_kwargs: object,
+    ) -> object:
+        if chat_id == 7 and message_id == 99:
+            raise TelegramBadRequest(
+                method=EditMessageText(chat_id=7, message_id=99, text="result"),
+                message="message to edit not found",
+            )
+        return SimpleNamespace(message_id=message_id)
+
+    bot.edit_message_text.side_effect = edit_result
+    runtime_service = service(tmp_path, storage, bot)
+
+    await runtime_service.finalize(raffle, notify_admin=True)
+
+    assert await storage.pending_raffle_results(chat_ids={GROUP_ID}) == ()
+    assert [call.kwargs["message_id"] for call in bot.edit_message_text.await_args_list] == [
+        88,
+        99,
+        100,
+    ]
+    assert (
+        await storage.runtime_setting(
+            GROUP_ID,
+            f"raffle_admin_result_message:{raffle.id}",
+        )
+        == "100"
+    )
+
+
+async def test_legacy_pending_result_creates_missing_admin_anchor(
+    tmp_path: Path,
+    storage: Storage,
+) -> None:
+    raffle = await active_raffle(storage, 41)
+    assert await storage.finish_raffle(
+        raffle.id,
+        (41,),
+        result_delivery_stage="group_and_admin",
+    )
+    pending = (await storage.pending_raffle_results(chat_ids={GROUP_ID}))[0]
+    assert pending.group_message_id == 88
+    assert pending.admin_message_id is None
+    bot = AsyncMock()
+    bot.unpin_chat_message.return_value = True
+    bot.send_message.return_value = SimpleNamespace(message_id=100)
+    runtime_service = service(tmp_path, storage, bot)
+
+    await runtime_service._recover_pending_results(force=True)
+
+    assert await storage.pending_raffle_results(chat_ids={GROUP_ID}) == ()
+    assert [call.kwargs["message_id"] for call in bot.edit_message_text.await_args_list] == [
+        88,
+        100,
+    ]
 
 
 async def test_admin_delivery_retry_does_not_repeat_group_result(
@@ -369,7 +491,12 @@ async def test_admin_delivery_retry_does_not_repeat_group_result(
     )
     bot.unpin_chat_message.return_value = True
 
-    async def fail_admin(chat_id: int, _text: str, **_kwargs: object) -> object:
+    bot.send_message.side_effect = (
+        SimpleNamespace(message_id=99),
+        SimpleNamespace(message_id=100),
+    )
+
+    async def fail_admin(_text: str, *, chat_id: int, **_kwargs: object) -> object:
         if chat_id == 7:
             raise TelegramBadRequest(
                 method=DeleteMessage(chat_id=7, message_id=1),
@@ -377,7 +504,7 @@ async def test_admin_delivery_retry_does_not_repeat_group_result(
             )
         return SimpleNamespace(message_id=99)
 
-    bot.send_message.side_effect = fail_admin
+    bot.edit_message_text.side_effect = fail_admin
     runtime_service = service(tmp_path, storage, bot)
 
     await runtime_service.finalize(raffle, notify_admin=True)
@@ -386,16 +513,25 @@ async def test_admin_delivery_retry_does_not_repeat_group_result(
     assert [(item.raffle.id, item.round_number, item.stage) for item in pending] == [
         (raffle.id, 1, "admin_only")
     ]
-    assert bot.edit_message_text.await_count == 1
+    assert bot.edit_message_text.await_count == 2
+    assert (
+        sum(call.kwargs["chat_id"] == GROUP_ID for call in bot.edit_message_text.await_args_list)
+        == 1
+    )
 
     bot.send_message.side_effect = None
+    bot.edit_message_text.side_effect = None
     await runtime_service._recover_pending_results(force=True)
 
     assert await storage.pending_raffle_results(chat_ids={GROUP_ID}) == ()
-    assert bot.edit_message_text.await_count == 1
+    assert bot.edit_message_text.await_count == 3
+    assert (
+        sum(call.kwargs["chat_id"] == GROUP_ID for call in bot.edit_message_text.await_args_list)
+        == 1
+    )
 
 
-async def test_group_delivery_failure_still_notifies_admin_once(
+async def test_group_delivery_failure_waits_before_editing_admin_result(
     tmp_path: Path,
     storage: Storage,
 ) -> None:
@@ -406,20 +542,76 @@ async def test_group_delivery_failure_still_notifies_admin_once(
         user=SimpleNamespace(is_bot=False),
     )
     bot.unpin_chat_message.return_value = False
+    bot.send_message.side_effect = (
+        SimpleNamespace(message_id=99),
+        SimpleNamespace(message_id=100),
+    )
     runtime_service = service(tmp_path, storage, bot)
 
     await runtime_service.finalize(raffle, notify_admin=True)
 
     pending = await storage.pending_raffle_results(chat_ids={GROUP_ID})
-    assert [(item.round_number, item.stage) for item in pending] == [(1, "group_only")]
-    bot.send_message.assert_awaited_once()
-    assert bot.send_message.await_args.args[0] == 7
+    assert [(item.round_number, item.stage) for item in pending] == [(1, "group_and_admin")]
+    bot.edit_message_text.assert_not_awaited()
 
     bot.unpin_chat_message.return_value = True
     await runtime_service._recover_pending_results(force=True)
 
     assert await storage.pending_raffle_results(chat_ids={GROUP_ID}) == ()
+    assert bot.edit_message_text.await_count == 2
+    assert [call.kwargs["chat_id"] for call in bot.edit_message_text.await_args_list] == [
+        GROUP_ID,
+        7,
+    ]
+
+
+async def test_result_recovery_reuses_fixed_message_anchors_after_marker_failure(
+    tmp_path: Path,
+    storage: Storage,
+) -> None:
+    raffle = await active_raffle(storage, 41)
+    bot = AsyncMock()
+    bot.get_chat_member.return_value = SimpleNamespace(
+        status=ChatMemberStatus.MEMBER,
+        user=SimpleNamespace(is_bot=False),
+    )
+    bot.unpin_chat_message.return_value = True
+    bot.send_message.side_effect = (
+        SimpleNamespace(message_id=99),
+        SimpleNamespace(message_id=100),
+    )
+    runtime_service = service(tmp_path, storage, bot)
+    original_complete = storage.complete_pending_raffle_result
+    complete_calls = 0
+
+    async def fail_first_complete(pending):  # type: ignore[no-untyped-def]
+        nonlocal complete_calls
+        complete_calls += 1
+        if complete_calls == 1:
+            return False
+        return await original_complete(pending)
+
+    storage.complete_pending_raffle_result = fail_first_complete  # type: ignore[method-assign]
+
+    await runtime_service.finalize(raffle, notify_admin=True)
+
+    pending = await storage.pending_raffle_results(chat_ids={GROUP_ID})
+    assert [(item.round_number, item.stage) for item in pending] == [(1, "admin_only")]
     assert bot.send_message.await_count == 1
+    assert [call.kwargs["message_id"] for call in bot.edit_message_text.await_args_list] == [
+        88,
+        99,
+    ]
+
+    await runtime_service._recover_pending_results(force=True)
+
+    assert await storage.pending_raffle_results(chat_ids={GROUP_ID}) == ()
+    assert bot.send_message.await_count == 1
+    assert [call.kwargs["message_id"] for call in bot.edit_message_text.await_args_list] == [
+        88,
+        99,
+        99,
+    ]
 
 
 async def test_reroll_result_is_recovered_without_creating_another_round(
@@ -438,9 +630,9 @@ async def test_reroll_result_is_recovered_without_creating_another_round(
         method=EditMessageText(chat_id=GROUP_ID, message_id=88, text="result"),
         message="temporary edit failure",
     )
-    bot.send_message.side_effect = TelegramBadRequest(
-        method=DeleteMessage(chat_id=GROUP_ID, message_id=88),
-        message="temporary send failure",
+    bot.send_message.side_effect = (
+        SimpleNamespace(message_id=99),
+        SimpleNamespace(message_id=100),
     )
     runtime_service = service(tmp_path, storage, bot)
 

@@ -5,9 +5,10 @@ import math
 import unicodedata
 from collections.abc import AsyncIterator, Collection, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal
 
 import aiosqlite
 
@@ -389,6 +390,9 @@ class PendingRaffleResult:
     raffle: Raffle
     round_number: int
     stage: str
+    group_message_id: int | None = None
+    admin_message_id: int | None = None
+    marker_value: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,6 +401,31 @@ class RaffleWinner:
     position: int
     user_id: int
     selected_at: str
+
+
+RAFFLE_RESULT_STAGES = frozenset({"group_only", "group_and_admin", "admin_only"})
+
+
+def _positive_message_id(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        message_id = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return message_id if message_id > 0 else None
+
+
+def _raffle_result_marker_key(raffle_id: int, round_number: int) -> str:
+    return f"raffle_result_pending:{raffle_id}:{round_number}"
+
+
+def _raffle_result_group_key(raffle_id: int, round_number: int) -> str:
+    return f"raffle_result_group_message:{raffle_id}:{round_number}"
+
+
+def _raffle_result_admin_key(raffle_id: int, round_number: int) -> str:
+    return f"raffle_result_admin_message:{raffle_id}:{round_number}"
 
 
 class Storage:
@@ -1759,6 +1788,8 @@ class Storage:
         winners: Sequence[int],
         *,
         result_delivery_stage: str | None = None,
+        result_group_message_id: int | None = None,
+        result_admin_message_id: int | None = None,
     ) -> bool:
         if result_delivery_stage not in {None, "group_only", "group_and_admin"}:
             raise ValueError("invalid raffle result delivery stage")
@@ -1785,6 +1816,15 @@ class Storage:
                 ),
             )
             if result_delivery_stage is not None:
+                effective_group_message_id = result_group_message_id
+                if effective_group_message_id is None:
+                    message_cursor = await db.execute(
+                        "SELECT message_id FROM raffles WHERE id = ?",
+                        (raffle_id,),
+                    )
+                    message_row = await message_cursor.fetchone()
+                    if message_row is not None and message_row["message_id"] is not None:
+                        effective_group_message_id = int(message_row["message_id"])
                 await db.execute(
                     """
                     INSERT INTO runtime_settings (chat_id, key, value, updated_at)
@@ -1794,12 +1834,52 @@ class Storage:
                         updated_at = excluded.updated_at
                     """,
                     (
-                        f"raffle_result_pending:{raffle_id}:1",
+                        _raffle_result_marker_key(raffle_id, 1),
                         result_delivery_stage,
                         timestamp,
                         raffle_id,
                     ),
                 )
+                if effective_group_message_id is not None:
+                    await db.execute(
+                        """
+                        INSERT INTO runtime_settings (chat_id, key, value, updated_at)
+                        SELECT chat_id, ?, ?, ? FROM raffles WHERE id = ?
+                        ON CONFLICT(chat_id, key) DO UPDATE SET
+                            value = excluded.value,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            _raffle_result_group_key(raffle_id, 1),
+                            str(effective_group_message_id),
+                            timestamp,
+                            raffle_id,
+                        ),
+                    )
+                    await db.execute(
+                        """
+                        DELETE FROM ephemeral_bot_messages
+                        WHERE chat_id = (SELECT chat_id FROM raffles WHERE id = ?)
+                          AND message_id = ?
+                        """,
+                        (raffle_id, effective_group_message_id),
+                    )
+                if result_admin_message_id is not None:
+                    await db.execute(
+                        """
+                        INSERT INTO runtime_settings (chat_id, key, value, updated_at)
+                        SELECT chat_id, ?, ?, ? FROM raffles WHERE id = ?
+                        ON CONFLICT(chat_id, key) DO UPDATE SET
+                            value = excluded.value,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            _raffle_result_admin_key(raffle_id, 1),
+                            str(result_admin_message_id),
+                            timestamp,
+                            raffle_id,
+                        ),
+                    )
         return True
 
     async def pending_raffle_results(
@@ -1851,14 +1931,218 @@ class Storage:
             round_number = int(row["result_round"])
             if round_number < 1:
                 continue
+            marker_value = str(row["result_delivery_stage"])
+            group_setting = await self.runtime_setting(
+                int(row["chat_id"]),
+                _raffle_result_group_key(int(row["id"]), round_number),
+            )
+            admin_setting = await self.runtime_setting(
+                int(row["chat_id"]),
+                _raffle_result_admin_key(int(row["id"]), round_number),
+            )
+            group_message_id = _positive_message_id(group_setting)
+            if group_message_id is None:
+                group_message_id = _positive_message_id(row["message_id"])
+            admin_message_id = _positive_message_id(admin_setting)
             pending.append(
                 PendingRaffleResult(
                     raffle=self._raffle_from_row(row),
                     round_number=round_number,
-                    stage=str(row["result_delivery_stage"]),
+                    stage=marker_value,
+                    group_message_id=group_message_id,
+                    admin_message_id=admin_message_id,
+                    marker_value=marker_value,
                 )
             )
         return tuple(pending)
+
+    async def update_pending_raffle_result(
+        self,
+        pending: PendingRaffleResult,
+        *,
+        stage: str,
+        group_delete_at: str | None = None,
+    ) -> PendingRaffleResult | None:
+        if stage not in RAFFLE_RESULT_STAGES:
+            raise ValueError("invalid raffle result delivery stage")
+        key = _raffle_result_marker_key(pending.raffle.id, pending.round_number)
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                UPDATE runtime_settings
+                SET value = ?, updated_at = ?
+                WHERE chat_id = ? AND key = ? AND value = ?
+                """,
+                (stage, utc_now(), pending.raffle.chat_id, key, pending.marker_value),
+            )
+            if (
+                cursor.rowcount == 1
+                and group_delete_at is not None
+                and pending.group_message_id is not None
+            ):
+                await db.execute(
+                    """
+                    INSERT INTO ephemeral_bot_messages (chat_id, message_id, delete_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id, message_id) DO NOTHING
+                    """,
+                    (
+                        pending.raffle.chat_id,
+                        pending.group_message_id,
+                        group_delete_at,
+                    ),
+                )
+        if cursor.rowcount != 1:
+            return None
+        return PendingRaffleResult(
+            raffle=pending.raffle,
+            round_number=pending.round_number,
+            stage=stage,
+            group_message_id=pending.group_message_id,
+            admin_message_id=pending.admin_message_id,
+            marker_value=stage,
+        )
+
+    async def touch_pending_raffle_result(self, pending: PendingRaffleResult) -> bool:
+        key = _raffle_result_marker_key(pending.raffle.id, pending.round_number)
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                UPDATE runtime_settings
+                SET updated_at = ?
+                WHERE chat_id = ? AND key = ? AND value = ?
+                """,
+                (utc_now(), pending.raffle.chat_id, key, pending.marker_value),
+            )
+        return cursor.rowcount == 1
+
+    async def bind_pending_raffle_result_anchor(
+        self,
+        pending: PendingRaffleResult,
+        *,
+        target: Literal["group", "admin"],
+        message_id: int,
+    ) -> PendingRaffleResult | None:
+        """CAS-bind a replacement message without losing a concurrent winner."""
+
+        if target not in {"group", "admin"}:
+            raise ValueError("invalid raffle result anchor target")
+        if isinstance(message_id, bool) or message_id <= 0:
+            raise ValueError("invalid raffle result anchor message id")
+        marker_key = _raffle_result_marker_key(
+            pending.raffle.id,
+            pending.round_number,
+        )
+        anchor_key = (
+            _raffle_result_group_key(pending.raffle.id, pending.round_number)
+            if target == "group"
+            else _raffle_result_admin_key(pending.raffle.id, pending.round_number)
+        )
+        expected_message_id = (
+            pending.group_message_id if target == "group" else pending.admin_message_id
+        )
+        timestamp = utc_now()
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO runtime_settings (chat_id, key, value, updated_at)
+                SELECT ?, ?, ?, ?
+                WHERE EXISTS (
+                    SELECT 1 FROM runtime_settings
+                    WHERE chat_id = ? AND key = ? AND value = ?
+                )
+                  AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM runtime_settings
+                        WHERE chat_id = ? AND key = ?
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM runtime_settings
+                        WHERE chat_id = ? AND key = ?
+                          AND (value = ? OR value = ?)
+                    )
+                  )
+                ON CONFLICT(chat_id, key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    pending.raffle.chat_id,
+                    anchor_key,
+                    str(message_id),
+                    timestamp,
+                    pending.raffle.chat_id,
+                    marker_key,
+                    pending.marker_value,
+                    pending.raffle.chat_id,
+                    anchor_key,
+                    pending.raffle.chat_id,
+                    anchor_key,
+                    str(expected_message_id) if expected_message_id is not None else None,
+                    str(message_id),
+                ),
+            )
+            if cursor.rowcount == 1 and target == "group":
+                await db.execute(
+                    """
+                    DELETE FROM ephemeral_bot_messages
+                    WHERE chat_id = ? AND message_id = ?
+                    """,
+                    (pending.raffle.chat_id, message_id),
+                )
+        if cursor.rowcount != 1:
+            return None
+        if target == "group":
+            return replace(pending, group_message_id=message_id)
+        return replace(pending, admin_message_id=message_id)
+
+    async def complete_pending_raffle_result(
+        self,
+        pending: PendingRaffleResult,
+        *,
+        group_delete_at: str | None = None,
+    ) -> bool:
+        key = _raffle_result_marker_key(pending.raffle.id, pending.round_number)
+        async with self._write_transaction() as db:
+            cursor = await db.execute(
+                """
+                DELETE FROM runtime_settings
+                WHERE chat_id = ? AND key = ? AND value = ?
+                """,
+                (pending.raffle.chat_id, key, pending.marker_value),
+            )
+            if cursor.rowcount == 1:
+                if group_delete_at is not None and pending.group_message_id is not None:
+                    await db.execute(
+                        """
+                        INSERT INTO ephemeral_bot_messages (chat_id, message_id, delete_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(chat_id, message_id) DO NOTHING
+                        """,
+                        (
+                            pending.raffle.chat_id,
+                            pending.group_message_id,
+                            group_delete_at,
+                        ),
+                    )
+                await db.execute(
+                    """
+                    DELETE FROM runtime_settings
+                    WHERE chat_id = ? AND key IN (?, ?)
+                    """,
+                    (
+                        pending.raffle.chat_id,
+                        _raffle_result_group_key(
+                            pending.raffle.id,
+                            pending.round_number,
+                        ),
+                        _raffle_result_admin_key(
+                            pending.raffle.id,
+                            pending.round_number,
+                        ),
+                    ),
+                )
+        return cursor.rowcount == 1
 
     async def cancel_raffle(self, raffle_id: int) -> bool:
         async with self._write_transaction() as db:
@@ -1877,6 +2161,8 @@ class Storage:
         winners: Sequence[int],
         *,
         result_delivery_stage: str | None = None,
+        result_group_message_id: int | None = None,
+        result_admin_message_id: int | None = None,
     ) -> int:
         if result_delivery_stage not in {None, "group_only", "group_and_admin"}:
             raise ValueError("invalid raffle result delivery stage")
@@ -1903,6 +2189,15 @@ class Storage:
                 ),
             )
             if result_delivery_stage is not None:
+                effective_group_message_id = result_group_message_id
+                if effective_group_message_id is None:
+                    message_cursor = await db.execute(
+                        "SELECT message_id FROM raffles WHERE id = ?",
+                        (raffle_id,),
+                    )
+                    message_row = await message_cursor.fetchone()
+                    if message_row is not None and message_row["message_id"] is not None:
+                        effective_group_message_id = int(message_row["message_id"])
                 await db.execute(
                     """
                     INSERT INTO runtime_settings (chat_id, key, value, updated_at)
@@ -1912,12 +2207,52 @@ class Storage:
                         updated_at = excluded.updated_at
                     """,
                     (
-                        f"raffle_result_pending:{raffle_id}:{next_round}",
+                        _raffle_result_marker_key(raffle_id, next_round),
                         result_delivery_stage,
                         timestamp,
                         raffle_id,
                     ),
                 )
+                if effective_group_message_id is not None:
+                    await db.execute(
+                        """
+                        INSERT INTO runtime_settings (chat_id, key, value, updated_at)
+                        SELECT chat_id, ?, ?, ? FROM raffles WHERE id = ?
+                        ON CONFLICT(chat_id, key) DO UPDATE SET
+                            value = excluded.value,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            _raffle_result_group_key(raffle_id, next_round),
+                            str(effective_group_message_id),
+                            timestamp,
+                            raffle_id,
+                        ),
+                    )
+                    await db.execute(
+                        """
+                        DELETE FROM ephemeral_bot_messages
+                        WHERE chat_id = (SELECT chat_id FROM raffles WHERE id = ?)
+                          AND message_id = ?
+                        """,
+                        (raffle_id, effective_group_message_id),
+                    )
+                if result_admin_message_id is not None:
+                    await db.execute(
+                        """
+                        INSERT INTO runtime_settings (chat_id, key, value, updated_at)
+                        SELECT chat_id, ?, ?, ? FROM raffles WHERE id = ?
+                        ON CONFLICT(chat_id, key) DO UPDATE SET
+                            value = excluded.value,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            _raffle_result_admin_key(raffle_id, next_round),
+                            str(result_admin_message_id),
+                            timestamp,
+                            raffle_id,
+                        ),
+                    )
         return next_round
 
     async def raffle_winners(

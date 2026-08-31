@@ -134,6 +134,112 @@ async def test_pending_raffle_results_are_sorted_by_numeric_round(storage: Stora
     assert [item.round_number for item in pending] == [2, 10]
 
 
+async def test_pending_raffle_result_anchor_state_uses_compare_and_swap(
+    storage: Storage,
+) -> None:
+    raffle = await storage.create_raffle(
+        chat_id=-100,
+        creator_id=7,
+        keyword="参与",
+        prize="GiftPass",
+        winner_count=1,
+        ends_at="2099-01-01T00:00:00+00:00",
+    )
+    assert await storage.set_raffle_message(raffle.id, 88)
+    assert await storage.activate_raffle(raffle.id)
+    assert await storage.finish_raffle(
+        raffle.id,
+        (41,),
+        result_delivery_stage="group_and_admin",
+        result_group_message_id=99,
+        result_admin_message_id=100,
+    )
+    pending = (await storage.pending_raffle_results(chat_ids={-100}))[0]
+    assert pending.group_message_id == 99
+    assert pending.admin_message_id == 100
+    assert pending.marker_value == "group_and_admin"
+
+    admin_pending = await storage.update_pending_raffle_result(
+        pending,
+        stage="admin_only",
+        group_delete_at="2099-01-01T00:00:00+00:00",
+    )
+
+    assert admin_pending is not None and admin_pending.stage == "admin_only"
+    due = await storage.due_ephemeral("2100-01-01T00:00:00+00:00")
+    assert [(item.chat_id, item.message_id) for item in due] == [(-100, 99)]
+    assert await storage.update_pending_raffle_result(pending, stage="group_only") is None
+    assert not await storage.complete_pending_raffle_result(pending)
+    assert await storage.complete_pending_raffle_result(admin_pending)
+    assert await storage.pending_raffle_results(chat_ids={-100}) == ()
+
+
+async def test_pending_raffle_anchor_binding_is_atomic_and_rejects_stale_writers(
+    storage: Storage,
+) -> None:
+    raffle = await storage.create_raffle(
+        chat_id=-100,
+        creator_id=7,
+        keyword="参与",
+        prize="GiftPass",
+        winner_count=1,
+        ends_at="2099-01-01T00:00:00+00:00",
+    )
+    assert await storage.set_raffle_message(raffle.id, 88)
+    assert await storage.activate_raffle(raffle.id)
+    assert await storage.finish_raffle(
+        raffle.id,
+        (41,),
+        result_delivery_stage="group_and_admin",
+        result_group_message_id=99,
+    )
+    pending = (await storage.pending_raffle_results(chat_ids={-100}))[0]
+    assert pending.admin_message_id is None
+    await storage.enqueue_ephemeral(-100, 101, "2099-01-01T00:00:00+00:00")
+    await storage.enqueue_ephemeral(-100, 102, "2099-01-01T00:00:00+00:00")
+
+    rebound = await storage.bind_pending_raffle_result_anchor(
+        pending,
+        target="group",
+        message_id=101,
+    )
+    stale = await storage.bind_pending_raffle_result_anchor(
+        pending,
+        target="group",
+        message_id=102,
+    )
+
+    assert rebound is not None and rebound.group_message_id == 101
+    assert stale is None
+    due = await storage.due_ephemeral("2100-01-01T00:00:00+00:00")
+    assert [(item.chat_id, item.message_id) for item in due] == [(-100, 102)]
+    assert (
+        await storage.bind_pending_raffle_result_anchor(
+            rebound,
+            target="group",
+            message_id=101,
+        )
+        is not None
+    )
+
+    with_admin = await storage.bind_pending_raffle_result_anchor(
+        rebound,
+        target="admin",
+        message_id=200,
+    )
+    assert with_admin is not None and with_admin.admin_message_id == 200
+
+    assert await storage.complete_pending_raffle_result(with_admin)
+    assert (
+        await storage.bind_pending_raffle_result_anchor(
+            with_admin,
+            target="admin",
+            message_id=201,
+        )
+        is None
+    )
+
+
 def test_raffle_keyword_normalization_is_exact_and_rejects_unsafe_values() -> None:
     assert normalize_raffle_keyword("  ＮＥＸＡ\u200b  ") == "nexa"
     assert normalize_raffle_keyword("参与") == "参与"

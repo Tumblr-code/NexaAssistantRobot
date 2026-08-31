@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus, ChatType
@@ -19,6 +20,7 @@ from nexa_guardian.admin import AdminService
 from nexa_guardian.commands import command_payload
 from nexa_guardian.config import Settings
 from nexa_guardian.detection import parse_duration
+from nexa_guardian.ephemeral import suspend_ephemeral_tracking
 from nexa_guardian.raffle_runtime import RaffleRuntime, verify_raffle_members
 from nexa_guardian.status_service import action_time
 from nexa_guardian.storage import PendingRaffleResult, Raffle, Storage
@@ -32,6 +34,11 @@ RAFFLE_WORKER_INTERVAL_SECONDS = 2.0
 RAFFLE_CARD_DEBOUNCE_SECONDS = 2.0
 RAFFLE_CARD_RECONCILE_SECONDS = 60.0
 RAFFLE_RESULT_RETRY_SECONDS = 30
+RAFFLE_RESULT_ANCHOR_TEXT = "🎲 正在生成抽奖结果…"
+
+
+class _RaffleResultAnchorMissing(RuntimeError):
+    pass
 
 
 class RaffleService:
@@ -285,6 +292,7 @@ class RaffleService:
             )
             if not pinned:
                 raise RuntimeError("Telegram 未确认置顶")
+            await self._ensure_admin_result_placeholder(raffle)
             if not await self.storage.activate_raffle(raffle.id):
                 raise RuntimeError("抽奖激活失败")
             active = replace(
@@ -296,7 +304,7 @@ class RaffleService:
                 raise RuntimeError("抽奖缓存激活失败")
             await self._keep_card_persistent(raffle.chat_id, card.message_id)
             return active
-        except (TelegramAPIError, RuntimeError):
+        except Exception:
             self.runtime.drop(raffle.chat_id, raffle_id=raffle.id)
             if card is not None:
                 if pinned:
@@ -307,6 +315,11 @@ class RaffleService:
                         )
                 await self._delete_card_or_expire(raffle.chat_id, card.message_id)
             await self.storage.discard_pending_raffle(raffle.id)
+            await self._cancel_admin_result_placeholder(
+                raffle,
+                text=f"抽奖 #{raffle.id} 发布未完成，已取消。",
+                remove_setting=True,
+            )
             logger.exception(
                 "发布抽奖卡片失败 chat_id=%s raffle_id=%s",
                 raffle.chat_id,
@@ -555,6 +568,11 @@ class RaffleService:
                 await self._unpin(raffle)
                 await self._delete_card_or_expire(raffle.chat_id, raffle.message_id)
             await self.storage.discard_pending_raffle(raffle.id)
+            await self._cancel_admin_result_placeholder(
+                raffle,
+                text=f"抽奖 #{raffle.id} 发布未完成，已取消。",
+                remove_setting=True,
+            )
 
     async def _delete_card_or_expire(self, chat_id: int, message_id: int) -> None:
         try:
@@ -596,17 +614,23 @@ class RaffleService:
     async def _schedule_card_cleanup(self, raffle: Raffle) -> None:
         if raffle.message_id is None:
             return
-        delete_at = (
-            datetime.now(UTC) + timedelta(seconds=self.settings.notice_ttl_seconds)
-        ).isoformat(timespec="microseconds")
+        await self._schedule_message_cleanup(raffle.chat_id, raffle.message_id)
+
+    async def _schedule_message_cleanup(self, chat_id: int, message_id: int) -> None:
+        delete_at = self._message_cleanup_deadline()
         try:
-            await self.storage.enqueue_ephemeral(raffle.chat_id, raffle.message_id, delete_at)
+            await self.storage.enqueue_ephemeral(chat_id, message_id, delete_at)
         except Exception:
             logger.exception(
-                "抽奖结果清理入队失败 chat_id=%s raffle_id=%s",
-                raffle.chat_id,
-                raffle.id,
+                "抽奖结果清理入队失败 chat_id=%s message_id=%s",
+                chat_id,
+                message_id,
             )
+
+    def _message_cleanup_deadline(self) -> str:
+        return (datetime.now(UTC) + timedelta(seconds=self.settings.notice_ttl_seconds)).isoformat(
+            timespec="microseconds"
+        )
 
     async def _valid_entries(self, raffle: Raffle) -> tuple[int, ...]:
         user_ids = await self.storage.raffle_entry_ids(raffle.id)
@@ -638,26 +662,200 @@ class RaffleService:
             candidates = await self._valid_entries(current)
             winner_total = min(current.winner_count, len(candidates))
             winners = tuple(secrets.SystemRandom().sample(candidates, winner_total))
-            delivery_stage = "group_and_admin" if notify_admin else "group_only"
+            result_anchor_id = current.message_id
+            if result_anchor_id is None:
+                result_anchor_id = await self._create_group_result_anchor(current)
+            if result_anchor_id is None:
+                return
+            admin_message_id = (
+                await self._ensure_admin_result_placeholder(current) if notify_admin else None
+            )
+            delivery_stage = "group_and_admin" if admin_message_id is not None else "group_only"
             if not await self.storage.finish_raffle(
                 current.id,
                 winners,
                 result_delivery_stage=delivery_stage,
+                result_group_message_id=result_anchor_id,
+                result_admin_message_id=admin_message_id,
             ):
                 return
             self.runtime.drop(current.chat_id, raffle_id=current.id)
-            await self._deliver_pending_result(
-                PendingRaffleResult(
-                    raffle=current,
-                    round_number=1,
-                    stage=delivery_stage,
-                ),
-                winners=winners,
+            pending = await self.storage.pending_raffle_results(
+                chat_ids={current.chat_id},
+                raffle_id=current.id,
             )
+            first_round = next((item for item in pending if item.round_number == 1), None)
+            if first_round is not None:
+                await self._deliver_pending_result(first_round, winners=winners)
 
     @staticmethod
-    def _result_setting_key(raffle_id: int, round_number: int) -> str:
-        return f"raffle_result_pending:{raffle_id}:{round_number}"
+    def _admin_result_setting_key(raffle_id: int) -> str:
+        return f"raffle_admin_result_message:{raffle_id}"
+
+    async def _create_group_result_anchor(self, raffle: Raffle) -> int | None:
+        try:
+            with suspend_ephemeral_tracking():
+                result_anchor = await self.bot.send_message(
+                    raffle.chat_id,
+                    RAFFLE_RESULT_ANCHOR_TEXT,
+                )
+        except TelegramAPIError:
+            logger.warning(
+                "创建抽奖结果消息锚点失败 chat_id=%s raffle_id=%s",
+                raffle.chat_id,
+                raffle.id,
+            )
+            return None
+        message_id = getattr(result_anchor, "message_id", None)
+        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            logger.warning(
+                "Telegram 未返回有效抽奖结果消息锚点 chat_id=%s raffle_id=%s",
+                raffle.chat_id,
+                raffle.id,
+            )
+            return None
+        try:
+            await self.storage.enqueue_ephemeral(
+                raffle.chat_id,
+                message_id,
+                self._message_cleanup_deadline(),
+            )
+        except Exception:
+            logger.exception(
+                "抽奖结果消息锚点清理入队失败 chat_id=%s raffle_id=%s",
+                raffle.chat_id,
+                raffle.id,
+            )
+            with contextlib.suppress(TelegramAPIError):
+                await self.bot.delete_message(raffle.chat_id, message_id)
+            return None
+        return message_id
+
+    async def _ensure_admin_result_placeholder(self, raffle: Raffle) -> int | None:
+        if len(self.settings.authorized_admin_ids) != 1:
+            return None
+        key = self._admin_result_setting_key(raffle.id)
+        current = await self.storage.runtime_setting(raffle.chat_id, key)
+        if current is not None:
+            try:
+                message_id = int(current)
+            except ValueError:
+                message_id = 0
+            if message_id > 0:
+                return message_id
+
+        await self.storage.set_runtime_setting(raffle.chat_id, key, "creating")
+        message_id = await self._send_admin_result_placeholder(raffle)
+        if message_id is None:
+            await self.storage.set_runtime_setting(raffle.chat_id, key, "disabled")
+            return None
+        await self.storage.set_runtime_setting(raffle.chat_id, key, str(message_id))
+        return message_id
+
+    async def _send_admin_result_placeholder(self, raffle: Raffle) -> int | None:
+        if len(self.settings.authorized_admin_ids) != 1:
+            return None
+        admin_id = next(iter(self.settings.authorized_admin_ids))
+        try:
+            placeholder = await self.bot.send_message(
+                admin_id,
+                f"<b>🎟 抽奖 #{raffle.id}</b>\n奖品：{html.escape(raffle.prize)}\n状态：等待开奖。",
+            )
+        except TelegramAPIError:
+            logger.debug("创建管理员抽奖结果锚点失败 raffle_id=%s", raffle.id)
+            return None
+        message_id = getattr(placeholder, "message_id", None)
+        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            return None
+        return message_id
+
+    async def _replace_pending_result_anchor(
+        self,
+        pending: PendingRaffleResult,
+        *,
+        target: Literal["group", "admin"],
+    ) -> PendingRaffleResult | None:
+        if target == "group":
+            message_id = await self._create_group_result_anchor(pending.raffle)
+        else:
+            message_id = await self._send_admin_result_placeholder(pending.raffle)
+        if message_id is None:
+            return None
+        rebound: PendingRaffleResult | None = None
+        try:
+            rebound = await self.storage.bind_pending_raffle_result_anchor(
+                pending,
+                target=target,
+                message_id=message_id,
+            )
+        except Exception:
+            logger.exception(
+                "抽奖结果消息锚点绑定失败 chat_id=%s raffle_id=%s target=%s",
+                pending.raffle.chat_id,
+                pending.raffle.id,
+                target,
+            )
+        if rebound is None:
+            if target == "admin" and len(self.settings.authorized_admin_ids) == 1:
+                with contextlib.suppress(TelegramAPIError):
+                    await self.bot.delete_message(
+                        next(iter(self.settings.authorized_admin_ids)),
+                        message_id,
+                    )
+            return None
+        if target == "admin":
+            try:
+                await self.storage.set_runtime_setting(
+                    pending.raffle.chat_id,
+                    self._admin_result_setting_key(pending.raffle.id),
+                    str(message_id),
+                )
+            except Exception:
+                logger.exception(
+                    "管理员抽奖结果锚点索引更新失败 raffle_id=%s",
+                    pending.raffle.id,
+                )
+        return rebound
+
+    async def _cancel_admin_result_placeholder(
+        self,
+        raffle: Raffle,
+        *,
+        text: str,
+        remove_setting: bool,
+    ) -> None:
+        key = self._admin_result_setting_key(raffle.id)
+        value = await self.storage.runtime_setting(raffle.chat_id, key)
+        try:
+            message_id = int(value or "")
+        except ValueError:
+            message_id = 0
+        if message_id > 0 and len(self.settings.authorized_admin_ids) == 1:
+            admin_id = next(iter(self.settings.authorized_admin_ids))
+            try:
+                await self.bot.edit_message_text(
+                    html.escape(text),
+                    chat_id=admin_id,
+                    message_id=message_id,
+                )
+            except TelegramBadRequest as exc:
+                if "message is not modified" not in str(exc).casefold():
+                    logger.debug("更新管理员抽奖锚点失败 raffle_id=%s", raffle.id)
+            except TelegramAPIError:
+                logger.debug("更新管理员抽奖锚点失败 raffle_id=%s", raffle.id)
+        if remove_setting:
+            await self.storage.delete_runtime_setting(raffle.chat_id, key)
+
+    async def _defer_pending_result(self, pending: PendingRaffleResult) -> bool:
+        try:
+            await self.storage.touch_pending_raffle_result(pending)
+        except Exception:
+            logger.exception(
+                "抽奖结果重试时间更新失败 chat_id=%s raffle_id=%s",
+                pending.raffle.chat_id,
+                pending.raffle.id,
+            )
+        return False
 
     async def _deliver_pending_result(
         self,
@@ -666,74 +864,155 @@ class RaffleService:
         winners: tuple[int, ...] | None = None,
     ) -> bool:
         raffle = pending.raffle
-        setting_key = self._result_setting_key(raffle.id, pending.round_number)
-        current_stage = pending.stage
-        try:
-            if winners is None:
-                winners = tuple(
-                    winner.user_id
-                    for winner in await self.storage.raffle_winners(
-                        raffle.id,
-                        latest_round=False,
-                    )
-                    if winner.round == pending.round_number
+        current = pending
+        if winners is None:
+            winners = tuple(
+                winner.user_id
+                for winner in await self.storage.raffle_winners(
+                    raffle.id,
+                    latest_round=False,
                 )
-            if pending.stage != "admin_only":
+                if winner.round == pending.round_number
+            )
+        if current.stage in {"group_and_admin", "admin_only"} and (
+            current.admin_message_id is None
+        ):
+            admin_message_id = await self._ensure_admin_result_placeholder(raffle)
+            if admin_message_id is None:
+                return await self._defer_pending_result(current)
+            current = await self.storage.bind_pending_raffle_result_anchor(
+                current,
+                target="admin",
+                message_id=admin_message_id,
+            )
+            if current is None:
+                return await self._defer_pending_result(pending)
+        if current.stage != "admin_only":
+            if current.group_message_id is None:
+                current = await self._replace_pending_result_anchor(
+                    current,
+                    target="group",
+                )
+                if current is None:
+                    return await self._defer_pending_result(pending)
+            if current.group_message_id is None:
+                return await self._defer_pending_result(current)
+            try:
+                await self._publish_result(
+                    raffle,
+                    winners,
+                    round_number=current.round_number,
+                    message_id=current.group_message_id,
+                )
+            except _RaffleResultAnchorMissing:
+                current = await self._replace_pending_result_anchor(
+                    current,
+                    target="group",
+                )
+                if current is None or current.group_message_id is None:
+                    return await self._defer_pending_result(current or pending)
                 try:
                     await self._publish_result(
                         raffle,
                         winners,
-                        round_number=pending.round_number,
+                        round_number=current.round_number,
+                        message_id=current.group_message_id,
                     )
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    if pending.stage == "group_and_admin" and await self._send_admin_result(
-                        raffle,
-                        winners,
-                        round_number=pending.round_number,
-                    ):
-                        current_stage = "group_only"
-                        await self.storage.set_runtime_setting(
-                            raffle.chat_id,
-                            setting_key,
-                            current_stage,
-                        )
-                    raise
-                if pending.stage == "group_and_admin":
-                    await self.storage.set_runtime_setting(
+                except Exception as exc:
+                    logger.warning(
+                        "抽奖群结果待重试 chat_id=%s raffle_id=%s error=%s",
                         raffle.chat_id,
-                        setting_key,
-                        "admin_only",
+                        raffle.id,
+                        type(exc).__name__,
                     )
-                    current_stage = "admin_only"
-                else:
-                    await self.storage.delete_runtime_setting(raffle.chat_id, setting_key)
-                    return True
-            if not await self._send_admin_result(
+                    return await self._defer_pending_result(current)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "抽奖群结果待重试 chat_id=%s raffle_id=%s error=%s",
+                    raffle.chat_id,
+                    raffle.id,
+                    type(exc).__name__,
+                )
+                return await self._defer_pending_result(current)
+            if current.stage == "group_and_admin":
+                try:
+                    transitioned = await self.storage.update_pending_raffle_result(
+                        current,
+                        stage="admin_only",
+                        group_delete_at=self._message_cleanup_deadline(),
+                    )
+                except Exception:
+                    logger.exception(
+                        "抽奖结果状态推进失败 chat_id=%s raffle_id=%s",
+                        raffle.chat_id,
+                        raffle.id,
+                    )
+                    return await self._defer_pending_result(current)
+                if transitioned is None:
+                    return await self._defer_pending_result(current)
+                current = transitioned
+            else:
+                try:
+                    return await self.storage.complete_pending_raffle_result(
+                        current,
+                        group_delete_at=self._message_cleanup_deadline(),
+                    )
+                except Exception:
+                    logger.exception(
+                        "抽奖结果完成标记失败 chat_id=%s raffle_id=%s",
+                        raffle.chat_id,
+                        raffle.id,
+                    )
+                    return await self._defer_pending_result(current)
+
+        if current.admin_message_id is None:
+            try:
+                return await self.storage.complete_pending_raffle_result(current)
+            except Exception:
+                logger.exception(
+                    "抽奖结果完成标记失败 chat_id=%s raffle_id=%s",
+                    raffle.chat_id,
+                    raffle.id,
+                )
+                return await self._defer_pending_result(current)
+        try:
+            delivered = await self._publish_admin_result(
                 raffle,
                 winners,
-                round_number=pending.round_number,
-            ):
-                raise RuntimeError("管理员抽奖结果通知未送达")
-            await self.storage.delete_runtime_setting(raffle.chat_id, setting_key)
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            with contextlib.suppress(Exception):
-                await self.storage.set_runtime_setting(
-                    raffle.chat_id,
-                    setting_key,
-                    current_stage,
+                round_number=current.round_number,
+                message_id=current.admin_message_id,
+            )
+        except _RaffleResultAnchorMissing:
+            current = await self._replace_pending_result_anchor(
+                current,
+                target="admin",
+            )
+            if current is None or current.admin_message_id is None:
+                return await self._defer_pending_result(current or pending)
+            try:
+                delivered = await self._publish_admin_result(
+                    raffle,
+                    winners,
+                    round_number=current.round_number,
+                    message_id=current.admin_message_id,
                 )
-            logger.warning(
-                "抽奖结果待重试 chat_id=%s raffle_id=%s error=%s",
+            except _RaffleResultAnchorMissing:
+                return await self._defer_pending_result(current)
+        if not delivered:
+            return await self._defer_pending_result(current)
+        try:
+            return await self.storage.complete_pending_raffle_result(current)
+        except Exception:
+            logger.exception(
+                "抽奖结果完成标记失败 chat_id=%s raffle_id=%s",
                 raffle.chat_id,
                 raffle.id,
-                type(exc).__name__,
             )
-            return False
+            return await self._defer_pending_result(current)
 
     async def _recover_pending_results(self, *, force: bool = False) -> None:
         updated_before = None
@@ -749,22 +1028,17 @@ class RaffleService:
             if pending.raffle.id in blocked_raffles:
                 continue
             async with self.chat_lock(pending.raffle.chat_id):
-                stage = await self.storage.runtime_setting(
-                    pending.raffle.chat_id,
-                    self._result_setting_key(
-                        pending.raffle.id,
-                        pending.round_number,
-                    ),
+                latest = await self.storage.pending_raffle_results(
+                    chat_ids={pending.raffle.chat_id},
+                    raffle_id=pending.raffle.id,
                 )
-                if stage not in {"group_only", "group_and_admin", "admin_only"}:
+                current = next(
+                    (item for item in latest if item.round_number == pending.round_number),
+                    None,
+                )
+                if current is None:
                     continue
-                delivered = await self._deliver_pending_result(
-                    PendingRaffleResult(
-                        raffle=pending.raffle,
-                        round_number=pending.round_number,
-                        stage=stage,
-                    )
-                )
+                delivered = await self._deliver_pending_result(current)
                 if not delivered:
                     blocked_raffles.add(pending.raffle.id)
 
@@ -774,6 +1048,7 @@ class RaffleService:
         winners: tuple[int, ...],
         *,
         round_number: int,
+        message_id: int,
     ) -> None:
         await self._cancel_card_update(raffle.id)
         if winners:
@@ -789,46 +1064,55 @@ class RaffleService:
             result = f"<b>抽奖已结束</b>\n\n奖品：{html.escape(raffle.prize)}\n无人符合条件。"
         if not await self._unpin(raffle):
             raise RuntimeError("Telegram 未确认取消抽奖置顶")
-        delivered = False
-        if raffle.message_id is not None:
-            try:
+        try:
+            with suspend_ephemeral_tracking():
                 await self.bot.edit_message_text(
                     result,
                     chat_id=raffle.chat_id,
-                    message_id=raffle.message_id,
+                    message_id=message_id,
                     reply_markup=None,
                 )
-                delivered = True
-            except TelegramBadRequest as exc:
-                if "message is not modified" in str(exc).casefold():
-                    delivered = True
-                else:
-                    logger.debug("编辑抽奖结果失败 raffle_id=%s", raffle.id)
-            except TelegramAPIError:
-                logger.debug("编辑抽奖结果失败 raffle_id=%s", raffle.id)
-        if not delivered:
-            await self.bot.send_message(raffle.chat_id, result)
-        await self._schedule_card_cleanup(raffle)
+        except TelegramBadRequest as exc:
+            detail = str(exc).casefold()
+            if "message is not modified" in detail:
+                pass
+            elif "message not found" in detail or "message to edit not found" in detail:
+                raise _RaffleResultAnchorMissing from exc
+            else:
+                raise
+        if raffle.message_id is not None and raffle.message_id != message_id:
+            await self._schedule_card_cleanup(raffle)
 
-    async def _send_admin_result(
+    async def _publish_admin_result(
         self,
         raffle: Raffle,
         winners: tuple[int, ...],
         *,
         round_number: int,
+        message_id: int,
     ) -> bool:
         if len(self.settings.authorized_admin_ids) != 1:
             return True
         admin_id = next(iter(self.settings.authorized_admin_ids))
         ids = "、".join(str(user_id) for user_id in winners) if winners else "无"
         try:
-            await self.bot.send_message(
-                admin_id,
+            await self.bot.edit_message_text(
                 f"抽奖 #{raffle.id} 第 {round_number} 轮完成。\n"
                 f"奖品：{html.escape(raffle.prize)}\n中奖用户 ID：<code>{ids}</code>",
+                chat_id=admin_id,
+                message_id=message_id,
             )
+        except TelegramBadRequest as exc:
+            detail = str(exc).casefold()
+            if "message is not modified" in detail:
+                return True
+            if "message not found" in detail or "message to edit not found" in detail:
+                logger.warning("管理员抽奖结果锚点已不存在 raffle_id=%s", raffle.id)
+                raise _RaffleResultAnchorMissing from exc
+            logger.debug("私聊编辑抽奖结果失败 raffle_id=%s", raffle.id)
+            return False
         except TelegramAPIError:
-            logger.debug("私聊发送抽奖结果失败 raffle_id=%s", raffle.id)
+            logger.debug("私聊编辑抽奖结果失败 raffle_id=%s", raffle.id)
             return False
         return True
 
@@ -845,6 +1129,11 @@ class RaffleService:
             text = f"<b>抽奖已取消</b>\n\n奖品：{html.escape(raffle.prize)}"
             await self._schedule_card_cleanup(raffle)
             await self._unpin(raffle)
+            await self._cancel_admin_result_placeholder(
+                raffle,
+                text=f"抽奖 #{raffle.id} 已取消。",
+                remove_setting=True,
+            )
             if raffle.message_id is not None:
                 try:
                     await self.bot.edit_message_text(
@@ -888,20 +1177,28 @@ class RaffleService:
                     min(raffle.winner_count, len(pool)),
                 )
             )
-            delivery_stage = "group_and_admin"
+            result_anchor_id = await self._create_group_result_anchor(raffle)
+            if result_anchor_id is None:
+                return
+            admin_message_id = await self._ensure_admin_result_placeholder(raffle)
+            delivery_stage = "group_and_admin" if admin_message_id is not None else "group_only"
             round_number = await self.storage.add_reroll(
                 raffle.id,
                 winners,
                 result_delivery_stage=delivery_stage,
+                result_group_message_id=result_anchor_id,
+                result_admin_message_id=admin_message_id,
             )
-            await self._deliver_pending_result(
-                PendingRaffleResult(
-                    raffle=raffle,
-                    round_number=round_number,
-                    stage=delivery_stage,
-                ),
-                winners=winners,
+            pending = await self.storage.pending_raffle_results(
+                chat_ids={chat_id},
+                raffle_id=raffle.id,
             )
+            current = next(
+                (item for item in pending if item.round_number == round_number),
+                None,
+            )
+            if current is not None:
+                await self._deliver_pending_result(current, winners=winners)
 
     async def _run_worker(self) -> None:
         while True:

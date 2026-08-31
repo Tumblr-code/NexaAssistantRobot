@@ -712,7 +712,7 @@ async def test_raffle_end_and_cancel_unpin_exact_card(
     assert bot.edited[-1][1] == 88
     assert await storage.active_raffle(-100) is None
     queued = await storage.due_ephemeral("2100-01-01T00:00:00+00:00")
-    assert [(item.chat_id, item.message_id) for item in queued] == [(-100, 88)]
+    assert {(item.chat_id, item.message_id) for item in queued} == {(-100, 88)}
 
 
 async def test_private_command_rejects_unlisted_user(tmp_path: Path, storage: Storage) -> None:

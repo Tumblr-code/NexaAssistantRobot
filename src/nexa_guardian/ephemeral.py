@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, TypeVar
@@ -14,6 +15,11 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import Message
 
 logger = logging.getLogger(__name__)
+
+_TRACK_EPHEMERAL_MESSAGES: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "nexa_track_ephemeral_messages",
+    default=True,
+)
 
 MessageResult = TypeVar("MessageResult")
 
@@ -69,6 +75,22 @@ def _utc_iso(value: datetime) -> str:
 def _message_is_already_absent(error: TelegramBadRequest) -> bool:
     """Return whether Telegram explicitly confirms that the message is gone."""
     return "message to delete not found" in str(error).casefold()
+
+
+@contextlib.contextmanager
+def suspend_ephemeral_tracking() -> Iterator[None]:
+    """Keep one outgoing request out of the global temporary-message queue.
+
+    The caller must durably enqueue or exempt the resulting message itself. A
+    context variable keeps concurrent Telegram requests in other tasks covered
+    by the normal middleware policy.
+    """
+
+    token = _TRACK_EPHEMERAL_MESSAGES.set(False)
+    try:
+        yield
+    finally:
+        _TRACK_EPHEMERAL_MESSAGES.reset(token)
 
 
 class EphemeralMessenger:
@@ -434,6 +456,8 @@ class EphemeralRequestMiddleware:
         method: Any,
     ) -> Any:
         result = await make_request(bot, method)
+        if not _TRACK_EPHEMERAL_MESSAGES.get():
+            return result
         if isinstance(result, Message):
             messages = (result,)
         elif isinstance(result, (list, tuple)):
