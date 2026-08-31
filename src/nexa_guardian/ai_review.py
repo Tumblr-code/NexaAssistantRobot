@@ -18,6 +18,7 @@ from nexa_guardian.ai_contract import (
     AI_REASONING_EFFORT,
     AI_REASONING_EFFORTS,
     AI_SERVICE_TIER,
+    AI_TIMEOUT_SECONDS,
     NEXA_OFFICIAL_DOMAINS,
 )
 
@@ -568,7 +569,7 @@ class AIReviewer:
         reasoning_effort: str = AI_REASONING_EFFORT,
         service_tier: str = AI_SERVICE_TIER,
         requester: ResponseRequester | None = None,
-        timeout: float = 8.0,
+        timeout: float = AI_TIMEOUT_SECONDS,
         concurrency: int = 8,
         cache_ttl: float = 600.0,
         cache_size: int = 1000,
@@ -616,6 +617,7 @@ class AIReviewer:
         risk_signals: Sequence[str] = (),
         linked_hosts: Sequence[str] = (),
         reasoning_effort: str | None = None,
+        deadline: float | None = None,
     ) -> AIReviewResult:
         if self._closed:
             raise RuntimeError("AI reviewer is closed")
@@ -633,7 +635,13 @@ class AIReviewer:
         normalized_linked_hosts = _normalize_linked_hosts(linked_hosts)
 
         started = self._clock()
-        deadline = started + self.timeout
+        if deadline is not None and not math.isfinite(deadline):
+            raise ValueError("deadline must be finite")
+        total_deadline = started + self.timeout
+        if deadline is not None:
+            total_deadline = min(total_deadline, deadline)
+        if total_deadline <= started:
+            raise AIReviewTimeout("AI review exceeded the total timeout")
         cache_key = _content_digest(
             self.model,
             selected_effort,
@@ -647,52 +655,66 @@ class AIReviewer:
         if cached_result is not None:
             return cached_result
 
-        async with self._inflight_lock:
-            if self._closed:
-                raise RuntimeError("AI reviewer is closed")
-            cached_result = self._cached_result(cache_key, started)
-            if cached_result is not None:
-                return cached_result
-            task = self._inflight.get(cache_key)
-            owner = task is None
-            if task is None:
-                task = asyncio.create_task(
-                    self._run_inflight(
-                        cache_key=cache_key,
-                        text=text,
-                        image_data_url=image_data_url,
-                        safety_identifier=safety_identifier,
-                        risk_signals=normalized_risk_signals,
-                        linked_hosts=normalized_linked_hosts,
-                        reasoning_effort=selected_effort,
-                        started=started,
-                        deadline=deadline,
-                    ),
-                    name="nexa-ai-review",
+        retried_after_shared_failure = False
+        while True:
+            async with self._inflight_lock:
+                if self._closed:
+                    raise RuntimeError("AI reviewer is closed")
+                cached_result = self._cached_result(cache_key, started)
+                if cached_result is not None:
+                    return cached_result
+                task = self._inflight.get(cache_key)
+                owner = task is None
+                if task is None:
+                    task = asyncio.create_task(
+                        self._run_inflight(
+                            cache_key=cache_key,
+                            text=text,
+                            image_data_url=image_data_url,
+                            safety_identifier=safety_identifier,
+                            risk_signals=normalized_risk_signals,
+                            linked_hosts=normalized_linked_hosts,
+                            reasoning_effort=selected_effort,
+                            started=started,
+                            deadline=total_deadline,
+                        ),
+                        name="nexa-ai-review",
+                    )
+                    task.add_done_callback(self._consume_inflight_result)
+                    self._inflight[cache_key] = task
+
+            remaining = total_deadline - self._clock()
+            if remaining <= 0:
+                raise AIReviewTimeout("AI review exceeded the total timeout")
+            try:
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise AIReviewTimeout("AI review exceeded the total timeout") from exc
+            except (AIReviewTimeout, AIReviewConnectionError, AIReviewHTTPError) as exc:
+                retryable = not isinstance(exc, AIReviewHTTPError) or (
+                    exc.status == 429 or 500 <= exc.status <= 599
                 )
-                task.add_done_callback(self._consume_inflight_result)
-                self._inflight[cache_key] = task
+                remaining = total_deadline - self._clock()
+                if owner or not retryable or retried_after_shared_failure or remaining <= 0:
+                    raise
+                # The shared owner may have had too little budget left to retry a
+                # transient failure. Retry once with this caller's remaining budget
+                # instead of inheriting the earlier caller's failure.
+                retried_after_shared_failure = True
+                continue
 
-        remaining = deadline - self._clock()
-        if remaining <= 0:
-            raise AIReviewTimeout("AI review exceeded the total timeout")
-        try:
-            result = await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
-        except asyncio.TimeoutError as exc:
-            raise AIReviewTimeout("AI review exceeded the total timeout") from exc
-
-        if owner:
-            return result
-        elapsed = _elapsed_ms(started, self._clock())
-        return replace(
-            result,
-            cached=True,
-            latency_ms=elapsed,
-            review_path="singleflight",
-            queue_latency_ms=elapsed,
-            request_latency_ms=0,
-            attempt_count=0,
-        )
+            if owner:
+                return result
+            elapsed = _elapsed_ms(started, self._clock())
+            return replace(
+                result,
+                cached=True,
+                latency_ms=elapsed,
+                review_path="singleflight",
+                queue_latency_ms=elapsed,
+                request_latency_ms=0,
+                attempt_count=0,
+            )
 
     async def _run_inflight(
         self,

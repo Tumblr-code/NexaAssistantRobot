@@ -250,6 +250,7 @@ async def test_ai_detail_uses_persisted_pause_state_and_seven_day_metrics(
     )
 
     assert "实际状态：已暂停" in text
+    assert "超时：12s" in text
     assert "连续失败：2" in text
     assert "近 7 天：调用 4｜广告 2｜失败率 25.0%｜P95 400 ms" in text
     assert "累计：调用 5｜广告 3｜失败 2" in text

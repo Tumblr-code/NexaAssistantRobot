@@ -10,7 +10,7 @@ Nexa Guardian 的身份是 Nexa 官方群管理审核员。固定的一方站点
 
 上述精确域名本身不会被当作外部链接信号；相似域名、伪造后缀、钓鱼、冒充和附带其他广告证据的内容仍会进入审核。
 
-生产服务位于 VM `192.168.0.35`，由 `nexa-guardian.service` 持久运行，目标为 `@NexaStoreGroup`。v0.6.1 使用五个极简命令，提供持久化关键词抽奖、审核策略短时缓存、幂等资料同步，以及管理员 MTProto 全历史与成员清理。
+生产服务位于 VM `192.168.0.35`，由 `nexa-guardian.service` 持久运行，目标为 `@NexaStoreGroup`。v0.6.2 使用五个极简命令，提供持久化关键词抽奖、审核策略短时缓存、幂等资料同步，以及管理员 MTProto 全历史与成员清理。
 
 ## 已实现
 
@@ -83,6 +83,7 @@ ALLOWED_CHAT_IDS=-1001234567890,-1009876543210
 | `AI_SERVICE_TIER` | `default` | 固定为当前兼容网关实际支持并回显的服务层 |
 | `AI_AD_THRESHOLD` | `0.92` | 删除并警告的最低广告置信度 |
 | `AI_LEARN_THRESHOLD` | `0.97` | 自动启用学习特征的最低置信度 |
+| `AI_TIMEOUT_SECONDS` | `12` | 单条消息自适应审核总预算，包含排队、重试及 `low` 到 `high` 复核 |
 | `AI_FAILURE_DELETE` | `true` | AI 故障时删除原消息，但不警告、不学习 |
 | `AI_IMAGE_MAX_BYTES` | `5242880` | 单个媒体预览的硬上限；生产固定为 `1572864`（1.5 MiB） |
 | `AI_IMAGE_TARGET_LONG_EDGE` | `1280` | 优先选择长边达到该值的最小 Telegram 图片预览 |
@@ -102,9 +103,9 @@ ALLOWED_CHAT_IDS=-1001234567890,-1009876543210
 | `TELEGRAM_API_HASH` | 空 | MTProto 管理会话使用的 Telegram API Hash；仅存于 VM 受保护环境文件 |
 | `TELEGRAM_SESSION_PATH` | `/var/lib/nexa-guardian/mtproto/admin` | 已交互登录的唯一管理员用户会话路径 |
 
-兼容网关必须同时支持 Responses API、严格 JSON Schema、图片输入、`reasoning.effort=low/high` 和可核验的服务层。当前生产网关会把 `priority` 请求降为 `default`，因此程序明确固定并校验 `service_tier=default`，不会把降级伪装成 Priority。快速响应由连接复用、相同内容 singleflight、普通文字 `low`、8 秒端到端总超时、10 分钟缓存和已学习特征本地直拦实现。程序只接受响应中明确返回 `status=completed`、`model=gpt-5.6-sol`、本次请求对应的推理强度及 `service_tier=default` 的结果，缺失或不匹配均按审核服务故障处理。请求设置 `store=false`，只发送待判断文本或图片，不发送用户名、用户 ID、群名和聊天历史。普通文件和无预览贴纸不送入 AI。
+兼容网关必须同时支持 Responses API、严格 JSON Schema、图片输入、`reasoning.effort=low/high` 和可核验的服务层。当前生产网关会把 `priority` 请求降为 `default`，因此程序明确固定并校验 `service_tier=default`，不会把降级伪装成 Priority。快速响应由连接复用、相同内容 singleflight、普通文字 `low`、12 秒端到端总超时、10 分钟缓存和已学习特征本地直拦实现；成功结果会立即返回，不会固定等待满 12 秒。程序只接受响应中明确返回 `status=completed`、`model=gpt-5.6-sol`、本次请求对应的推理强度及 `service_tier=default` 的结果，缺失或不匹配均按审核服务故障处理。请求设置 `store=false`，只发送待判断文本或图片，不发送用户名、用户 ID、群名和聊天历史。普通文件和无预览贴纸不送入 AI。
 
-生产发布额外要求显式配置并由发布探针校验：`EXPECTED_BOT_ID`、`EXPECTED_BOT_USERNAME`、`UPDATE_CONCURRENCY_LIMIT=32`、`AI_NORMAL_REASONING_EFFORT=low`、`AI_SUSPICIOUS_REASONING_EFFORT=high`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、`AI_IMAGE_MAX_BYTES=1572864`、`AI_IMAGE_TARGET_LONG_EDGE=1280`、`AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2` 和 `AI_MEDIA_CONCURRENCY=4`。身份不匹配时服务会在启动轮询前退出。
+生产发布额外要求显式配置并由发布探针校验：`EXPECTED_BOT_ID`、`EXPECTED_BOT_USERNAME`、`UPDATE_CONCURRENCY_LIMIT=32`、`AI_NORMAL_REASONING_EFFORT=low`、`AI_SUSPICIOUS_REASONING_EFFORT=high`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、`AI_TIMEOUT_SECONDS=12`、`AI_IMAGE_MAX_BYTES=1572864`、`AI_IMAGE_TARGET_LONG_EDGE=1280`、`AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2` 和 `AI_MEDIA_CONCURRENCY=4`。身份不匹配时服务会在启动轮询前退出。
 
 模型及服务层字段依据 [OpenAI GPT-5.6 Sol 模型说明](https://developers.openai.com/api/docs/models/gpt-5.6-sol) 和 [Responses API 参考](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)。
 
@@ -225,7 +226,7 @@ BotFather 菜单与 `/help` 共用 `COMMAND_SPECS`，只保留以下五个顶级
    `EXPECTED_BOT_USERNAME`、`UPDATE_CONCURRENCY_LIMIT=32`、`AI_MODEL=gpt-5.6-sol`、
    `AI_REASONING_EFFORT=high`、`AI_NORMAL_REASONING_EFFORT=low`、
    `AI_SUSPICIOUS_REASONING_EFFORT=high`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、
-   `AI_SERVICE_TIER=default`、`AI_IMAGE_MAX_BYTES=1572864`、
+   `AI_SERVICE_TIER=default`、`AI_TIMEOUT_SECONDS=12`、`AI_IMAGE_MAX_BYTES=1572864`、
    `AI_IMAGE_TARGET_LONG_EDGE=1280`、`AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2`、
    `AI_MEDIA_CONCURRENCY=4`、`AI_ENABLED=true`、`WARN_LIMIT=3`、
    `NOTICE_TTL_SECONDS=30` 和 `AI_FAILURE_DELETE=true`。

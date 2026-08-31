@@ -6,7 +6,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from nexa_guardian.ai_contract import AI_MODEL, AI_REASONING_EFFORT, AI_SERVICE_TIER
+from nexa_guardian.ai_contract import (
+    AI_MODEL,
+    AI_REASONING_EFFORT,
+    AI_SERVICE_TIER,
+    AI_TIMEOUT_SECONDS,
+)
 
 
 def _csv(value: str | None) -> tuple[str, ...]:
@@ -106,7 +111,7 @@ class Settings:
     ai_enabled: bool = False
     ai_ad_threshold: float = 0.92
     ai_learn_threshold: float = 0.97
-    ai_timeout_seconds: float = 8.0
+    ai_timeout_seconds: float = AI_TIMEOUT_SECONDS
     ai_concurrency: int = 8
     ai_cache_ttl_seconds: int = 600
     ai_cache_max_entries: int = 1000
@@ -218,7 +223,9 @@ class Settings:
             ai_enabled=ai_enabled,
             ai_ad_threshold=ai_ad_threshold,
             ai_learn_threshold=ai_learn_threshold,
-            ai_timeout_seconds=_float("AI_TIMEOUT_SECONDS", 8.0, minimum=1.0, maximum=60.0),
+            ai_timeout_seconds=_float(
+                "AI_TIMEOUT_SECONDS", AI_TIMEOUT_SECONDS, minimum=1.0, maximum=60.0
+            ),
             ai_concurrency=_integer("AI_CONCURRENCY", 8, minimum=1),
             ai_cache_ttl_seconds=_integer("AI_CACHE_TTL_SECONDS", 600, minimum=1),
             ai_cache_max_entries=_integer("AI_CACHE_MAX_ENTRIES", 1000, minimum=1),

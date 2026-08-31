@@ -25,6 +25,7 @@
   `AI_SERVICE_TIER=default`；模型与自适应推理契约必须显式存在，不接受默认补齐、家族别名或静默改写。
   还必须显式配置正确的 `EXPECTED_BOT_ID`、`EXPECTED_BOT_USERNAME`，以及
   `UPDATE_CONCURRENCY_LIMIT=32`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、
+  `AI_TIMEOUT_SECONDS=12`、
   `AI_IMAGE_MAX_BYTES=1572864`、`AI_IMAGE_TARGET_LONG_EDGE=1280`、
   `AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2`、`AI_MEDIA_CONCURRENCY=4`。
   发布脚本会用候选虚拟环境的 `nexa-guardian-probe --require-production-settings` 验证
@@ -41,7 +42,7 @@
 
 ```bash
 sudo /path/to/repository/deploy/release.sh \
-  --wheel /root/releases/nexa_guardian-0.6.1-py3-none-any.whl \
+  --wheel /root/releases/nexa_guardian-0.6.2-py3-none-any.whl \
   --git-sha 0123456789abcdef0123456789abcdef01234567 \
   --schema-version 8
 ```
@@ -83,6 +84,13 @@ sudo /path/to/repository/deploy/release.sh \
 
 `release.json` 记录完整 Git SHA、UTC 构建时间、wheel SHA256、数据库 schema 版本和
 wheel 文件名，可用于把 VM release 对应回 GitHub 版本与构建产物。
+
+v0.6.2 将单条消息自适应审核的端到端总预算从 8 秒调整为 12 秒；排队、重试以及
+`low` 升级 `high` 共用同一绝对截止时间，媒体下载仍使用独立的 2 秒上限。成功响应会立即
+返回，不会固定等待满 12 秒。数据库 schema 保持为 8。手工运行 v0.6.1 旧版发布探针或
+要求精确恢复旧发布契约前，必须先把受保护环境文件中的 `AI_TIMEOUT_SECONDS` 恢复为 `8`。
+发布脚本的自动回滚只恢复代码和主数据库，不改写环境文件；v0.6.1 运行时能够读取 12 秒，
+但若要求完整恢复旧发布契约，需使用上线前保留的 8 秒配置备份人工恢复后再运行旧版探针。
 
 ## 失败回滚
 

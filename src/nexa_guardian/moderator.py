@@ -956,6 +956,7 @@ class ModerationController:
             return
 
         review_started = time.monotonic()
+        review_deadline = review_started + self.settings.ai_timeout_seconds
         use_high_reasoning = (
             suspicion.is_suspicious or flood_violation is not None or has_media_preview
         )
@@ -982,8 +983,9 @@ class ModerationController:
                     risk_signals=normalized_risk_signals,
                     linked_hosts=linked_hosts,
                     use_high_reasoning=use_high_reasoning,
+                    deadline=review_deadline,
                 ),
-                timeout=self.settings.ai_timeout_seconds,
+                timeout=max(0.0, review_deadline - time.monotonic()),
             )
         except (AIReviewError, AiohttpClientError, asyncio.TimeoutError) as exc:
             processing = await processing_task if processing_task is not None else None
@@ -1126,6 +1128,7 @@ class ModerationController:
         risk_signals: tuple[str, ...],
         linked_hosts: tuple[str, ...],
         use_high_reasoning: bool,
+        deadline: float,
     ):
         if self.ai_reviewer is None:
             raise RuntimeError("AI reviewer is unavailable")
@@ -1141,6 +1144,7 @@ class ModerationController:
             risk_signals=risk_signals,
             linked_hosts=linked_hosts,
             reasoning_effort=initial_effort,
+            deadline=deadline,
         )
         if initial_effort != "low" or (
             not result.is_ad and result.confidence >= self.settings.ai_normal_accept_confidence
@@ -1154,6 +1158,7 @@ class ModerationController:
             risk_signals=risk_signals,
             linked_hosts=linked_hosts,
             reasoning_effort=self.settings.ai_suspicious_reasoning_effort,
+            deadline=deadline,
         )
         updates: dict[str, object] = {
             "latency_ms": result.latency_ms + confirmed.latency_ms,

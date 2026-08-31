@@ -2091,6 +2091,8 @@ async def test_uncertain_low_reasoning_result_is_confirmed_with_high_reasoning(
         "low",
         "high",
     ]
+    deadlines = [call.kwargs["deadline"] for call in reviewer.review.await_args_list]
+    assert deadlines[0] == deadlines[1]
     decision = (await recent_ai_decisions(storage, -100, limit=1))[0]
     assert decision.review_path == "low_to_high"
     assert decision.latency_ms == 40

@@ -13,6 +13,7 @@ from nexa_guardian.ai_contract import (
     AI_REASONING_EFFORT,
     AI_REASONING_EFFORTS,
     AI_SERVICE_TIER,
+    AI_TIMEOUT_SECONDS,
 )
 from nexa_guardian.ai_review import (
     AIReviewer,
@@ -21,6 +22,7 @@ from nexa_guardian.ai_review import (
 )
 
 PROBE_TEXT = "Benign capability probe for a Telegram moderation gateway."
+GATEWAY_PROBE_TIMEOUT_SECONDS = AI_TIMEOUT_SECONDS
 PROBE_IMAGE_DATA_URL = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
@@ -52,7 +54,7 @@ async def probe_gateway(
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
         requester=requester,
-        timeout=8,
+        timeout=GATEWAY_PROBE_TIMEOUT_SECONDS,
         concurrency=1,
         cache_ttl=0,
         cache_size=0,
@@ -139,7 +141,7 @@ def _validate_production_settings(values: Mapping[str, str | None]) -> None:
     float_settings = {
         "AI_AD_THRESHOLD": (0.92, "0.92"),
         "AI_LEARN_THRESHOLD": (0.97, "0.97"),
-        "AI_TIMEOUT_SECONDS": (8.0, "8"),
+        "AI_TIMEOUT_SECONDS": (AI_TIMEOUT_SECONDS, f"{AI_TIMEOUT_SECONDS:g}"),
         "AI_NORMAL_ACCEPT_CONFIDENCE": (0.90, "0.90"),
         "AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS": (2.0, "2"),
     }

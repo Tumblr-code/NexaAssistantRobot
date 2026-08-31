@@ -11,6 +11,7 @@ from nexa_guardian.ai_contract import (
     AI_MODEL,
     AI_REASONING_EFFORT,
     AI_SERVICE_TIER,
+    AI_TIMEOUT_SECONDS,
     NEXA_OFFICIAL_PROPERTIES,
 )
 from nexa_guardian.ai_review import (
@@ -130,9 +131,10 @@ async def test_responses_payload_is_strict_private_and_multimodal() -> None:
     assert result.is_ad
     assert result.signatures == ("claim airdrop",)
     assert not result.cached
+    assert service.timeout == AI_TIMEOUT_SECONDS
     call = requester.calls[0]
     assert call["url"] == "https://gateway.example/openai/v1/responses"
-    assert 0 < call["timeout"] <= 8.0
+    assert AI_TIMEOUT_SECONDS - 0.1 < call["timeout"] <= AI_TIMEOUT_SECONDS
     payload = call["payload"]
     assert isinstance(payload, dict)
     assert payload["model"] == AI_MODEL
@@ -498,6 +500,92 @@ async def test_cancelled_waiter_does_not_cancel_shared_review() -> None:
     assert calls == 1
 
 
+async def test_later_singleflight_waiter_retries_after_earlier_owner_deadline() -> None:
+    started = asyncio.Event()
+    never_finishes = asyncio.Event()
+    calls = 0
+
+    async def requester_with_short_first_owner(**_: object) -> HTTPResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await never_finishes.wait()
+        return response(is_ad=False)
+
+    service = reviewer(requester_with_short_first_owner, timeout=1)
+    owner = asyncio.create_task(
+        service.review(
+            text="same message",
+            safety_identifier="owner",
+            deadline=service._clock() + 0.03,
+        )
+    )
+    await started.wait()
+    waiter = asyncio.create_task(
+        service.review(
+            text="same message",
+            safety_identifier="waiter",
+            deadline=service._clock() + 0.3,
+        )
+    )
+
+    owner_result, waiter_result = await asyncio.gather(owner, waiter, return_exceptions=True)
+    await service.close()
+
+    assert isinstance(owner_result, AIReviewTimeout)
+    assert isinstance(waiter_result, AIReviewResult)
+    assert waiter_result.is_ad is False
+    assert calls == 2
+
+
+@pytest.mark.parametrize("first_failure", (429, 503, "connection"))
+async def test_later_waiter_retries_retryable_shared_failure(
+    first_failure: int | str,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def requester_with_retryable_first_failure(**_: object) -> HTTPResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+            if first_failure == "connection":
+                raise AIReviewConnectionError("connection failed")
+            return HTTPResponse(int(first_failure), {})
+        return response(is_ad=False)
+
+    service = reviewer(requester_with_retryable_first_failure, timeout=4)
+    owner = asyncio.create_task(
+        service.review(
+            text="same message",
+            safety_identifier="owner",
+            deadline=service._clock() + 0.5,
+        )
+    )
+    await started.wait()
+    waiter = asyncio.create_task(
+        service.review(
+            text="same message",
+            safety_identifier="waiter",
+            deadline=service._clock() + 4,
+        )
+    )
+    await asyncio.sleep(0)
+    release.set()
+
+    owner_result, waiter_result = await asyncio.gather(owner, waiter, return_exceptions=True)
+    await service.close()
+
+    assert isinstance(owner_result, (AIReviewConnectionError, AIReviewHTTPError))
+    assert isinstance(waiter_result, AIReviewResult)
+    assert waiter_result.is_ad is False
+    assert calls == 2
+
+
 async def test_singleflight_failure_is_shared_and_not_cached() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
@@ -552,7 +640,7 @@ async def test_retry_requires_three_seconds_remaining_in_total_deadline() -> Non
         now[0] += 5.1
         return HTTPResponse(503, {})
 
-    service = reviewer(requester_without_retry, clock=lambda: now[0])
+    service = reviewer(requester_without_retry, clock=lambda: now[0], timeout=8)
     with pytest.raises(AIReviewHTTPError) as caught:
         await service.review(text="message", safety_identifier="opaque")
 
@@ -571,7 +659,7 @@ async def test_retry_uses_only_remaining_deadline_and_reports_attempts() -> None
             return HTTPResponse(503, {})
         return response(is_ad=False)
 
-    service = reviewer(requester_with_retry, clock=lambda: now[0])
+    service = reviewer(requester_with_retry, clock=lambda: now[0], timeout=8)
     result = await service.review(text="message", safety_identifier="opaque")
 
     assert calls[0] == 8.0
@@ -579,6 +667,63 @@ async def test_retry_uses_only_remaining_deadline_and_reports_attempts() -> None
     assert result.attempt_count == 2
     assert result.request_latency_ms == 4900
     assert result.latency_ms == 4900
+
+
+async def test_caller_deadline_caps_request_budget() -> None:
+    now = [100.0]
+    calls: list[float] = []
+
+    async def requester_with_shared_deadline(*, timeout: float, **_: object) -> HTTPResponse:
+        calls.append(timeout)
+        now[0] += 4.0
+        return response(is_ad=False)
+
+    service = reviewer(requester_with_shared_deadline, clock=lambda: now[0])
+    result = await service.review(
+        text="message",
+        safety_identifier="opaque",
+        deadline=105.0,
+    )
+
+    assert calls == [5.0]
+    assert result.request_latency_ms == 4000
+
+
+async def test_caller_deadline_releases_gateway_slot_promptly() -> None:
+    never_finishes = asyncio.Event()
+
+    async def hanging_requester(**_: object) -> HTTPResponse:
+        await never_finishes.wait()
+        return response(is_ad=False)
+
+    service = reviewer(hanging_requester, timeout=1, concurrency=1)
+    with pytest.raises(AIReviewTimeout):
+        await service.review(
+            text="message",
+            safety_identifier="opaque",
+            deadline=service._clock() + 0.02,
+        )
+
+    await asyncio.wait_for(service._semaphore.acquire(), timeout=0.2)
+    service._semaphore.release()
+    await service.close()
+
+
+async def test_default_budget_accepts_response_after_old_eight_second_limit() -> None:
+    now = [100.0]
+    calls: list[float] = []
+
+    async def requester_after_nine_seconds(*, timeout: float, **_: object) -> HTTPResponse:
+        calls.append(timeout)
+        now[0] += 9.0
+        return response(is_ad=False)
+
+    service = reviewer(requester_after_nine_seconds, clock=lambda: now[0])
+    result = await service.review(text="message", safety_identifier="opaque")
+
+    assert calls == [AI_TIMEOUT_SECONDS]
+    assert result.request_latency_ms == 9000
+    assert result.is_ad is False
 
 
 @pytest.mark.parametrize(
