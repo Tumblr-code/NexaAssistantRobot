@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 SESSION_SETUP_TIMEOUT_SECONDS = 15.0
 HISTORY_PURGE_MAX_FLOOD_WAIT_SECONDS = 300
+HISTORY_PURGE_BATCH_SIZE = 100
 SAFE_PROBE_DETAILS = frozenset(
     {
         "MTProto 管理会话必须绑定唯一授权管理员。",
@@ -200,39 +201,26 @@ class HistoryPurger:
             async with self.session.connect(chat_id) as (client, entity):
                 deleted = skipped = failed = 0
                 flood_wait_used = [False]
+                lower_id = 0
                 for _scan in range(3):
-                    message_ids = await self._collect_message_ids_with_flood_retry(
+                    upper_id = await self._latest_message_id_with_flood_retry(
                         client,
                         entity,
                         flood_wait_used=flood_wait_used,
                     )
-                    if not message_ids:
+                    if upper_id <= lower_id:
                         break
-                    for offset in range(0, len(message_ids), 100):
-                        batch = message_ids[offset : offset + 100]
-                        try:
-                            await self._delete_with_flood_retry(
-                                client, entity, batch, flood_wait_used=flood_wait_used
-                            )
-                        except RPCError:
-                            for message_id in batch:
-                                try:
-                                    await self._delete_with_flood_retry(
-                                        client,
-                                        entity,
-                                        [message_id],
-                                        flood_wait_used=flood_wait_used,
-                                    )
-                                except RPCError:
-                                    skipped += 1
-                                except HistoryPurgeError:
-                                    raise
-                                except Exception:
-                                    failed += 1
-                                else:
-                                    deleted += 1
-                        else:
-                            deleted += len(batch)
+                    scan_deleted, scan_skipped, scan_failed = await self._purge_range(
+                        client,
+                        entity,
+                        lower_id=lower_id,
+                        upper_id=upper_id,
+                        flood_wait_used=flood_wait_used,
+                    )
+                    deleted += scan_deleted
+                    skipped += scan_skipped
+                    failed += scan_failed
+                    lower_id = upper_id
                 return HistoryPurgeResult(deleted=deleted, skipped=skipped, failed=failed)
         except asyncio.CancelledError:
             raise
@@ -248,20 +236,123 @@ class HistoryPurger:
             raise HistoryPurgeError("Telegram 群历史清理失败。") from exc
 
     @staticmethod
-    async def _collect_message_ids_with_flood_retry(
+    async def _latest_message_id_with_flood_retry(
         client: TelegramClient,
         entity: Any,
         *,
         flood_wait_used: list[bool],
-    ) -> list[int]:
+    ) -> int:
+        async def collect() -> int:
+            ids = [
+                message.id
+                async for message in client.iter_messages(
+                    entity,
+                    limit=1,
+                )
+            ]
+            return int(ids[0]) if ids else 0
+
         try:
-            return [message.id async for message in client.iter_messages(entity)]
+            return await collect()
         except FloodWaitError as exc:
             await HistoryPurger._wait_for_flood(exc, flood_wait_used=flood_wait_used)
         try:
-            return [message.id async for message in client.iter_messages(entity)]
+            return await collect()
         except FloodWaitError as exc:
             raise HistoryPurgeError("Telegram 再次限流，清理已中止。") from exc
+
+    @staticmethod
+    async def _purge_range(
+        client: TelegramClient,
+        entity: Any,
+        *,
+        lower_id: int,
+        upper_id: int,
+        flood_wait_used: list[bool],
+    ) -> tuple[int, int, int]:
+        deleted = skipped = failed = 0
+        resume_max_id = upper_id + 1
+        while resume_max_id > lower_id + 1:
+            batch: list[int] = []
+            try:
+                async for message in client.iter_messages(
+                    entity,
+                    min_id=lower_id,
+                    max_id=resume_max_id,
+                    wait_time=1,
+                ):
+                    message_id = int(message.id)
+                    if not lower_id < message_id < resume_max_id:
+                        raise HistoryPurgeError("Telegram 返回了清理范围外的消息，任务已中止。")
+                    batch.append(message_id)
+                    if len(batch) == HISTORY_PURGE_BATCH_SIZE:
+                        (
+                            batch_deleted,
+                            batch_skipped,
+                            batch_failed,
+                        ) = await HistoryPurger._delete_batch(
+                            client,
+                            entity,
+                            batch,
+                            flood_wait_used=flood_wait_used,
+                        )
+                        deleted += batch_deleted
+                        skipped += batch_skipped
+                        failed += batch_failed
+                        resume_max_id = min(batch)
+                        batch = []
+                if batch:
+                    batch_deleted, batch_skipped, batch_failed = await HistoryPurger._delete_batch(
+                        client,
+                        entity,
+                        batch,
+                        flood_wait_used=flood_wait_used,
+                    )
+                    deleted += batch_deleted
+                    skipped += batch_skipped
+                    failed += batch_failed
+                return deleted, skipped, failed
+            except FloodWaitError as exc:
+                await HistoryPurger._wait_for_flood(exc, flood_wait_used=flood_wait_used)
+                # A partial in-memory page was not deleted, so retry the same
+                # committed range boundary after the single permitted wait.
+        return deleted, skipped, failed
+
+    @staticmethod
+    async def _delete_batch(
+        client: TelegramClient,
+        entity: Any,
+        message_ids: list[int],
+        *,
+        flood_wait_used: list[bool],
+    ) -> tuple[int, int, int]:
+        try:
+            await HistoryPurger._delete_with_flood_retry(
+                client,
+                entity,
+                message_ids,
+                flood_wait_used=flood_wait_used,
+            )
+        except RPCError:
+            deleted = skipped = failed = 0
+            for message_id in message_ids:
+                try:
+                    await HistoryPurger._delete_with_flood_retry(
+                        client,
+                        entity,
+                        [message_id],
+                        flood_wait_used=flood_wait_used,
+                    )
+                except RPCError:
+                    skipped += 1
+                except HistoryPurgeError:
+                    raise
+                except Exception:
+                    failed += 1
+                else:
+                    deleted += 1
+            return deleted, skipped, failed
+        return len(message_ids), 0, 0
 
     @staticmethod
     async def _delete_with_flood_retry(

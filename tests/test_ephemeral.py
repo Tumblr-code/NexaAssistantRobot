@@ -17,6 +17,7 @@ from nexa_guardian.ephemeral import (
     EphemeralMessenger,
     EphemeralRecord,
     EphemeralRequestMiddleware,
+    suspend_ephemeral_tracking,
 )
 
 UTC = timezone.utc
@@ -699,6 +700,27 @@ async def test_request_middleware_tracks_every_message_result() -> None:
     result = await middleware(make_request, FakeBot(), object())  # type: ignore[arg-type]
 
     assert result is sent
+    messenger.track_sent.assert_awaited_once_with(sent)
+
+
+async def test_request_middleware_can_suspend_one_request_without_affecting_others() -> None:
+    sent = Message(
+        message_id=77,
+        date=datetime.now(UTC),
+        chat=Chat(id=-100, type=ChatType.SUPERGROUP, title="Test"),
+        text="durably coordinated result",
+    )
+    messenger = SimpleNamespace(track_sent=AsyncMock(return_value=sent))
+    middleware = EphemeralRequestMiddleware(messenger)  # type: ignore[arg-type]
+    make_request = AsyncMock(return_value=sent)
+
+    with suspend_ephemeral_tracking():
+        result = await middleware(make_request, FakeBot(), object())  # type: ignore[arg-type]
+
+    assert result is sent
+    messenger.track_sent.assert_not_awaited()
+
+    await middleware(make_request, FakeBot(), object())  # type: ignore[arg-type]
     messenger.track_sent.assert_awaited_once_with(sent)
 
 

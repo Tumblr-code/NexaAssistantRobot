@@ -41,7 +41,7 @@
 
 ```bash
 sudo /path/to/repository/deploy/release.sh \
-  --wheel /root/releases/nexa_guardian-0.6.0-py3-none-any.whl \
+  --wheel /root/releases/nexa_guardian-0.6.1-py3-none-any.whl \
   --git-sha 0123456789abcdef0123456789abcdef01234567 \
   --schema-version 8
 ```
@@ -127,7 +127,7 @@ systemctl status nexa-guardian-backup.timer --no-pager
 与命令菜单。上线后应通过 Telegram API 回读两套资料，确认成员筛选、群内 30 秒清理及唯一
 管理员私聊永久保留的说明均已生效；头像不由服务自动覆盖。
 
-v0.6.0 的 `/del members` 使用已授权的 MTProto 用户会话分页读取目标群成员，并只扫描一次最近
+当前版本的 `/del members` 使用已授权的 MTProto 用户会话分页读取目标群成员，并只扫描一次最近
 30 天群历史。已注销、精确离线超过 30 天、`LastMonth` 或入群满 30 天且无发言，任一命中即
 进入候选；`LastMonth` 受隐私设置影响，会在预览中单独标识；官方没有独立的 `LongAgo` 类型，
 `UserStatusEmpty` 不作为离线依据。历史未跨过 30 天边界时不使用“无发言”条件。上线验收只在唯一管理员私聊中运行 `/del members` 查看预览，
