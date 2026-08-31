@@ -5,9 +5,19 @@ from unittest.mock import AsyncMock
 import pytest
 
 from nexa_guardian import gateway_probe
-from nexa_guardian.ai_contract import AI_MODEL, AI_REASONING_EFFORT, AI_SERVICE_TIER
+from nexa_guardian.ai_contract import (
+    AI_MODEL,
+    AI_REASONING_EFFORT,
+    AI_SERVICE_TIER,
+    AI_TIMEOUT_SECONDS,
+)
 from nexa_guardian.ai_review import AIReviewResult, HTTPResponse
-from nexa_guardian.gateway_probe import PROBE_IMAGE_DATA_URL, PROBE_TEXT, probe_gateway
+from nexa_guardian.gateway_probe import (
+    GATEWAY_PROBE_TIMEOUT_SECONDS,
+    PROBE_IMAGE_DATA_URL,
+    PROBE_TEXT,
+    probe_gateway,
+)
 
 
 def production_env(**overrides: str) -> str:
@@ -36,7 +46,7 @@ def production_env(**overrides: str) -> str:
         "AI_MEDIA_CONCURRENCY": "4",
         "AI_AD_THRESHOLD": "0.92",
         "AI_LEARN_THRESHOLD": "0.97",
-        "AI_TIMEOUT_SECONDS": "8",
+        "AI_TIMEOUT_SECONDS": f"{AI_TIMEOUT_SECONDS:g}",
         "AI_NORMAL_ACCEPT_CONFIDENCE": "0.90",
         "AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS": "2",
     }
@@ -87,6 +97,9 @@ async def test_gateway_probe_uses_fixed_model_structured_output_and_image(
     assert payload["store"] is False
     assert result.reasoning_effort == reasoning_effort
     assert result.actual_service_tier == AI_SERVICE_TIER
+    assert (
+        GATEWAY_PROBE_TIMEOUT_SECONDS - 0.1 < calls[0]["timeout"] <= GATEWAY_PROBE_TIMEOUT_SECONDS
+    )
     user_content = payload["input"][1]["content"]  # type: ignore[index]
     assert {item["type"] for item in user_content} == {"input_text", "input_image"}
     assert PROBE_TEXT in {item.get("text") for item in user_content}
@@ -229,7 +242,7 @@ def test_probe_cli_does_not_accept_credentials_from_ambient_environment(
         ("NOTICE_TTL_SECONDS", "29"),
         ("AI_AD_THRESHOLD", "0.93"),
         ("AI_LEARN_THRESHOLD", "0.98"),
-        ("AI_TIMEOUT_SECONDS", "9"),
+        ("AI_TIMEOUT_SECONDS", "8"),
         ("AI_CONCURRENCY", "7"),
         ("AI_CACHE_TTL_SECONDS", "601"),
         ("AI_CACHE_MAX_ENTRIES", "999"),
