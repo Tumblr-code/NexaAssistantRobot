@@ -11,7 +11,7 @@ from nexa_guardian.ai_contract import (
     AI_SERVICE_TIER,
     AI_TIMEOUT_SECONDS,
 )
-from nexa_guardian.ai_review import AIReviewResult, HTTPResponse
+from nexa_guardian.ai_review import AIReviewHTTPError, AIReviewResult, HTTPResponse
 from nexa_guardian.gateway_probe import (
     GATEWAY_PROBE_TIMEOUT_SECONDS,
     PROBE_IMAGE_DATA_URL,
@@ -205,6 +205,105 @@ def test_probe_cli_accepts_explicit_required_production_contract(
 
     assert gateway_probe.main(["--env-file", str(env_file), "--require-production-settings"]) == 0
     assert efforts == ["low", "high"]
+
+
+@pytest.mark.parametrize(
+    ("status", "error_code", "expected"),
+    (
+        (429, "model_cooldown", 0),
+        (429, "rate_limit_exceeded", 1),
+        (503, "model_cooldown", 1),
+    ),
+)
+def test_probe_cli_cooldown_exception_is_exact_and_operator_authorized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: int,
+    error_code: str,
+    expected: int,
+) -> None:
+    env_file = tmp_path / "guardian.env"
+    env_file.write_text(production_env(), encoding="utf-8")
+
+    async def cooldown_probe(**_: object) -> AIReviewResult:
+        raise AIReviewHTTPError(status, error_code)
+
+    monkeypatch.setattr(gateway_probe, "probe_gateway", cooldown_probe)
+
+    result = gateway_probe.main(
+        [
+            "--env-file",
+            str(env_file),
+            "--require-production-settings",
+            "--allow-model-cooldown",
+        ]
+    )
+
+    assert result == expected
+    output = capsys.readouterr().err
+    assert ("operator-authorized temporary model_cooldown" in output) is (expected == 0)
+
+
+def test_probe_cli_cooldown_exception_requires_full_production_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / "guardian.env"
+    env_file.write_text(production_env(), encoding="utf-8")
+    probe = AsyncMock()
+    monkeypatch.setattr(gateway_probe, "probe_gateway", probe)
+
+    assert (
+        gateway_probe.main(
+            ["--env-file", str(env_file), "--allow-model-cooldown"],
+        )
+        == 1
+    )
+    probe.assert_not_awaited()
+
+
+def test_probe_cli_cooldown_exception_is_disabled_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / "guardian.env"
+    env_file.write_text(production_env(), encoding="utf-8")
+
+    async def cooldown_probe(**_: object) -> AIReviewResult:
+        raise AIReviewHTTPError(429, "model_cooldown")
+
+    monkeypatch.setattr(gateway_probe, "probe_gateway", cooldown_probe)
+
+    assert (
+        gateway_probe.main(
+            ["--env-file", str(env_file), "--require-production-settings"],
+        )
+        == 1
+    )
+
+
+def test_probe_cli_cooldown_exception_cannot_bypass_invalid_production_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / "guardian.env"
+    env_file.write_text(production_env(AI_ENABLED="false"), encoding="utf-8")
+    probe = AsyncMock()
+    monkeypatch.setattr(gateway_probe, "probe_gateway", probe)
+
+    assert (
+        gateway_probe.main(
+            [
+                "--env-file",
+                str(env_file),
+                "--require-production-settings",
+                "--allow-model-cooldown",
+            ],
+        )
+        == 1
+    )
+    probe.assert_not_awaited()
 
 
 def test_probe_cli_does_not_accept_credentials_from_ambient_environment(

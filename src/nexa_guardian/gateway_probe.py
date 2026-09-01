@@ -17,6 +17,7 @@ from nexa_guardian.ai_contract import (
 )
 from nexa_guardian.ai_review import (
     AIReviewer,
+    AIReviewHTTPError,
     AIReviewResult,
     ResponseRequester,
 )
@@ -82,6 +83,11 @@ def _parser() -> argparse.ArgumentParser:
         "--require-production-settings",
         action="store_true",
         help="also require AI enabled, warning limit 3, 30-second notices, and failure deletion",
+    )
+    parser.add_argument(
+        "--allow-model-cooldown",
+        action="store_true",
+        help="accept only an exact HTTP 429 model_cooldown after production settings validate",
     )
     return parser
 
@@ -169,6 +175,12 @@ def _validate_production_settings(values: Mapping[str, str | None]) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    if arguments.allow_model_cooldown and not arguments.require_production_settings:
+        print(
+            "gateway probe failed: model cooldown exception requires production validation",
+            file=sys.stderr,
+        )
+        return 1
     if not arguments.env_file.is_file() or arguments.env_file.is_symlink():
         print("gateway probe failed: protected environment file is unavailable", file=sys.stderr)
         return 1
@@ -202,6 +214,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
         results = asyncio.run(run_probes())
+    except AIReviewHTTPError as exc:
+        if (
+            arguments.allow_model_cooldown
+            and exc.status == 429
+            and exc.error_code == "model_cooldown"
+        ):
+            print(
+                "gateway probe accepted operator-authorized temporary model_cooldown",
+                file=sys.stderr,
+            )
+            return 0
+        print(f"gateway probe failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
     except Exception as exc:
         print(f"gateway probe failed: {type(exc).__name__}", file=sys.stderr)
         return 1

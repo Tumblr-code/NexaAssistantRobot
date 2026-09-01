@@ -45,7 +45,7 @@ root 专用备份；脚本不会删除 `manual/` 下的手工和
 
 ```bash
 sudo /path/to/repository/deploy/release.sh \
-  --wheel /root/releases/nexa_guardian-0.6.3-py3-none-any.whl \
+  --wheel /root/releases/nexa_guardian-0.6.4-py3-none-any.whl \
   --git-sha 0123456789abcdef0123456789abcdef01234567 \
   --schema-version 8 \
   --ai-model gpt-5.5
@@ -64,6 +64,11 @@ sudo /path/to/repository/deploy/release.sh \
 `AI_MODEL`。切换后失败时，脚本先停止新服务并校验、恢复数据库，临近切回旧代码时才恢复原配置。
 配置已经是 `gpt-5.5` 的后续发布无需重复传入该选项。
 
+只有网关已经由独立只读检查确认精确返回 `HTTP 429` 且错误码为 `model_cooldown`，并由操作者
+明确接受临时冷却时，才可在首次迁移命令末尾追加 `--allow-model-cooldown`。该例外仍会完整
+校验生产配置，只放行这一种错误；认证失败、普通限流、5xx、模型替换和响应契约错误仍会中止。
+正常发布不得使用该选项。
+
 当前版本的 `--schema-version` 必须明确传入 `8`，脚本会在启动后核对数据库的
 `PRAGMA user_version=8`。wheel 模式必须显式提供
 完整 Git SHA；源码模式只接受无未提交或未跟踪文件的干净 Git worktree，默认读取 `HEAD`，
@@ -79,7 +84,8 @@ sudo /path/to/repository/deploy/release.sh \
 3. 校验或构建 wheel，计算并复核 SHA256，创建服务组只读的独立虚拟环境。
 4. 使用候选版本对兼容网关执行固定无害请求，验证 Responses、严格结构化输出、图片输入、
    `low/high` 自适应推理契约及服务端实际采用 `gpt-5.5`、`default`；同时验证机器人身份、
-   更新并发与媒体预览生产配置。任一能力或响应契约失败即停止，不切换生产。
+   更新并发与媒体预览生产配置。除经批准的精确 `model_cooldown` 例外外，任一能力或响应
+   契约失败即停止，不切换生产。
 5. 写入 `release.json` 并完成候选 release 后，停止服务并确认它不再写库。
    若数据库需要升级且仍有进行中的旧版抽奖，发布会停止并恢复原服务；同一 schema 的
    文案或代码补丁会保留活动抽奖并在新进程中继续。
@@ -94,8 +100,13 @@ sudo /path/to/repository/deploy/release.sh \
 9. 验证成功后，仅清理标准命名的旧代码 release，固定保留 `current` 和最近两个旧版本；
    备份目录、非标准目录及 `current` 指向的 release 不会被清理。
 
-`release.json` 记录完整 Git SHA、UTC 构建时间、wheel SHA256、数据库 schema 版本和
-wheel 文件名，可用于把 VM release 对应回 GitHub 版本与构建产物。
+`release.json` 记录完整 Git SHA、UTC 构建时间、wheel SHA256、数据库 schema 版本、
+wheel 文件名和本次网关探针策略，可用于把 VM release 对应回 GitHub 版本与构建产物，
+并区分严格探针与显式允许临时 `model_cooldown` 的发布。
+
+v0.6.4 增加显式、单次的 `--allow-model-cooldown` 发布例外，只接受精确的
+`HTTP 429 model_cooldown`，用于操作者已经确认的临时网关冷却；默认发布路径仍要求
+`low/high`、结构化输出与图片探针全部成功。数据库 schema 保持为 8。
 
 v0.6.3 将审核模型固定切换为 `gpt-5.5`，并继续把历史 `gpt-5.6` 与
 `gpt-5.6-sol` 记录纳入累计和分时统计。数据库 schema 保持为 8。首次从 v0.6.2
