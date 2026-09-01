@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 from aiogram.types import ChatMemberOwner, User
 
+from nexa_guardian.ai_contract import AI_MODEL
 from nexa_guardian.config import Settings
 from nexa_guardian.history_purge import SessionHealth
 from nexa_guardian.status_service import StatusService, stats_cutoffs
@@ -152,7 +153,7 @@ async def _insert_ai_metrics(storage: Storage) -> None:
             is_ad=is_ad,
             confidence=0.99 if is_ad is not None else None,
             category="promotion" if is_ad else "",
-            model="gpt-5.6-sol",
+            model=AI_MODEL,
             latency_ms=latency_ms,
             cached=False,
             enforced=is_ad is True,

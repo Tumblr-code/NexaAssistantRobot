@@ -17,6 +17,9 @@ from nexa_guardian.ai_contract import AI_GATEWAY_MODELS
 SCHEMA_VERSION = 8
 UTC = timezone.utc
 RAFFLE_ZERO_WIDTH_TRANSLATION = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None)
+AI_GATEWAY_MODEL_PARAMETERS = tuple(sorted(AI_GATEWAY_MODELS))
+AI_GATEWAY_MODEL_PLACEHOLDERS = ", ".join("?" for _ in AI_GATEWAY_MODEL_PARAMETERS)
+AI_GATEWAY_MODEL_PREDICATE = f"model IN ({AI_GATEWAY_MODEL_PLACEHOLDERS})"
 
 AI_LEARNING_EVIDENCE_TYPES = (
     "text",
@@ -568,7 +571,7 @@ class Storage:
     async def _rebuild_ai_totals(self) -> None:
         await self.db.execute("DELETE FROM ai_totals")
         await self.db.execute(
-            """
+            f"""
             INSERT INTO ai_totals (
                 chat_id, decisions, calls, ads, enforced, failed, cached,
                 latency_total_ms, latency_samples
@@ -577,29 +580,30 @@ class Storage:
                 chat_id,
                 COUNT(*),
                 SUM(CASE
-                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND cached = 0 THEN 1 ELSE 0
+                    WHEN {AI_GATEWAY_MODEL_PREDICATE} AND cached = 0 THEN 1 ELSE 0
                 END),
                 SUM(CASE WHEN is_ad = 1 THEN 1 ELSE 0 END),
                 SUM(enforced),
                 SUM(CASE
-                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND error_type <> '' THEN 1 ELSE 0
+                    WHEN {AI_GATEWAY_MODEL_PREDICATE} AND error_type <> '' THEN 1 ELSE 0
                 END),
                 SUM(CASE
-                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND cached = 1 THEN 1 ELSE 0
+                    WHEN {AI_GATEWAY_MODEL_PREDICATE} AND cached = 1 THEN 1 ELSE 0
                 END),
                 SUM(CASE
-                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol')
+                    WHEN {AI_GATEWAY_MODEL_PREDICATE}
                          AND cached = 0 AND error_type = ''
                     THEN latency_ms ELSE 0
                 END),
                 SUM(CASE
-                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol')
+                    WHEN {AI_GATEWAY_MODEL_PREDICATE}
                          AND cached = 0 AND error_type = ''
                     THEN 1 ELSE 0
                 END)
             FROM ai_decisions
             GROUP BY chat_id
-            """
+            """,  # noqa: S608 - placeholders come from a fixed internal model allowlist
+            AI_GATEWAY_MODEL_PARAMETERS * 5,
         )
 
     async def _migrate_v7(self) -> None:
@@ -982,30 +986,33 @@ class Storage:
                 average_latency_ms=average_latency_ms,
             )
 
-        query = """
+        query = f"""
             SELECT
                 COUNT(*) AS total,
                 SUM(CASE
-                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND cached = 0 THEN 1 ELSE 0
+                    WHEN {AI_GATEWAY_MODEL_PREDICATE} AND cached = 0 THEN 1 ELSE 0
                 END) AS calls,
                 SUM(CASE WHEN is_ad = 1 THEN 1 ELSE 0 END) AS ads,
                 SUM(enforced) AS enforced,
                 SUM(CASE
-                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND error_type <> '' THEN 1 ELSE 0
+                    WHEN {AI_GATEWAY_MODEL_PREDICATE} AND error_type <> '' THEN 1 ELSE 0
                 END) AS failed,
                 SUM(CASE
-                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol') AND cached = 1 THEN 1 ELSE 0
+                    WHEN {AI_GATEWAY_MODEL_PREDICATE} AND cached = 1 THEN 1 ELSE 0
                 END) AS cached,
                 AVG(CASE
-                    WHEN model IN ('gpt-5.6', 'gpt-5.6-sol')
+                    WHEN {AI_GATEWAY_MODEL_PREDICATE}
                          AND cached = 0 AND error_type = ''
                     THEN latency_ms
                 END) AS average_latency_ms
             FROM ai_decisions
             WHERE chat_id = ?
-        """
+        """  # noqa: S608 - placeholders come from a fixed internal model allowlist
         query += " AND created_at >= ?"
-        cursor = await self.db.execute(query, (chat_id, since))
+        cursor = await self.db.execute(
+            query,
+            (*(AI_GATEWAY_MODEL_PARAMETERS * 4), chat_id, since),
+        )
         row = await cursor.fetchone()
         if row is None:
             return AIStats(0, 0, 0, 0, 0, 0, 0)

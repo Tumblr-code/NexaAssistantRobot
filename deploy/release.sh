@@ -19,16 +19,20 @@ readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
 readonly PYTHON_BIN="/usr/bin/python3"
 readonly CODE_SCHEMA_VERSION="8"
+readonly CODE_AI_MODEL="gpt-5.5"
 
 artifact_mode=""
 artifact_path=""
 git_sha=""
 schema_version=""
+requested_ai_model=""
 stage_path=""
 candidate_release_path=""
 build_path=""
 switch_path=""
 config_backup_staging=""
+candidate_config_path=""
+probe_config_path="${CONFIG_PATH}"
 backup_path=""
 database_backup_sha256=""
 database_backup_validated=0
@@ -42,20 +46,24 @@ switched=0
 release_stable=0
 service_stopped=0
 backup_timer_paused=0
+config_transition=0
 
 usage() {
   cat <<'EOF'
 Usage:
   sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-*.whl \
-    --git-sha <full-git-sha> --schema-version <integer>
+    --git-sha <full-git-sha> --schema-version <integer> \
+    [--ai-model gpt-5.5]
 
   sudo deploy/release.sh --source /absolute/path/to/repository \
-    [--git-sha <full-git-sha>] --schema-version <integer>
+    [--git-sha <full-git-sha>] --schema-version <integer> \
+    [--ai-model gpt-5.5]
 
 The script always deploys to /opt/nexa-guardian, backs up the protected
 configuration, builds and probes the candidate, then stops the service for a
 final consistent database backup before atomically switching current. It keeps
 current plus the two newest older releases after a health check.
+Use --ai-model only for the first transactional migration from the prior model.
 EOF
 }
 
@@ -66,6 +74,92 @@ log() {
 die() {
   printf '[release] ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+update_ai_model_config() {
+  local config_path="$1"
+  local target_model="$2"
+
+  "${PYTHON_BIN}" - "${config_path}" "${target_model}" "$$" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+target_model = sys.argv[2]
+process_id = sys.argv[3]
+staging_path = config_path.parent / f".{config_path.name}.ai-model.{process_id}"
+original = config_path.read_bytes()
+lines = original.splitlines(keepends=True)
+matches = [index for index, line in enumerate(lines) if line.startswith(b"AI_MODEL=")]
+if len(matches) != 1:
+    raise RuntimeError("configuration must contain exactly one literal AI_MODEL= line")
+
+index = matches[0]
+line = lines[index]
+newline = b"\r\n" if line.endswith(b"\r\n") else b"\n" if line.endswith(b"\n") else b""
+current_model = line[len(b"AI_MODEL=") : len(line) - len(newline) if newline else None]
+target = target_model.encode("ascii")
+if current_model == target:
+    print("unchanged")
+    raise SystemExit(0)
+if not current_model or any(character in current_model for character in b" \t#'\""):
+    raise RuntimeError("AI_MODEL must be an unquoted value on its own line")
+
+lines[index] = b"AI_MODEL=" + target + newline
+updated = b"".join(lines)
+metadata = config_path.stat()
+if staging_path.exists() or staging_path.is_symlink():
+    raise RuntimeError(f"configuration staging path already exists: {staging_path}")
+
+try:
+    descriptor = os.open(
+        staging_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        metadata.st_mode & 0o7777,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as target_stream:
+            target_stream.write(updated)
+            target_stream.flush()
+            os.fchown(target_stream.fileno(), metadata.st_uid, metadata.st_gid)
+            os.fchmod(target_stream.fileno(), metadata.st_mode & 0o7777)
+            os.fsync(target_stream.fileno())
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    os.replace(staging_path, config_path)
+    directory_fd = os.open(config_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        staging_path.unlink()
+    except FileNotFoundError:
+        pass
+    raise
+
+print("changed")
+PY
+}
+
+restore_candidate_config_after_failed_rollback() {
+  local update_result=""
+
+  if [[ -z "${requested_ai_model}" ]]; then
+    return 0
+  fi
+  if ! update_result="$(update_ai_model_config "${CONFIG_PATH}" "${requested_ai_model}")"; then
+    return 1
+  fi
+  [[ "${update_result}" == "changed" || "${update_result}" == "unchanged" ]] || return 1
+  config_transition=1
+  printf '[release] restored candidate-compatible configuration after rollback link failure\n' >&2
 }
 
 require_command() {
@@ -161,6 +255,7 @@ switch_current_to() {
 restore_previous_release() {
   local rollback_link="${CURRENT_LINK}.rollback.$$"
   local current_backup_sha256=""
+  local current_after_rollback=""
 
   if (( switched == 0 || release_stable == 1 )); then
     return
@@ -289,6 +384,10 @@ PY
   fi
 
   if [[ -n "${previous_target}" && -d "${previous_target}" ]]; then
+    if ! restore_original_config; then
+      printf '[release] CRITICAL: old code was not restored because its configuration could not be restored\n' >&2
+      return 1
+    fi
     if ln -s -- "${previous_target}" "${rollback_link}" \
       && mv -Tf -- "${rollback_link}" "${CURRENT_LINK}"; then
       if systemctl start "${SERVICE_NAME}" \
@@ -300,8 +399,21 @@ PY
         return 1
       fi
     else
-      printf '[release] CRITICAL: failed to restore previous current link; service remains stopped\n' >&2
+      current_after_rollback="$(canonical_path "${CURRENT_LINK}" 2>/dev/null || true)"
       [[ ! -L "${rollback_link}" ]] || rm -f -- "${rollback_link}"
+      if [[ "${current_after_rollback}" == "${previous_target}" ]]; then
+        if systemctl start "${SERVICE_NAME}" \
+          && systemctl is-active --quiet "${SERVICE_NAME}"; then
+          printf '[release] rollback link was already on the previous release; service restored\n' >&2
+          return 0
+        fi
+        printf '[release] CRITICAL: previous release link was intact but service did not start\n' >&2
+        return 1
+      fi
+      if ! restore_candidate_config_after_failed_rollback; then
+        printf '[release] CRITICAL: failed to restore candidate-compatible configuration\n' >&2
+      fi
+      printf '[release] CRITICAL: failed to restore previous current link; service remains stopped\n' >&2
       return 1
     fi
   elif [[ -L "${CURRENT_LINK}" ]]; then
@@ -312,6 +424,75 @@ PY
 
   printf '[release] CRITICAL: rollback had no previous release to restore\n' >&2
   return 1
+}
+
+restore_original_config() {
+  local restore_result=""
+
+  if (( config_transition == 0 )); then
+    return 0
+  fi
+  if [[ ! -f "${config_backup_path}" || -L "${config_backup_path}" ]]; then
+    printf '[release] CRITICAL: original configuration backup is unavailable\n' >&2
+    return 1
+  fi
+  if ! restore_result="$("${PYTHON_BIN}" - \
+    "${config_backup_path}" "${CONFIG_PATH}" "${config_mode}" "$$" <<'PY'
+import os
+import shutil
+import sys
+from pathlib import Path
+
+backup_path = Path(sys.argv[1])
+config_path = Path(sys.argv[2])
+mode = int(sys.argv[3], 8)
+process_id = sys.argv[4]
+staging_path = config_path.parent / f".{config_path.name}.rollback.{process_id}"
+metadata = config_path.stat()
+
+if staging_path.exists() or staging_path.is_symlink():
+    raise RuntimeError(f"configuration rollback staging path already exists: {staging_path}")
+
+try:
+    with backup_path.open("rb") as source:
+        descriptor = os.open(staging_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as target:
+                shutil.copyfileobj(source, target)
+                target.flush()
+                os.fchown(target.fileno(), metadata.st_uid, metadata.st_gid)
+                os.fchmod(target.fileno(), mode)
+                os.fsync(target.fileno())
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+    os.replace(staging_path, config_path)
+    directory_fd = os.open(config_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        staging_path.unlink()
+    except FileNotFoundError:
+        pass
+    raise
+
+print("restored")
+PY
+  )"; then
+    printf '[release] CRITICAL: failed to restore original configuration\n' >&2
+    return 1
+  fi
+  [[ "${restore_result}" == "restored" ]] || return 1
+  cmp -s -- "${config_backup_path}" "${CONFIG_PATH}" || return 1
+  [[ "$(stat -c '%u:%g:%a' -- "${CONFIG_PATH}")" == "0:0:${config_mode}" ]] || return 1
+  config_transition=0
+  printf '[release] restored the original configuration before rollback\n' >&2
 }
 
 cleanup() {
@@ -343,8 +524,13 @@ cleanup() {
     fi
   fi
 
-  if (( switched == 0 && service_stopped == 1 && release_stable == 0 )); then
-    if systemctl start "${SERVICE_NAME}"; then
+  if (( switched == 0 && service_stopped == 1 && release_stable == 0 \
+    && rollback_succeeded == 1 )); then
+    if ! restore_original_config; then
+      printf '[release] CRITICAL: previous service remains stopped because its configuration could not be restored\n' >&2
+      rollback_succeeded=0
+      exit_code=1
+    elif systemctl start "${SERVICE_NAME}"; then
       printf '[release] previous service restarted after pre-switch failure\n' >&2
     else
       printf '[release] CRITICAL: failed to restart previous service after pre-switch failure\n' >&2
@@ -399,6 +585,18 @@ cleanup() {
       (( release_stable == 1 )) || exit_code=1
     fi
   fi
+  if [[ -n "${candidate_config_path}" ]]; then
+    if [[ "${candidate_config_path}" == "${MANUAL_BACKUP_ROOT}"/.candidate-env-* \
+      && -f "${candidate_config_path}" && ! -L "${candidate_config_path}" ]]; then
+      if ! rm -f -- "${candidate_config_path}"; then
+        printf '[release] WARNING: failed to remove candidate configuration copy\n' >&2
+        (( release_stable == 1 )) || exit_code=1
+      fi
+    elif [[ -e "${candidate_config_path}" || -L "${candidate_config_path}" ]]; then
+      printf '[release] CRITICAL: refusing to remove unexpected candidate configuration path\n' >&2
+      exit_code=1
+    fi
+  fi
 
   if (( backup_timer_paused == 1 )); then
     if (( switched == 1 && release_stable == 0 && rollback_succeeded == 0 )); then
@@ -445,6 +643,12 @@ while (($# > 0)); do
       schema_version="$2"
       shift 2
       ;;
+    --ai-model)
+      [[ $# -ge 2 ]] || die "--ai-model requires a value"
+      [[ -z "${requested_ai_model}" ]] || die "--ai-model may only be provided once"
+      requested_ai_model="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -460,6 +664,8 @@ done
 [[ "${schema_version}" =~ ^[0-9]+$ ]] || die "schema version must be a non-negative integer"
 [[ "${schema_version}" == "${CODE_SCHEMA_VERSION}" ]] \
   || die "this release script requires schema version ${CODE_SCHEMA_VERSION}"
+[[ -z "${requested_ai_model}" || "${requested_ai_model}" == "${CODE_AI_MODEL}" ]] \
+  || die "this release script only supports AI model ${CODE_AI_MODEL}"
 [[ "${artifact_path}" = /* ]] || die "artifact path must be absolute"
 [[ ${EUID} -eq 0 ]] || die "run this script as root"
 
@@ -468,6 +674,7 @@ require_command getent
 require_command findmnt
 require_command cmp
 require_command mv
+require_command mktemp
 require_command readlink
 require_command sha256sum
 require_command stat
@@ -609,6 +816,25 @@ cmp -s -- "${CONFIG_PATH}" "${config_backup_staging}" \
 mv -- "${config_backup_staging}" "${config_backup_path}"
 config_backup_staging=""
 
+if [[ -n "${requested_ai_model}" ]]; then
+  candidate_config_path="$(
+    mktemp "${MANUAL_BACKUP_ROOT}/.candidate-env-${release_id}.XXXXXX"
+  )" || die "failed to create candidate configuration path"
+  [[ -f "${candidate_config_path}" && ! -L "${candidate_config_path}" ]] \
+    || die "candidate configuration path is not a regular file"
+  cp -- "${CONFIG_PATH}" "${candidate_config_path}"
+  chown root:root -- "${candidate_config_path}"
+  chmod 0600 -- "${candidate_config_path}"
+  cmp -s -- "${CONFIG_PATH}" "${candidate_config_path}" \
+    || die "candidate configuration copy verification failed"
+  candidate_update_result="$(
+    update_ai_model_config "${candidate_config_path}" "${requested_ai_model}"
+  )" || die "failed to prepare candidate AI_MODEL"
+  [[ "${candidate_update_result}" == "changed" ]] \
+    || die "--ai-model is only valid when migrating from a different configured model"
+  probe_config_path="${candidate_config_path}"
+fi
+
 build_path="$(mktemp -d /tmp/nexa-guardian-build.XXXXXX)"
 if [[ "${artifact_mode}" == "source" ]]; then
   log "building wheel from ${artifact_path}"
@@ -687,10 +913,15 @@ log "creating isolated virtual environment"
 "${final_release}/.venv/bin/python" -m pip install \
   --disable-pip-version-check --no-cache-dir "${copied_wheel}"
 "${final_release}/.venv/bin/python" -c 'import nexa_guardian'
-log "probing GPT-5.6 Sol adaptive-reasoning capabilities and production settings"
+log "probing GPT-5.5 adaptive-reasoning capabilities and production settings"
 "${final_release}/.venv/bin/nexa-guardian-probe" \
-  --env-file "${CONFIG_PATH}" --require-production-settings \
+  --env-file "${probe_config_path}" --require-production-settings \
   || die "gateway capability probe failed; production was not switched"
+if [[ -n "${candidate_config_path}" ]]; then
+  rm -f -- "${candidate_config_path}" || die "failed to remove candidate configuration copy"
+  candidate_config_path=""
+  probe_config_path="${CONFIG_PATH}"
+fi
 chown -hR "root:${SERVICE_GROUP}" -- "${final_release}"
 chmod -R u=rwX,g=rX,o= -- "${final_release}"
 
@@ -833,6 +1064,16 @@ PY
 session_backup_sha256="$(sha256sum -- "${session_backup_path}" | awk '{print $1}')"
 [[ "${session_backup_sha256}" =~ ^[0-9a-f]{64}$ ]] \
   || die "Telegram session backup checksum verification failed"
+
+if [[ -n "${requested_ai_model}" ]]; then
+  log "atomically applying AI_MODEL=${requested_ai_model} immediately before code switch"
+  config_transition=1
+  production_update_result="$(
+    update_ai_model_config "${CONFIG_PATH}" "${requested_ai_model}"
+  )" || die "failed to apply production AI_MODEL transactionally"
+  [[ "${production_update_result}" == "changed" ]] \
+    || die "production AI_MODEL changed unexpectedly during release"
+fi
 
 log "switching current to ${final_release}"
 switch_current_to "${final_release}"

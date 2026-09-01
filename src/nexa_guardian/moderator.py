@@ -63,12 +63,12 @@ TRUST_CACHE_SECONDS = 60
 TRUST_CACHE_MAX = 4096
 BOT_PROFILE_NAME = "Nexa 群管助手"
 BOT_PROFILE_SHORT_DESCRIPTION = (
-    "Nexa 官方群管理审核员：GPT-5.6 Sol 智能识别广告与刷屏，自动删除并警告；"
+    "Nexa 官方群管理审核员：GPT-5.5 智能识别广告与刷屏，自动删除并警告；"
     "第 3 次直接封禁，并支持安全透明的群抽奖。"
 )
 BOT_PROFILE_DESCRIPTION = """Nexa Guardian 是 @NexaStoreGroup 的官方群管理与安全审核员。
 
-• GPT-5.6 Sol 审核文字、图片及视频封面
+• GPT-5.5 审核文字、图片及视频封面
 • 自动清理广告、诈骗、恶意推广与刷屏；第 3 次警告直接封禁
 • 普通聊天静默处理；仅可疑消息显示审核状态
 • 持续学习高置信广告特征，提升后续拦截效率
