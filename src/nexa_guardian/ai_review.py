@@ -24,6 +24,7 @@ from nexa_guardian.ai_contract import (
 
 ZERO_WIDTH_TRANSLATION = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None)
 ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
+GATEWAY_ERROR_CODE_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 URL_RE = re.compile(
     r"(?i)(?:(?:https?://|www\.|t\.me/|telegram\.me/|wa\.me/)[^\s<>{}\[\]]+|"
     r"(?:[a-z0-9-]+\.)+(?:com|net|org|cn|io|me|xyz|top|vip|shop|site|online)\b"
@@ -328,8 +329,12 @@ class AIReviewTimeout(AIReviewError):
 class AIReviewHTTPError(AIReviewError):
     """The compatible Responses endpoint returned an unsuccessful status."""
 
-    def __init__(self, status: int) -> None:
+    def __init__(self, status: int, error_code: str = "") -> None:
         self.status = status
+        normalized_code = error_code.strip()
+        self.error_code = (
+            normalized_code if GATEWAY_ERROR_CODE_RE.fullmatch(normalized_code) else ""
+        )
         super().__init__(f"AI review endpoint returned HTTP {status}")
 
 
@@ -345,6 +350,16 @@ class AIReviewConnectionError(AIReviewError):
 class HTTPResponse:
     status: int
     body: object
+
+
+def _gateway_error_code(body: object) -> str:
+    if not isinstance(body, Mapping):
+        return ""
+    error = body.get("error")
+    if not isinstance(error, Mapping):
+        return ""
+    code = error.get("code")
+    return code if isinstance(code, str) and GATEWAY_ERROR_CODE_RE.fullmatch(code) else ""
 
 
 class ResponseRequester(Protocol):
@@ -865,7 +880,7 @@ class AIReviewer:
         if response is None:
             raise AIReviewConnectionError("AI review endpoint connection failed")
         if not 200 <= response.status <= 299:
-            raise AIReviewHTTPError(response.status)
+            raise AIReviewHTTPError(response.status, _gateway_error_code(response.body))
 
         if deadline - self._clock() <= 0:
             raise AIReviewTimeout("AI review exceeded the total timeout")

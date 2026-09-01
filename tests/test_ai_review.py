@@ -380,6 +380,18 @@ async def test_retries_connection_and_retryable_status_once() -> None:
         assert len(status_requester.calls) == 2
 
 
+async def test_retryable_http_error_preserves_safe_gateway_error_code() -> None:
+    cooldown = HTTPResponse(429, {"error": {"code": "model_cooldown"}})
+    requester = FakeRequester(cooldown, cooldown)
+
+    with pytest.raises(AIReviewHTTPError) as caught:
+        await reviewer(requester).review(text="message", safety_identifier="opaque")
+
+    assert caught.value.status == 429
+    assert caught.value.error_code == "model_cooldown"
+    assert len(requester.calls) == 2
+
+
 async def test_connection_is_not_retried_more_than_once() -> None:
     requester = FakeRequester(ConnectionError(), ConnectionError())
 
@@ -390,13 +402,24 @@ async def test_connection_is_not_retried_more_than_once() -> None:
 
 
 async def test_non_retryable_http_error_is_not_retried() -> None:
-    requester = FakeRequester(HTTPResponse(400, {}))
+    requester = FakeRequester(HTTPResponse(400, {"error": {"code": "invalid_request"}}))
 
     with pytest.raises(AIReviewHTTPError) as caught:
         await reviewer(requester).review(text="message", safety_identifier="opaque")
 
     assert caught.value.status == 400
+    assert caught.value.error_code == "invalid_request"
     assert len(requester.calls) == 1
+
+
+async def test_http_error_rejects_untrusted_error_code_metadata() -> None:
+    requester = FakeRequester(HTTPResponse(400, {"error": {"code": "unsafe code\nsecret"}}))
+
+    with pytest.raises(AIReviewHTTPError) as caught:
+        await reviewer(requester).review(text="message", safety_identifier="opaque")
+
+    assert caught.value.status == 400
+    assert caught.value.error_code == ""
 
 
 async def test_total_timeout_is_enforced() -> None:

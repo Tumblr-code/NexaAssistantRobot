@@ -26,6 +26,7 @@ artifact_path=""
 git_sha=""
 schema_version=""
 requested_ai_model=""
+allow_model_cooldown=0
 stage_path=""
 candidate_release_path=""
 build_path=""
@@ -53,17 +54,18 @@ usage() {
 Usage:
   sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-*.whl \
     --git-sha <full-git-sha> --schema-version <integer> \
-    [--ai-model gpt-5.5]
+    [--ai-model gpt-5.5] [--allow-model-cooldown]
 
   sudo deploy/release.sh --source /absolute/path/to/repository \
     [--git-sha <full-git-sha>] --schema-version <integer> \
-    [--ai-model gpt-5.5]
+    [--ai-model gpt-5.5] [--allow-model-cooldown]
 
 The script always deploys to /opt/nexa-guardian, backs up the protected
 configuration, builds and probes the candidate, then stops the service for a
 final consistent database backup before atomically switching current. It keeps
 current plus the two newest older releases after a health check.
 Use --ai-model only for the first transactional migration from the prior model.
+Use --allow-model-cooldown only for an operator-approved exact 429 model_cooldown.
 EOF
 }
 
@@ -649,6 +651,11 @@ while (($# > 0)); do
       requested_ai_model="$2"
       shift 2
       ;;
+    --allow-model-cooldown)
+      (( allow_model_cooldown == 0 )) || die "--allow-model-cooldown may only be provided once"
+      allow_model_cooldown=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -666,6 +673,8 @@ done
   || die "this release script requires schema version ${CODE_SCHEMA_VERSION}"
 [[ -z "${requested_ai_model}" || "${requested_ai_model}" == "${CODE_AI_MODEL}" ]] \
   || die "this release script only supports AI model ${CODE_AI_MODEL}"
+(( allow_model_cooldown == 0 )) || [[ "${requested_ai_model}" == "${CODE_AI_MODEL}" ]] \
+  || die "--allow-model-cooldown requires --ai-model ${CODE_AI_MODEL}"
 [[ "${artifact_path}" = /* ]] || die "artifact path must be absolute"
 [[ ${EUID} -eq 0 ]] || die "run this script as root"
 
@@ -877,12 +886,21 @@ copied_wheel="${stage_path}/artifacts/$(basename "${artifact_path}")"
   "${build_time}" \
   "${wheel_sha256}" \
   "${schema_version}" \
-  "$(basename "${artifact_path}")" <<'PY'
+  "$(basename "${artifact_path}")" \
+  "${allow_model_cooldown}" <<'PY'
 import json
 import os
 import sys
 
-path, git_sha, build_time, wheel_sha256, schema_version, artifact = sys.argv[1:]
+(
+    path,
+    git_sha,
+    build_time,
+    wheel_sha256,
+    schema_version,
+    artifact,
+    allow_model_cooldown,
+) = sys.argv[1:]
 metadata = {
     "application": "nexa-guardian",
     "git_sha": git_sha,
@@ -890,6 +908,9 @@ metadata = {
     "wheel_sha256": wheel_sha256,
     "schema_version": int(schema_version),
     "artifact": artifact,
+    "gateway_probe_policy": (
+        "allow_model_cooldown" if allow_model_cooldown == "1" else "strict"
+    ),
 }
 with open(path, "x", encoding="utf-8") as stream:
     json.dump(metadata, stream, ensure_ascii=False, indent=2, sort_keys=True)
@@ -914,8 +935,13 @@ log "creating isolated virtual environment"
   --disable-pip-version-check --no-cache-dir "${copied_wheel}"
 "${final_release}/.venv/bin/python" -c 'import nexa_guardian'
 log "probing GPT-5.5 adaptive-reasoning capabilities and production settings"
+probe_arguments=(--env-file "${probe_config_path}" --require-production-settings)
+if (( allow_model_cooldown == 1 )); then
+  probe_arguments+=(--allow-model-cooldown)
+  log "allowing only an operator-authorized exact 429 model_cooldown during this migration"
+fi
 "${final_release}/.venv/bin/nexa-guardian-probe" \
-  --env-file "${probe_config_path}" --require-production-settings \
+  "${probe_arguments[@]}" \
   || die "gateway capability probe failed; production was not switched"
 if [[ -n "${candidate_config_path}" ]]; then
   rm -f -- "${candidate_config_path}" || die "failed to remove candidate configuration copy"

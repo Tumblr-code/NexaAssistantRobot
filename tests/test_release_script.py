@@ -25,11 +25,22 @@ def _run_embedded(script: str, *arguments: str) -> subprocess.CompletedProcess[s
     )
 
 
+def _run_release_arguments(*arguments: str) -> subprocess.CompletedProcess[str]:
+    release_script = Path(__file__).parents[1] / "deploy" / "release.sh"
+    return subprocess.run(  # noqa: S603 - repository-owned release script
+        [str(release_script), *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     script = _release_script()
 
     assert 'readonly CODE_SCHEMA_VERSION="8"' in script
     assert 'readonly CODE_AI_MODEL="gpt-5.5"' in script
+    assert "--allow-model-cooldown requires --ai-model" in script
     probe = script.index("probing GPT-5.5 adaptive-reasoning capabilities")
     pause_timer = script.index("pausing ${BACKUP_TIMER_NAME}")
     backup_inactive = script.index("database backup service did not become idle")
@@ -121,6 +132,8 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     production_model_update = script.index('log "atomically applying AI_MODEL=')
     assert config_backup < candidate_config < probe < stop < production_model_update < switch
     assert '--env-file "${probe_config_path}"' in script
+    assert "probe_arguments+=(--allow-model-cooldown)" in script
+    assert "operator-authorized exact 429 model_cooldown" in script
     assert 'chmod 0600 -- "${candidate_config_path}"' in script
     assert "configuration must contain exactly one literal AI_MODEL= line" in script
     assert "os.replace(staging_path, config_path)" in script
@@ -138,6 +151,60 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     )
     rollback_failure = rollback[rollback.index("failed to restore previous current link") - 1200 :]
     assert "restore_candidate_config_after_failed_rollback" in rollback_failure
+
+
+def test_release_cooldown_exception_arguments_fail_closed(tmp_path: Path) -> None:
+    base = (
+        "--wheel",
+        str(tmp_path / "nexa-guardian-test.whl"),
+        "--git-sha",
+        "0" * 40,
+        "--schema-version",
+        "8",
+    )
+
+    missing_model = _run_release_arguments(*base, "--allow-model-cooldown")
+    wrong_model = _run_release_arguments(
+        *base,
+        "--ai-model",
+        "gpt-5.6-sol",
+        "--allow-model-cooldown",
+    )
+    duplicate = _run_release_arguments(
+        *base,
+        "--ai-model",
+        "gpt-5.5",
+        "--allow-model-cooldown",
+        "--allow-model-cooldown",
+    )
+
+    assert missing_model.returncode != 0
+    assert "requires --ai-model gpt-5.5" in missing_model.stderr
+    assert wrong_model.returncode != 0
+    assert "only supports AI model gpt-5.5" in wrong_model.stderr
+    assert duplicate.returncode != 0
+    assert "may only be provided once" in duplicate.stderr
+
+
+def test_release_metadata_records_gateway_probe_policy(tmp_path: Path) -> None:
+    script = _release_script()
+    snippet = _embedded_python(script, '"${stage_path}/release.json"')
+
+    for allowed, expected in (("0", "strict"), ("1", "allow_model_cooldown")):
+        metadata_path = tmp_path / f"release-{allowed}.json"
+        result = _run_embedded(
+            snippet,
+            str(metadata_path),
+            "0" * 40,
+            "2026-09-01T00:00:00Z",
+            "1" * 64,
+            "8",
+            "nexa_guardian-0.6.4-py3-none-any.whl",
+            allowed,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert f'"gateway_probe_policy": "{expected}"' in metadata_path.read_text(encoding="utf-8")
 
 
 def test_release_ai_model_update_is_atomic_and_preserves_other_config(tmp_path: Path) -> None:
