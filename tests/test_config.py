@@ -11,6 +11,10 @@ from nexa_guardian.ai_contract import (
 from nexa_guardian.config import Settings
 
 
+def test_release_ai_model_is_fixed_to_gpt_5_5() -> None:
+    assert AI_MODEL == "gpt-5.5"
+
+
 def _base_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BOT_TOKEN", "123:ABC")
     monkeypatch.setenv("ALLOWED_CHAT_IDS", "-100")

@@ -62,7 +62,7 @@ def help_text() -> str:
     lines = [
         "<b>Nexa Guardian</b>",
         "",
-        "广告由 GPT-5.6 Sol 自动审核；累计 3 次警告自动封禁。",
+        "广告由 GPT-5.5 自动审核；累计 3 次警告自动封禁。",
         "",
     ]
     for spec in COMMAND_SPECS:

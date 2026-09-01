@@ -1,11 +1,36 @@
+import stat
+import subprocess
+import sys
 from pathlib import Path
 
 
+def _release_script() -> str:
+    return (Path(__file__).parents[1] / "deploy" / "release.sh").read_text(encoding="utf-8")
+
+
+def _embedded_python(script: str, anchor: str) -> str:
+    anchor_index = script.index(anchor)
+    start = script.index("<<'PY'", anchor_index) + len("<<'PY'")
+    end = script.index("\nPY\n", start)
+    return script[start:end].lstrip("\n")
+
+
+def _run_embedded(script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603 - sys.executable and a repository-owned snippet
+        [sys.executable, "-", *arguments],
+        input=script,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
-    script = (Path(__file__).parents[1] / "deploy" / "release.sh").read_text(encoding="utf-8")
+    script = _release_script()
 
     assert 'readonly CODE_SCHEMA_VERSION="8"' in script
-    probe = script.index("probing GPT-5.6 Sol adaptive-reasoning capabilities")
+    assert 'readonly CODE_AI_MODEL="gpt-5.5"' in script
+    probe = script.index("probing GPT-5.5 adaptive-reasoning capabilities")
     pause_timer = script.index("pausing ${BACKUP_TIMER_NAME}")
     backup_inactive = script.index("database backup service did not become idle")
     stop = script.index("for a final consistent database backup")
@@ -80,7 +105,7 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     )
     assert cleanup.index("set +e") < cleanup.index("restore_previous_release")
     assert "backup timer remains stopped after incomplete rollback" in cleanup
-    assert cleanup.count("(( release_stable == 1 )) || exit_code=1") == 4
+    assert cleanup.count("(( release_stable == 1 )) || exit_code=1") == 5
 
     stable_tail = script[script.index("release_stable=1") :]
     assert " || die " not in stable_tail
@@ -90,6 +115,102 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
         script.index("switch_current_to()") : script.index("restore_previous_release()")
     ]
     assert switch_function.index("switched=1") < switch_function.index("mv -Tf")
+
+    config_backup = script.index('mv -- "${config_backup_staging}" "${config_backup_path}"')
+    candidate_config = script.index('mktemp "${MANUAL_BACKUP_ROOT}/.candidate-env-')
+    production_model_update = script.index('log "atomically applying AI_MODEL=')
+    assert config_backup < candidate_config < probe < stop < production_model_update < switch
+    assert '--env-file "${probe_config_path}"' in script
+    assert 'chmod 0600 -- "${candidate_config_path}"' in script
+    assert "configuration must contain exactly one literal AI_MODEL= line" in script
+    assert "os.replace(staging_path, config_path)" in script
+    assert "restored the original configuration before rollback" in script
+    assert "restore_candidate_config_after_failed_rollback" in script
+
+    rollback = script[
+        script.index("restore_previous_release()") : script.index("restore_original_config()")
+    ]
+    assert rollback.index('systemctl stop "${SERVICE_NAME}"') < rollback.index(
+        "restore_original_config"
+    )
+    assert rollback.index("restore_original_config") < rollback.index(
+        'ln -s -- "${previous_target}"'
+    )
+    rollback_failure = rollback[rollback.index("failed to restore previous current link") - 1200 :]
+    assert "restore_candidate_config_after_failed_rollback" in rollback_failure
+
+
+def test_release_ai_model_update_is_atomic_and_preserves_other_config(tmp_path: Path) -> None:
+    script = _release_script()
+    snippet = _embedded_python(script, "update_ai_model_config()")
+    config = tmp_path / "guardian.env"
+    original = b"SECRET=unchanged\nAI_MODEL=gpt-5.6-sol\nOTHER=value\n"
+    config.write_bytes(original)
+    config.chmod(0o600)
+
+    result = _run_embedded(snippet, str(config), "gpt-5.5", "101")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "changed"
+    assert config.read_bytes() == b"SECRET=unchanged\nAI_MODEL=gpt-5.5\nOTHER=value\n"
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert list(tmp_path.glob(".guardian.env.ai-model.*")) == []
+
+
+def test_release_ai_model_update_rejects_missing_or_duplicate_config(tmp_path: Path) -> None:
+    script = _release_script()
+    snippet = _embedded_python(script, "update_ai_model_config()")
+    invalid_configs = (
+        b"OTHER=value\n",
+        b"AI_MODEL=gpt-5.6-sol\nAI_MODEL=gpt-5.6\n",
+    )
+    for index, original in enumerate(invalid_configs):
+        config = tmp_path / f"guardian-{index}.env"
+        config.write_bytes(original)
+        config.chmod(0o600)
+
+        result = _run_embedded(snippet, str(config), "gpt-5.5", f"102{index}")
+
+        assert result.returncode != 0
+        assert config.read_bytes() == original
+        assert list(tmp_path.glob(f".{config.name}.ai-model.*")) == []
+
+
+def test_release_ai_model_update_reports_unchanged_without_rewrite(tmp_path: Path) -> None:
+    script = _release_script()
+    snippet = _embedded_python(script, "update_ai_model_config()")
+    config = tmp_path / "guardian.env"
+    original = b"SECRET=unchanged\nAI_MODEL=gpt-5.5\n"
+    config.write_bytes(original)
+    config.chmod(0o600)
+    original_inode = config.stat().st_ino
+
+    result = _run_embedded(snippet, str(config), "gpt-5.5", "104")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "unchanged"
+    assert config.read_bytes() == original
+    assert config.stat().st_ino == original_inode
+
+
+def test_release_config_rollback_restores_exact_backup(tmp_path: Path) -> None:
+    script = _release_script()
+    snippet = _embedded_python(script, 'restore_result="$(')
+    backup = tmp_path / "pre-release.env"
+    config = tmp_path / "guardian.env"
+    original = b"SECRET=unchanged\nAI_MODEL=gpt-5.6-sol\n"
+    backup.write_bytes(original)
+    backup.chmod(0o600)
+    config.write_bytes(b"SECRET=unchanged\nAI_MODEL=gpt-5.5\n")
+    config.chmod(0o600)
+
+    result = _run_embedded(snippet, str(backup), str(config), "600", "103")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "restored"
+    assert config.read_bytes() == original
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert list(tmp_path.glob(".guardian.env.rollback.*")) == []
 
 
 def test_runtime_paths_include_persistent_mtproto_session_and_backup() -> None:
