@@ -608,6 +608,7 @@ async def test_ai_stats_distinguish_gateway_calls_cache_and_local_signatures(
     records = (
         ("gpt-5.6", False, True, "", 120),
         ("gpt-5.6-sol", False, True, "", 100),
+        ("gpt-5.5", False, True, "", 90),
         (AI_MODEL, False, True, "", 80),
         (AI_MODEL, True, True, "", 0),
         ("local-signature", True, True, "", 0),
@@ -631,18 +632,18 @@ async def test_ai_stats_distinguish_gateway_calls_cache_and_local_signatures(
 
     stats = await storage.ai_stats(-100)
 
-    assert stats.total == 7
-    assert stats.calls == 4
-    assert stats.ads == 5
+    assert stats.total == 8
+    assert stats.calls == 5
+    assert stats.ads == 6
     assert stats.failed == 1
     assert stats.cached == 1
-    assert stats.average_latency_ms == 100
+    assert stats.average_latency_ms == 97
 
     recent_stats = await storage.ai_stats(-100, since="2000-01-01T00:00:00+00:00")
-    assert recent_stats.calls == 4
+    assert recent_stats.calls == 5
     assert recent_stats.failed == 1
     assert recent_stats.cached == 1
-    assert recent_stats.average_latency_ms == 100
+    assert recent_stats.average_latency_ms == 97
 
     await storage.db.execute("UPDATE ai_decisions SET created_at = '2000-01-01T00:00:00+00:00'")
     await storage.db.commit()
@@ -660,8 +661,8 @@ async def test_ai_stats_distinguish_gateway_calls_cache_and_local_signatures(
         ("text", "link", "promotion"),
         0.80,
     )
-    assert await storage.prune_ai_decisions(retention_days=30) == 7
-    assert (await storage.ai_stats(-100)).total == 7
+    assert await storage.prune_ai_decisions(retention_days=30) == 8
+    assert (await storage.ai_stats(-100)).total == 8
     assert (await storage.ai_stats(-100, since="2026-01-01T00:00:00+00:00")).total == 0
     persistent = await storage.ai_signatures(-100, statuses=("candidate",))
     assert [(item.normalized_signature, item.hit_count) for item in persistent] == [
