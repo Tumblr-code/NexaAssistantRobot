@@ -72,7 +72,7 @@ async def probe_gateway(
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Probe the configured GPT-5.5 gateway")
+    parser = argparse.ArgumentParser(description=f"Probe the configured {AI_MODEL} gateway")
     parser.add_argument(
         "--env-file",
         type=Path,

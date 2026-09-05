@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from nexa_guardian.ai_contract import (
+    AI_GATEWAY_MODELS,
     AI_MODEL,
     AI_REASONING_EFFORT,
     AI_SERVICE_TIER,
@@ -11,8 +12,9 @@ from nexa_guardian.ai_contract import (
 from nexa_guardian.config import Settings
 
 
-def test_release_ai_model_is_fixed_to_gpt_5_5() -> None:
-    assert AI_MODEL == "gpt-5.5"
+def test_release_ai_model_is_fixed_to_gpt_5_6_luna() -> None:
+    assert AI_MODEL == "gpt-5.6-luna"
+    assert "gpt-5.5" in AI_GATEWAY_MODELS
 
 
 def _base_env(monkeypatch: pytest.MonkeyPatch) -> None:

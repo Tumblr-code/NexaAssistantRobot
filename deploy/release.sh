@@ -19,7 +19,7 @@ readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
 readonly PYTHON_BIN="/usr/bin/python3"
 readonly CODE_SCHEMA_VERSION="8"
-readonly CODE_AI_MODEL="gpt-5.5"
+readonly CODE_AI_MODEL="gpt-5.6-luna"
 
 artifact_mode=""
 artifact_path=""
@@ -54,11 +54,11 @@ usage() {
 Usage:
   sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-*.whl \
     --git-sha <full-git-sha> --schema-version <integer> \
-    [--ai-model gpt-5.5] [--allow-model-cooldown]
+    [--ai-model gpt-5.6-luna] [--allow-model-cooldown]
 
   sudo deploy/release.sh --source /absolute/path/to/repository \
     [--git-sha <full-git-sha>] --schema-version <integer> \
-    [--ai-model gpt-5.5] [--allow-model-cooldown]
+    [--ai-model gpt-5.6-luna] [--allow-model-cooldown]
 
 The script always deploys to /opt/nexa-guardian, backs up the protected
 configuration, builds and probes the candidate, then stops the service for a
@@ -934,7 +934,7 @@ log "creating isolated virtual environment"
 "${final_release}/.venv/bin/python" -m pip install \
   --disable-pip-version-check --no-cache-dir "${copied_wheel}"
 "${final_release}/.venv/bin/python" -c 'import nexa_guardian'
-log "probing GPT-5.5 adaptive-reasoning capabilities and production settings"
+log "probing ${CODE_AI_MODEL} adaptive-reasoning capabilities and production settings"
 probe_arguments=(--env-file "${probe_config_path}" --require-production-settings)
 if (( allow_model_cooldown == 1 )); then
   probe_arguments+=(--allow-model-cooldown)
