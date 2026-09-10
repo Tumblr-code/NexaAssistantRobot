@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _release_script() -> str:
     return (Path(__file__).parents[1] / "deploy" / "release.sh").read_text(encoding="utf-8")
@@ -39,10 +41,10 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     script = _release_script()
 
     assert 'readonly CODE_SCHEMA_VERSION="8"' in script
-    assert 'readonly CODE_AI_MODEL="gpt-6-astra"' in script
+    assert 'readonly CODE_AI_MODEL="deepseek-flash"' in script
     assert 'readonly APP_ROOT="/opt/projects/nexa-guardian/runtime"' in script
     assert "--allow-model-cooldown requires --ai-model" in script
-    probe = script.index("probing ${CODE_AI_MODEL} low-reasoning capabilities")
+    probe = script.index("probing ${CODE_AI_MODEL} non-thinking capabilities")
     pause_timer = script.index("pausing ${BACKUP_TIMER_NAME}")
     backup_inactive = script.index("database backup service did not become idle")
     stop = script.index("for a final consistent database backup")
@@ -174,15 +176,15 @@ def test_release_cooldown_exception_arguments_fail_closed(tmp_path: Path) -> Non
     duplicate = _run_release_arguments(
         *base,
         "--ai-model",
-        "gpt-6-astra",
+        "deepseek-flash",
         "--allow-model-cooldown",
         "--allow-model-cooldown",
     )
 
     assert missing_model.returncode != 0
-    assert "requires --ai-model gpt-6-astra" in missing_model.stderr
+    assert "requires --ai-model deepseek-flash" in missing_model.stderr
     assert wrong_model.returncode != 0
-    assert "only supports AI model gpt-6-astra" in wrong_model.stderr
+    assert "only supports AI model deepseek-flash" in wrong_model.stderr
     assert duplicate.returncode != 0
     assert "may only be provided once" in duplicate.stderr
 
@@ -200,7 +202,7 @@ def test_release_metadata_records_gateway_probe_policy(tmp_path: Path) -> None:
             "2026-09-01T00:00:00Z",
             "1" * 64,
             "8",
-            "nexa_guardian-0.6.6-py3-none-any.whl",
+            "nexa_guardian-0.6.7-py3-none-any.whl",
             allowed,
         )
 
@@ -220,13 +222,13 @@ def test_release_ai_model_update_is_atomic_and_preserves_other_config(tmp_path: 
     config.write_bytes(original)
     config.chmod(0o600)
 
-    result = _run_embedded(snippet, str(config), "gpt-6-astra", "101")
+    result = _run_embedded(snippet, str(config), "deepseek-flash", "101")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "changed"
-    assert config.read_bytes() == original.replace(b"gpt-5.6-luna", b"gpt-6-astra").replace(
-        b"=high\n", b"=low\n"
-    )
+    assert config.read_bytes() == original.replace(b"gpt-5.6-luna", b"deepseek-flash").replace(
+        b"=high\n", b"=none\n"
+    ).replace(b"=low\n", b"=none\n")
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
     assert list(tmp_path.glob(".guardian.env.ai-model.*")) == []
 
@@ -247,7 +249,7 @@ def test_release_ai_model_update_rejects_missing_or_duplicate_config(tmp_path: P
         config.write_bytes(original)
         config.chmod(0o600)
 
-        result = _run_embedded(snippet, str(config), "gpt-6-astra", f"102{index}")
+        result = _run_embedded(snippet, str(config), "deepseek-flash", f"102{index}")
 
         assert result.returncode != 0
         assert config.read_bytes() == original
@@ -259,15 +261,15 @@ def test_release_ai_model_update_reports_unchanged_without_rewrite(tmp_path: Pat
     snippet = _embedded_python(script, "update_ai_model_config()")
     config = tmp_path / "guardian.env"
     original = (
-        b"SECRET=unchanged\nAI_MODEL=gpt-6-astra\n"
-        b"AI_REASONING_EFFORT=low\nAI_NORMAL_REASONING_EFFORT=low\n"
-        b"AI_SUSPICIOUS_REASONING_EFFORT=low\n"
+        b"SECRET=unchanged\nAI_MODEL=deepseek-flash\n"
+        b"AI_REASONING_EFFORT=none\nAI_NORMAL_REASONING_EFFORT=none\n"
+        b"AI_SUSPICIOUS_REASONING_EFFORT=none\n"
     )
     config.write_bytes(original)
     config.chmod(0o600)
     original_inode = config.stat().st_ino
 
-    result = _run_embedded(snippet, str(config), "gpt-6-astra", "104")
+    result = _run_embedded(snippet, str(config), "deepseek-flash", "104")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "unchanged"
@@ -288,7 +290,7 @@ def test_release_config_rollback_restores_exact_backup(tmp_path: Path) -> None:
     backup.write_bytes(original)
     backup.chmod(0o600)
     config.write_bytes(
-        original.replace(b"gpt-5.6-luna", b"gpt-6-astra").replace(b"=high\n", b"=low\n")
+        original.replace(b"gpt-5.6-luna", b"deepseek-flash").replace(b"=high\n", b"=low\n")
     )
     config.chmod(0o600)
 
@@ -309,3 +311,63 @@ def test_runtime_paths_include_persistent_mtproto_session_and_backup() -> None:
     assert "TELEGRAM_SESSION_PATH: /data/mtproto/admin" in compose
     assert "Environment=TELEGRAM_SESSION_PATH=/var/lib/nexa-guardian/mtproto/admin" in backup_unit
     assert "--session-path /var/lib/nexa-guardian/mtproto/admin" in backup_unit
+
+
+def test_release_credentials_are_atomic_and_rollback_restores_old_provider(tmp_path: Path) -> None:
+    script = _release_script()
+    update = _embedded_python(script, "update_ai_model_config()")
+    rollback = _embedded_python(script, 'restore_result="$(')
+    original = (
+        b"BOT_TOKEN=unchanged\nAI_MODEL=gpt-5.6-luna\n"
+        b"AI_REASONING_EFFORT=high\nAI_NORMAL_REASONING_EFFORT=low\n"
+        b"AI_SUSPICIOUS_REASONING_EFFORT=high\n"
+        b"OPENAI_BASE_URL=https://old.example\nOPENAI_API_KEY=old-placeholder\n"
+    )
+    config = tmp_path / "guardian.env"
+    backup = tmp_path / "backup.env"
+    credentials = tmp_path / "credentials.env"
+    for path in (config, backup):
+        path.write_bytes(original)
+        path.chmod(0o600)
+    credentials.write_bytes(
+        b"OPENAI_BASE_URL=https://api.deepseek.com\nOPENAI_API_KEY=new-placeholder\n"
+    )
+    credentials.chmod(0o600)
+    result = _run_embedded(update, str(config), "deepseek-flash", "105", str(credentials))
+    assert result.returncode == 0, result.stderr
+    updated = config.read_bytes()
+    assert b"AI_MODEL=deepseek-flash\n" in updated
+    assert b"OPENAI_API_KEY=new-placeholder\n" in updated
+    assert b"OPENAI_BASE_URL=https://api.deepseek.com\n" in updated
+    assert b"BOT_TOKEN=unchanged\n" in updated
+    assert b"=high\n" not in updated and b"=low\n" not in updated
+    assert "placeholder" not in result.stdout + result.stderr
+    restored = _run_embedded(rollback, str(backup), str(config), "600", "106")
+    assert restored.returncode == 0, restored.stderr
+    assert config.read_bytes() == original
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("invalid", ["symlink", "permissions", "host", "duplicate", "extra"])
+def test_release_unsafe_credentials_do_not_modify_config(tmp_path: Path, invalid: str) -> None:
+    snippet = _embedded_python(_release_script(), "update_ai_model_config()")
+    config = tmp_path / "guardian.env"
+    config.write_bytes(b"SECRET=must-not-change\n")
+    credentials = tmp_path / "credentials.env"
+    content = b"OPENAI_BASE_URL=https://api.deepseek.com\nOPENAI_API_KEY=placeholder\n"
+    if invalid == "host":
+        content = content.replace(b"https://api.deepseek.com", b"http://api.deepseek.com")
+    elif invalid == "duplicate":
+        content += b"OPENAI_API_KEY=duplicate\n"
+    elif invalid == "extra":
+        content += b"BOT_TOKEN=not-allowed\n"
+    credentials.write_bytes(content)
+    credentials.chmod(0o644 if invalid == "permissions" else 0o600)
+    if invalid == "symlink":
+        link = tmp_path / "link.env"
+        link.symlink_to(credentials)
+        credentials = link
+    result = _run_embedded(snippet, str(config), "deepseek-flash", "107", str(credentials))
+    assert result.returncode != 0
+    assert config.read_bytes() == b"SECRET=must-not-change\n"
+    assert "placeholder" not in result.stdout + result.stderr

@@ -12,9 +12,9 @@ from nexa_guardian.ai_contract import (
 from nexa_guardian.config import Settings
 
 
-def test_release_ai_model_is_fixed_to_gpt_6_astra() -> None:
-    assert AI_MODEL == "gpt-6-astra"
-    assert AI_REASONING_EFFORT == "low"
+def test_release_ai_model_is_fixed_to_deepseek_flash() -> None:
+    assert AI_MODEL == "deepseek-flash"
+    assert AI_REASONING_EFFORT == "none"
     assert "gpt-5.6-luna" in AI_GATEWAY_MODELS
     assert "gpt-5.5" in AI_GATEWAY_MODELS
 
@@ -82,8 +82,8 @@ def test_adaptive_reasoning_and_runtime_limits(monkeypatch: pytest.MonkeyPatch) 
     _base_env(monkeypatch)
     monkeypatch.setenv("EXPECTED_BOT_ID", "8476280054")
     monkeypatch.setenv("EXPECTED_BOT_USERNAME", "@NexaAdminRobot")
-    monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "low")
-    monkeypatch.setenv("AI_SUSPICIOUS_REASONING_EFFORT", "low")
+    monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "none")
+    monkeypatch.setenv("AI_SUSPICIOUS_REASONING_EFFORT", "none")
     monkeypatch.setenv("AI_NORMAL_ACCEPT_CONFIDENCE", "0.9")
     monkeypatch.setenv("UPDATE_CONCURRENCY_LIMIT", "32")
     monkeypatch.setenv("AI_IMAGE_MAX_BYTES", "1572864")
@@ -95,8 +95,8 @@ def test_adaptive_reasoning_and_runtime_limits(monkeypatch: pytest.MonkeyPatch) 
 
     assert settings.expected_bot_id == 8476280054
     assert settings.expected_bot_username == "NexaAdminRobot"
-    assert settings.ai_normal_reasoning_effort == "low"
-    assert settings.ai_suspicious_reasoning_effort == "low"
+    assert settings.ai_normal_reasoning_effort == "none"
+    assert settings.ai_suspicious_reasoning_effort == "none"
     assert settings.ai_normal_accept_confidence == 0.9
     assert settings.update_concurrency_limit == 32
     assert settings.ai_image_max_bytes == 1572864
@@ -109,7 +109,7 @@ def test_adaptive_reasoning_must_be_configured_as_a_pair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _base_env(monkeypatch)
-    monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "low")
+    monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "none")
 
     with pytest.raises(ValueError, match="必须同时配置"):
         Settings.from_env()
@@ -119,9 +119,9 @@ def test_adaptive_reasoning_must_be_configured_as_a_pair(
     ("setting", "value", "message"),
     (
         ("EXPECTED_BOT_ID", "0", "正整数"),
-        ("AI_NORMAL_REASONING_EFFORT", "medium", "必须固定为 low"),
-        ("AI_NORMAL_REASONING_EFFORT", "high", "必须固定为 low"),
-        ("AI_SUSPICIOUS_REASONING_EFFORT", "high", "必须固定为 low"),
+        ("AI_NORMAL_REASONING_EFFORT", "medium", "必须固定为 none"),
+        ("AI_NORMAL_REASONING_EFFORT", "high", "必须固定为 none"),
+        ("AI_SUSPICIOUS_REASONING_EFFORT", "high", "必须固定为 none"),
     ),
 )
 def test_runtime_safety_configuration_is_validated(
@@ -132,8 +132,8 @@ def test_runtime_safety_configuration_is_validated(
 ) -> None:
     _base_env(monkeypatch)
     if setting.startswith("AI_") and "REASONING" in setting:
-        monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "low")
-        monkeypatch.setenv("AI_SUSPICIOUS_REASONING_EFFORT", "low")
+        monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "none")
+        monkeypatch.setenv("AI_SUSPICIOUS_REASONING_EFFORT", "none")
     monkeypatch.setenv(setting, value)
 
     with pytest.raises(ValueError, match=message):
@@ -146,14 +146,14 @@ def test_ai_requires_gateway_credentials(monkeypatch: pytest.MonkeyPatch) -> Non
     with pytest.raises(ValueError, match="OPENAI_BASE_URL"):
         Settings.from_env()
 
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1/")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com/")
     with pytest.raises(ValueError, match="OPENAI_API_KEY"):
         Settings.from_env()
 
     monkeypatch.setenv("OPENAI_API_KEY", "placeholder-credential")
     settings = Settings.from_env()
     assert settings.ai_enabled is True
-    assert settings.openai_base_url == "https://gateway.example/v1"
+    assert settings.openai_base_url == "https://api.deepseek.com"
 
 
 def test_learning_threshold_cannot_be_lower_than_action_threshold(
@@ -163,6 +163,15 @@ def test_learning_threshold_cannot_be_lower_than_action_threshold(
     monkeypatch.setenv("AI_AD_THRESHOLD", "0.95")
     monkeypatch.setenv("AI_LEARN_THRESHOLD", "0.90")
     with pytest.raises(ValueError, match="不能低于"):
+        Settings.from_env()
+
+
+def test_deepseek_key_cannot_be_sent_to_another_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("AI_ENABLED", "true")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "placeholder-credential")
+    with pytest.raises(ValueError, match="OPENAI_BASE_URL"):
         Settings.from_env()
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 from nexa_guardian.ai_contract import (
+    AI_BASE_URL,
     AI_MODEL,
     AI_REASONING_EFFORT,
     AI_REASONING_EFFORTS,
@@ -44,7 +45,7 @@ async def probe_gateway(
     if model != AI_MODEL:
         raise ValueError(f"AI_MODEL must be exactly {AI_MODEL}")
     if reasoning_effort not in AI_REASONING_EFFORTS:
-        raise ValueError("AI_REASONING_EFFORT must be low or high")
+        raise ValueError("AI_REASONING_EFFORT must be none, low or high")
     if service_tier != AI_SERVICE_TIER:
         raise ValueError(f"AI_SERVICE_TIER must be exactly {AI_SERVICE_TIER}")
 
@@ -110,6 +111,7 @@ def _validate_production_settings(values: Mapping[str, str | None]) -> None:
     if _env_value(values, "DRY_RUN", "false").casefold() not in false_values:
         raise ValueError("DRY_RUN must be false for production")
     fixed_settings = {
+        "OPENAI_BASE_URL": AI_BASE_URL,
         "AI_MODEL": AI_MODEL,
         "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
         "AI_NORMAL_REASONING_EFFORT": AI_REASONING_EFFORT,

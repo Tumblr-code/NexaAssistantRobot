@@ -19,13 +19,14 @@ readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
 readonly PYTHON_BIN="/usr/bin/python3"
 readonly CODE_SCHEMA_VERSION="8"
-readonly CODE_AI_MODEL="gpt-6-astra"
+readonly CODE_AI_MODEL="deepseek-flash"
 
 artifact_mode=""
 artifact_path=""
 git_sha=""
 schema_version=""
 requested_ai_model=""
+ai_credentials_file=""
 allow_model_cooldown=0
 stage_path=""
 candidate_release_path=""
@@ -54,17 +55,18 @@ usage() {
 Usage:
   sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-*.whl \
     --git-sha <full-git-sha> --schema-version <integer> \
-    [--ai-model gpt-6-astra] [--allow-model-cooldown]
+    [--ai-model deepseek-flash] [--ai-credentials-file /protected/credentials.env]
 
   sudo deploy/release.sh --source /absolute/path/to/repository \
     [--git-sha <full-git-sha>] --schema-version <integer> \
-    [--ai-model gpt-6-astra] [--allow-model-cooldown]
+    [--ai-model deepseek-flash] [--ai-credentials-file /protected/credentials.env]
 
 The script always deploys to /opt/projects/nexa-guardian/runtime, backs up the protected
 configuration, builds and probes the candidate, then stops the service for a
 final consistent database backup before atomically switching current. It keeps
 current plus the two newest older releases after a health check.
-Use --ai-model for the transactional model and low-reasoning migration.
+Use --ai-model for the transactional model and non-thinking migration.
+Use --ai-credentials-file for an owner-only file containing OPENAI_BASE_URL and OPENAI_API_KEY.
 Use --allow-model-cooldown only for an operator-approved exact 429 model_cooldown.
 EOF
 }
@@ -82,8 +84,9 @@ update_ai_model_config() {
   local config_path="$1"
   local target_model="$2"
 
-  "${PYTHON_BIN}" - "${config_path}" "${target_model}" "$$" <<'PY'
+  "${PYTHON_BIN}" - "${config_path}" "${target_model}" "$$" "${ai_credentials_file}" <<'PY'
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -95,10 +98,31 @@ original = config_path.read_bytes()
 lines = original.splitlines(keepends=True)
 targets = {
     b"AI_MODEL": target_model.encode("ascii"),
-    b"AI_REASONING_EFFORT": b"low",
-    b"AI_NORMAL_REASONING_EFFORT": b"low",
-    b"AI_SUSPICIOUS_REASONING_EFFORT": b"low",
+    b"AI_REASONING_EFFORT": b"none",
+    b"AI_NORMAL_REASONING_EFFORT": b"none",
+    b"AI_SUSPICIOUS_REASONING_EFFORT": b"none",
 }
+credentials_path = sys.argv[4] if len(sys.argv) > 4 else ""
+if credentials_path:
+    descriptor = os.open(credentials_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as credentials_stream:
+        metadata = os.fstat(credentials_stream.fileno())
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & ~0o600):
+            raise RuntimeError("credential file must be owner-only and not a symlink")
+        credentials = {}
+        for line in credentials_stream.read(4097).splitlines():
+            key, separator, value = line.partition(b"=")
+            if not separator or key in credentials or key not in (
+                b"OPENAI_BASE_URL", b"OPENAI_API_KEY"
+            ) or not value or any(character in value for character in b" \t#'\""):
+                raise RuntimeError("credential file must contain exactly two literal AI settings")
+            credentials[key] = value
+        if (set(credentials) != {b"OPENAI_BASE_URL", b"OPENAI_API_KEY"}
+                or credentials[b"OPENAI_BASE_URL"] != b"https://api.deepseek.com"
+                or len(credentials[b"OPENAI_API_KEY"]) > 512):
+            raise RuntimeError("invalid official DeepSeek credentials configuration")
+        targets.update(credentials)
 for key, target in targets.items():
     prefix = key + b"="
     matches = [index for index, line in enumerate(lines) if line.startswith(prefix)]
@@ -661,6 +685,12 @@ while (($# > 0)); do
       allow_model_cooldown=1
       shift
       ;;
+    --ai-credentials-file)
+      [[ $# -ge 2 ]] || die "--ai-credentials-file requires a protected path"
+      [[ -z "${ai_credentials_file}" ]] || die "--ai-credentials-file may only be provided once"
+      ai_credentials_file="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -680,6 +710,14 @@ done
   || die "this release script only supports AI model ${CODE_AI_MODEL}"
 (( allow_model_cooldown == 0 )) || [[ "${requested_ai_model}" == "${CODE_AI_MODEL}" ]] \
   || die "--allow-model-cooldown requires --ai-model ${CODE_AI_MODEL}"
+if [[ -n "${ai_credentials_file}" ]]; then
+  [[ "${requested_ai_model}" == "${CODE_AI_MODEL}" ]] \
+    || die "--ai-credentials-file requires --ai-model ${CODE_AI_MODEL}"
+  [[ "${ai_credentials_file}" = /* && -f "${ai_credentials_file}" && ! -L "${ai_credentials_file}" ]] \
+    || die "AI credentials must be a regular absolute non-symlink file"
+  [[ "$(readlink -f -- "${ai_credentials_file}")" == "${ai_credentials_file}" ]] \
+    || die "AI credentials path resolved unexpectedly"
+fi
 [[ "${artifact_path}" = /* ]] || die "artifact path must be absolute"
 [[ ${EUID} -eq 0 ]] || die "run this script as root"
 
@@ -939,7 +977,7 @@ log "creating isolated virtual environment"
 "${final_release}/.venv/bin/python" -m pip install \
   --disable-pip-version-check --no-cache-dir "${copied_wheel}"
 "${final_release}/.venv/bin/python" -c 'import nexa_guardian'
-log "probing ${CODE_AI_MODEL} low-reasoning capabilities and production settings"
+log "probing ${CODE_AI_MODEL} non-thinking capabilities and production settings"
 probe_arguments=(--env-file "${probe_config_path}" --require-production-settings)
 if (( allow_model_cooldown == 1 )); then
   probe_arguments+=(--allow-model-cooldown)
@@ -1098,12 +1136,16 @@ session_backup_sha256="$(sha256sum -- "${session_backup_path}" | awk '{print $1}
 
 if [[ -n "${requested_ai_model}" ]]; then
   log "atomically applying AI_MODEL=${requested_ai_model} immediately before code switch"
+  cmp -s -- "${CONFIG_PATH}" "${config_backup_path}" \
+    || die "production configuration changed after release preflight"
   config_transition=1
   production_update_result="$(
     update_ai_model_config "${CONFIG_PATH}" "${requested_ai_model}"
   )" || die "failed to apply production AI_MODEL transactionally"
   [[ "${production_update_result}" == "changed" ]] \
     || die "production AI_MODEL changed unexpectedly during release"
+  cmp -s -- "${CONFIG_PATH}" "${candidate_config_path}" \
+    || die "production AI configuration does not match the probed candidate"
 fi
 
 log "switching current to ${final_release}"
