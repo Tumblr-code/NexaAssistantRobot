@@ -1,8 +1,8 @@
 # Nexa Guardian 发布说明
 
 `deploy/release.sh` 仅用于生产 VM，以 root 身份把一个已构建 wheel 或源码目录发布到
-`/opt/nexa-guardian/releases/`。脚本不会输出 `/etc/nexa-guardian/guardian.env`
-的内容；仅在显式传入 `--ai-model gpt-5.6-luna` 时原子更新模型行，并始终在变更前创建一份
+`/opt/projects/nexa-guardian/runtime/releases/`；旧 `/opt/nexa-guardian` 兼容链接保留。脚本不会输出 `/etc/nexa-guardian/guardian.env`
+的内容；仅在显式传入 `--ai-model gpt-6-astra` 时原子更新模型及三项思考配置，并始终在变更前创建一份
 root 专用备份；脚本不会删除 `manual/` 下的手工和
 发布前备份，根目录的标准每日备份仍会按 30 天策略轮换。
 
@@ -21,12 +21,12 @@ root 专用备份；脚本不会删除 `manual/` 下的手工和
 - 使用 `--source` 时，还需安装 Python `build`、`uv` 或可用的 `python3 -m pip`；生产发布优先使用 CI 构建的 wheel。
 - 在运行脚本前，将仓库或 wheel 放到 VM 上的明确绝对路径；不要把 API Key 写入 wheel、源码或命令行。
 - `/etc/nexa-guardian/guardian.env` 必须配置兼容网关的 `OPENAI_BASE_URL`、
-  `OPENAI_API_KEY`、`AI_REASONING_EFFORT=high`、
-  `AI_NORMAL_REASONING_EFFORT=low`、`AI_SUSPICIOUS_REASONING_EFFORT=high` 和
-  `AI_SERVICE_TIER=default`；模型与自适应推理契约必须显式存在，不接受默认补齐、家族别名或静默改写。
-  首次从 v0.6.4 升级时保留 `AI_MODEL=gpt-5.5` 并向发布脚本传入
-  `--ai-model gpt-5.6-luna`，不要提前手改线上配置；后续发布要求已配置
-  `AI_MODEL=gpt-5.6-luna`。
+  `OPENAI_API_KEY`、`AI_REASONING_EFFORT=low`、
+  `AI_NORMAL_REASONING_EFFORT=low`、`AI_SUSPICIOUS_REASONING_EFFORT=low` 和
+  `AI_SERVICE_TIER=default`；模型与单次低思考契约必须显式存在，不接受默认补齐、家族别名或静默改写。
+  首次从 v0.6.5 升级时保留线上模型和思考配置，并向发布脚本传入
+  `--ai-model gpt-6-astra`；候选副本先迁移、验证，切换时才更新线上配置。后续发布要求已配置
+  `AI_MODEL=gpt-6-astra` 和全量 `low`。
   还必须显式配置正确的 `EXPECTED_BOT_ID`、`EXPECTED_BOT_USERNAME`，以及
   `UPDATE_CONCURRENCY_LIMIT=32`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、
   `AI_TIMEOUT_SECONDS=12`、
@@ -34,7 +34,7 @@ root 专用备份；脚本不会删除 `manual/` 下的手工和
   `AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2`、`AI_MEDIA_CONCURRENCY=4`。
   发布脚本会用候选虚拟环境的 `nexa-guardian-probe --require-production-settings` 验证
   Responses、严格结构化输出和图片输入，并要求响应明确返回 `status=completed`、
-  `model=gpt-5.6-luna`、本次请求对应的 `reasoning.effort=low/high`、
+  `model=gpt-6-astra`、本次请求对应的 `reasoning.effort=low`、
   `service_tier=default`。探针还会拒绝未启用 AI、警告阈值不是 3、消息保留时间不是 30 秒、
   机器人身份未固定或关闭故障删除的配置，同时核对发布计划固定的阈值、超时、更新/AI/媒体
   并发、缓存、保留期及图片预览限制。探测只发送固定的无害文本及 1×1 测试图片，
@@ -46,10 +46,10 @@ root 专用备份；脚本不会删除 `manual/` 下的手工和
 
 ```bash
 sudo /path/to/repository/deploy/release.sh \
-  --wheel /root/releases/nexa_guardian-0.6.5-py3-none-any.whl \
+  --wheel /root/releases/nexa_guardian-0.6.6-py3-none-any.whl \
   --git-sha 0123456789abcdef0123456789abcdef01234567 \
   --schema-version 8 \
-  --ai-model gpt-5.6-luna
+  --ai-model gpt-6-astra
 ```
 
 直接从已检出的源码构建：
@@ -60,10 +60,10 @@ sudo /path/to/repository/deploy/release.sh \
   --schema-version 8
 ```
 
-首次从旧模型迁移时传入 `--ai-model gpt-5.6-luna`。脚本先备份原配置，用临时候选副本完成
+首次从旧模型迁移时传入 `--ai-model gpt-6-astra`。脚本先备份原配置，用临时候选副本完成
 构建与探针；旧服务停稳且数据库与会话备份完成后，才在代码切换前一刻原子替换生产
-`AI_MODEL`。切换后失败时，脚本先停止新服务并校验、恢复数据库，临近切回旧代码时才恢复原配置。
-配置已经是 `gpt-5.6-luna` 的后续发布无需重复传入该选项。
+`AI_MODEL` 及三项思考配置。切换后失败时，脚本先停止新服务并校验、恢复数据库，临近切回旧代码时才恢复原模型及思考配置。
+配置已经是 `gpt-6-astra` 和全量 `low` 的后续发布无需重复传入该选项。
 
 只有网关已经由独立只读检查确认精确返回 `HTTP 429` 且错误码为 `model_cooldown`，并由操作者
 明确接受临时冷却时，才可在首次迁移命令末尾追加 `--allow-model-cooldown`。该例外仍会完整
@@ -84,7 +84,7 @@ sudo /path/to/repository/deploy/release.sh \
    旧服务读取的生产配置。日志只显示备份路径和目标模型，不输出配置内容。
 3. 校验或构建 wheel，计算并复核 SHA256，创建服务组只读的独立虚拟环境。
 4. 使用候选版本对兼容网关执行固定无害请求，验证 Responses、严格结构化输出、图片输入、
-   `low/high` 自适应推理契约及服务端实际采用 `gpt-5.6-luna`、`default`；同时验证机器人身份、
+   `low` 推理契约及服务端实际采用 `gpt-6-astra`、`default`；同时验证机器人身份、
    更新并发与媒体预览生产配置。除经批准的精确 `model_cooldown` 例外外，任一能力或响应
    契约失败即停止，不切换生产。
 5. 写入 `release.json` 并完成候选 release 后，停止服务并确认它不再写库。
@@ -104,6 +104,10 @@ sudo /path/to/repository/deploy/release.sh \
 `release.json` 记录完整 Git SHA、UTC 构建时间、wheel SHA256、数据库 schema 版本、
 wheel 文件名和本次网关探针策略，可用于把 VM release 对应回 GitHub 版本与构建产物，
 并区分严格探针与显式允许临时 `model_cooldown` 的发布。
+
+v0.6.6 使用 `gpt-6-astra`，全部消息单次 `low` 审核，不再进行低到高的二次复核；
+简洁结构化输出与思考 token 合计上限为 512。历史模型统计继续保留，数据库 schema 为 8。
+发布同时原子迁移模型及三项思考配置，失败时完整恢复；发布根目录适配现有规范化 VM 路径。
 
 v0.6.5 将审核模型迁移为面向成本敏感高并发任务的 `gpt-5.6-luna`，保留普通文字 `low`、
 可疑和媒体 `high` 的自适应审核，以及历史 `gpt-5.5`、`gpt-5.6`、`gpt-5.6-sol` 统计。
@@ -133,7 +137,7 @@ v0.6.2 将单条消息自适应审核的端到端总预算从 8 秒调整为 12 
 复制到数据库同目录的临时文件，再次通过 `quick_check` 和 `foreign_key_check` 后原子替换
 生产数据库；随后清除与新数据库对应的 WAL、SHM 和 rollback journal，保留原属主与权限，
 并对恢复后的生产数据库再次执行完整性检查。临近切回旧 `current` 时才恢复上线前配置，
-最后启动旧服务。如果回滚前置条件无法满足，脚本保留与候选代码兼容的 `gpt-5.6-luna` 配置，
+最后启动旧服务。如果回滚前置条件无法满足，脚本保留与候选代码兼容的 `gpt-6-astra` 和全量 `low` 配置，
 不会先写回旧模型而造成当前候选代码与磁盘配置错配。
 
 如果候选构建、网关探测或停服前检查失败，生产服务保持运行；停服后、切换前失败时，脚本
@@ -162,7 +166,7 @@ systemctl status nexa-guardian-backup.timer --no-pager
 固定使用 `/var/lib/nexa-guardian/mtproto/admin.session`。
 
 脚本只验证服务和 SQLite 的基础健康状态。Telegram 权限、管理员私聊、Nexa Guardian 官方
-群管理审核员身份、三个一方站点的精确域名行为、AI 网关 GPT-5.6 Luna/low-high/default 响应契约、
+群管理审核员身份、三个一方站点的精确域名行为、AI 网关 GPT-6 Astra/low/default 响应契约、
 群内与日志群 30 秒消息清理、授权管理员私聊永久保留、日志 outbox 重试及真实群组审核行为
 仍需按照发布验收清单逐项检查。
 

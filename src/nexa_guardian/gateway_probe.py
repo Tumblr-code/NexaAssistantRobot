@@ -112,8 +112,8 @@ def _validate_production_settings(values: Mapping[str, str | None]) -> None:
     fixed_settings = {
         "AI_MODEL": AI_MODEL,
         "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
-        "AI_NORMAL_REASONING_EFFORT": "low",
-        "AI_SUSPICIOUS_REASONING_EFFORT": "high",
+        "AI_NORMAL_REASONING_EFFORT": AI_REASONING_EFFORT,
+        "AI_SUSPICIOUS_REASONING_EFFORT": AI_REASONING_EFFORT,
         "AI_SERVICE_TIER": AI_SERVICE_TIER,
     }
     for name, expected in fixed_settings.items():
@@ -197,7 +197,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments.require_production_settings:
             _validate_production_settings(values)
-        efforts = ("low", "high") if arguments.require_production_settings else (reasoning_effort,)
+        efforts = (reasoning_effort,)
 
         async def run_probes() -> tuple[AIReviewResult, ...]:
             return tuple(

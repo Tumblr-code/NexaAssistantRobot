@@ -14,6 +14,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from nexa_guardian.ai_contract import (
+    AI_MAX_OUTPUT_TOKENS,
     AI_MODEL,
     AI_REASONING_EFFORT,
     AI_REASONING_EFFORTS,
@@ -995,7 +996,7 @@ def _build_payload(
         "service_tier": service_tier,
         "store": False,
         "safety_identifier": safety_identifier,
-        "max_output_tokens": 1000,
+        "max_output_tokens": AI_MAX_OUTPUT_TOKENS,
     }
 
 

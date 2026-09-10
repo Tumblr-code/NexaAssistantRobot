@@ -30,7 +30,7 @@ def production_env(**overrides: str) -> str:
         "AI_MODEL": AI_MODEL,
         "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
         "AI_NORMAL_REASONING_EFFORT": "low",
-        "AI_SUSPICIOUS_REASONING_EFFORT": "high",
+        "AI_SUSPICIOUS_REASONING_EFFORT": "low",
         "AI_SERVICE_TIER": AI_SERVICE_TIER,
         "AI_ENABLED": "true",
         "AI_FAILURE_DELETE": "true",
@@ -204,7 +204,7 @@ def test_probe_cli_accepts_explicit_required_production_contract(
     monkeypatch.setattr(gateway_probe, "probe_gateway", fake_probe_gateway)
 
     assert gateway_probe.main(["--env-file", str(env_file), "--require-production-settings"]) == 0
-    assert efforts == ["low", "high"]
+    assert efforts == ["low"]
 
 
 @pytest.mark.parametrize(
@@ -328,9 +328,9 @@ def test_probe_cli_does_not_accept_credentials_from_ambient_environment(
     ("setting", "value"),
     (
         ("AI_MODEL", "gpt-5.6"),
-        ("AI_REASONING_EFFORT", "low"),
+        ("AI_REASONING_EFFORT", "high"),
         ("AI_NORMAL_REASONING_EFFORT", "high"),
-        ("AI_SUSPICIOUS_REASONING_EFFORT", "low"),
+        ("AI_SUSPICIOUS_REASONING_EFFORT", "high"),
         ("AI_SERVICE_TIER", "priority"),
         ("EXPECTED_BOT_ID", "0"),
         ("EXPECTED_BOT_USERNAME", ""),

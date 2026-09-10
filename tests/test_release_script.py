@@ -39,9 +39,10 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     script = _release_script()
 
     assert 'readonly CODE_SCHEMA_VERSION="8"' in script
-    assert 'readonly CODE_AI_MODEL="gpt-5.6-luna"' in script
+    assert 'readonly CODE_AI_MODEL="gpt-6-astra"' in script
+    assert 'readonly APP_ROOT="/opt/projects/nexa-guardian/runtime"' in script
     assert "--allow-model-cooldown requires --ai-model" in script
-    probe = script.index("probing ${CODE_AI_MODEL} adaptive-reasoning capabilities")
+    probe = script.index("probing ${CODE_AI_MODEL} low-reasoning capabilities")
     pause_timer = script.index("pausing ${BACKUP_TIMER_NAME}")
     backup_inactive = script.index("database backup service did not become idle")
     stop = script.index("for a final consistent database backup")
@@ -135,7 +136,7 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     assert "probe_arguments+=(--allow-model-cooldown)" in script
     assert "operator-authorized exact 429 model_cooldown" in script
     assert 'chmod 0600 -- "${candidate_config_path}"' in script
-    assert "configuration must contain exactly one literal AI_MODEL= line" in script
+    assert "configuration must contain exactly one literal {key.decode()}= line" in script
     assert "os.replace(staging_path, config_path)" in script
     assert "restored the original configuration before rollback" in script
     assert "restore_candidate_config_after_failed_rollback" in script
@@ -173,15 +174,15 @@ def test_release_cooldown_exception_arguments_fail_closed(tmp_path: Path) -> Non
     duplicate = _run_release_arguments(
         *base,
         "--ai-model",
-        "gpt-5.6-luna",
+        "gpt-6-astra",
         "--allow-model-cooldown",
         "--allow-model-cooldown",
     )
 
     assert missing_model.returncode != 0
-    assert "requires --ai-model gpt-5.6-luna" in missing_model.stderr
+    assert "requires --ai-model gpt-6-astra" in missing_model.stderr
     assert wrong_model.returncode != 0
-    assert "only supports AI model gpt-5.6-luna" in wrong_model.stderr
+    assert "only supports AI model gpt-6-astra" in wrong_model.stderr
     assert duplicate.returncode != 0
     assert "may only be provided once" in duplicate.stderr
 
@@ -199,7 +200,7 @@ def test_release_metadata_records_gateway_probe_policy(tmp_path: Path) -> None:
             "2026-09-01T00:00:00Z",
             "1" * 64,
             "8",
-            "nexa_guardian-0.6.5-py3-none-any.whl",
+            "nexa_guardian-0.6.6-py3-none-any.whl",
             allowed,
         )
 
@@ -211,15 +212,21 @@ def test_release_ai_model_update_is_atomic_and_preserves_other_config(tmp_path: 
     script = _release_script()
     snippet = _embedded_python(script, "update_ai_model_config()")
     config = tmp_path / "guardian.env"
-    original = b"SECRET=unchanged\nAI_MODEL=gpt-5.5\nOTHER=value\n"
+    original = (
+        b"SECRET=unchanged\nAI_MODEL=gpt-5.6-luna\nOTHER=value\n"
+        b"AI_REASONING_EFFORT=high\nAI_NORMAL_REASONING_EFFORT=low\n"
+        b"AI_SUSPICIOUS_REASONING_EFFORT=high\n"
+    )
     config.write_bytes(original)
     config.chmod(0o600)
 
-    result = _run_embedded(snippet, str(config), "gpt-5.6-luna", "101")
+    result = _run_embedded(snippet, str(config), "gpt-6-astra", "101")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "changed"
-    assert config.read_bytes() == b"SECRET=unchanged\nAI_MODEL=gpt-5.6-luna\nOTHER=value\n"
+    assert config.read_bytes() == original.replace(b"gpt-5.6-luna", b"gpt-6-astra").replace(
+        b"=high\n", b"=low\n"
+    )
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
     assert list(tmp_path.glob(".guardian.env.ai-model.*")) == []
 
@@ -230,13 +237,17 @@ def test_release_ai_model_update_rejects_missing_or_duplicate_config(tmp_path: P
     invalid_configs = (
         b"OTHER=value\n",
         b"AI_MODEL=gpt-5.6-sol\nAI_MODEL=gpt-5.6\n",
+        b"AI_MODEL=gpt-5.6-luna\nAI_REASONING_EFFORT=high\n",
+        b"AI_MODEL=gpt-5.6-luna\nAI_REASONING_EFFORT=high\n"
+        b"AI_NORMAL_REASONING_EFFORT=low\nAI_SUSPICIOUS_REASONING_EFFORT=high\n"
+        b"AI_SUSPICIOUS_REASONING_EFFORT=low\n",
     )
     for index, original in enumerate(invalid_configs):
         config = tmp_path / f"guardian-{index}.env"
         config.write_bytes(original)
         config.chmod(0o600)
 
-        result = _run_embedded(snippet, str(config), "gpt-5.6-luna", f"102{index}")
+        result = _run_embedded(snippet, str(config), "gpt-6-astra", f"102{index}")
 
         assert result.returncode != 0
         assert config.read_bytes() == original
@@ -247,12 +258,16 @@ def test_release_ai_model_update_reports_unchanged_without_rewrite(tmp_path: Pat
     script = _release_script()
     snippet = _embedded_python(script, "update_ai_model_config()")
     config = tmp_path / "guardian.env"
-    original = b"SECRET=unchanged\nAI_MODEL=gpt-5.6-luna\n"
+    original = (
+        b"SECRET=unchanged\nAI_MODEL=gpt-6-astra\n"
+        b"AI_REASONING_EFFORT=low\nAI_NORMAL_REASONING_EFFORT=low\n"
+        b"AI_SUSPICIOUS_REASONING_EFFORT=low\n"
+    )
     config.write_bytes(original)
     config.chmod(0o600)
     original_inode = config.stat().st_ino
 
-    result = _run_embedded(snippet, str(config), "gpt-5.6-luna", "104")
+    result = _run_embedded(snippet, str(config), "gpt-6-astra", "104")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "unchanged"
@@ -265,10 +280,16 @@ def test_release_config_rollback_restores_exact_backup(tmp_path: Path) -> None:
     snippet = _embedded_python(script, 'restore_result="$(')
     backup = tmp_path / "pre-release.env"
     config = tmp_path / "guardian.env"
-    original = b"SECRET=unchanged\nAI_MODEL=gpt-5.5\n"
+    original = (
+        b"SECRET=unchanged\nAI_MODEL=gpt-5.6-luna\n"
+        b"AI_REASONING_EFFORT=high\nAI_NORMAL_REASONING_EFFORT=low\n"
+        b"AI_SUSPICIOUS_REASONING_EFFORT=high\n"
+    )
     backup.write_bytes(original)
     backup.chmod(0o600)
-    config.write_bytes(b"SECRET=unchanged\nAI_MODEL=gpt-5.6-luna\n")
+    config.write_bytes(
+        original.replace(b"gpt-5.6-luna", b"gpt-6-astra").replace(b"=high\n", b"=low\n")
+    )
     config.chmod(0o600)
 
     result = _run_embedded(snippet, str(backup), str(config), "600", "103")

@@ -169,10 +169,10 @@ class Settings:
             raise ValueError(f"AI_MODEL 必须固定为 {AI_MODEL}")
         if ai_reasoning_effort != AI_REASONING_EFFORT:
             raise ValueError(f"AI_REASONING_EFFORT 必须固定为 {AI_REASONING_EFFORT}")
-        if ai_normal_reasoning_effort not in {"low", "high"}:
-            raise ValueError("AI_NORMAL_REASONING_EFFORT 只能是 low 或 high")
-        if ai_suspicious_reasoning_effort != "high":
-            raise ValueError("AI_SUSPICIOUS_REASONING_EFFORT 必须是 high")
+        if ai_normal_reasoning_effort != AI_REASONING_EFFORT:
+            raise ValueError(f"AI_NORMAL_REASONING_EFFORT 必须固定为 {AI_REASONING_EFFORT}")
+        if ai_suspicious_reasoning_effort != AI_REASONING_EFFORT:
+            raise ValueError(f"AI_SUSPICIOUS_REASONING_EFFORT 必须固定为 {AI_REASONING_EFFORT}")
         if ai_service_tier != AI_SERVICE_TIER:
             raise ValueError(f"AI_SERVICE_TIER 必须固定为 {AI_SERVICE_TIER}")
 

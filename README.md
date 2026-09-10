@@ -1,6 +1,6 @@
 # Nexa Guardian
 
-一个独立、自托管的 Telegram 群管理机器人，使用低成本 GPT-5.6 Luna 识别广告，并提供删除、警告、封禁和管理员私聊管理。它不会改动现有客服机器人，也不会自动接管未明确列入白名单的群。
+一个独立、自托管的 Telegram 群管理机器人，使用 GPT-6 Astra 最低思考档识别广告，并提供删除、警告、封禁和管理员私聊管理。它不会改动现有客服机器人，也不会自动接管未明确列入白名单的群。
 
 Nexa Guardian 的身份是 Nexa 官方群管理审核员。固定的一方站点为：
 
@@ -10,11 +10,11 @@ Nexa Guardian 的身份是 Nexa 官方群管理审核员。固定的一方站点
 
 上述精确域名本身不会被当作外部链接信号；相似域名、伪造后缀、钓鱼、冒充和附带其他广告证据的内容仍会进入审核。
 
-生产服务位于 VM `SERVER-IP`，由 `nexa-guardian.service` 持久运行，目标为 `@ExampleGroup`。v0.6.5 使用五个极简命令，提供持久化关键词抽奖、审核策略短时缓存、幂等资料同步，以及管理员 MTProto 全历史与成员清理。
+生产服务位于 VM `SERVER-IP`，由 `nexa-guardian.service` 持久运行，目标为 `@ExampleGroup`。v0.6.6 使用五个极简命令，提供持久化关键词抽奖、审核策略短时缓存、幂等资料同步，以及管理员 MTProto 全历史与成员清理。
 
 ## 已实现
 
-- GPT-5.6 Luna 低成本自适应审核：无本地可疑信号的纯文字先用 `low`；可疑、刷屏、图片或视频封面直接用 `high`；`low` 只有在判为非广告且置信度不低于 `0.90` 时才直接放行，其余结果升级为 `high` 复核。
+- GPT-6 Astra 单次审核：文字、可疑内容、图片和视频封面统一使用最低思考档 `low`，不升级二次复核。输出与思考合计上限 `512` token，文字输出为 `low` 简洁度；广告置信度达到 `0.92` 才处罚。
 - AI 网关复用 keep-alive 连接；相同并发内容合并为一次请求，并把排队、重试纳入同一个总超时。判断记录拆分媒体、排队、网关、动作和端到端延迟，可在 `/status` 查看近 7 天统计和 P95。
 - 图片从 Telegram 可用尺寸中选择达到目标边长的最小预览，视频只取封面；下载受独立并发、大小和 2 秒超时限制，失败时只用已有文字继续审核。
 - 外链、转发、联系方式、混淆字符、刷屏及已学习特征仅作为可疑预检；正常聊天静默审核。
@@ -72,18 +72,18 @@ ALLOWED_CHAT_IDS=-1001234567890,-1009876543210
 | `EXPECTED_BOT_ID` | 空 | 启动时核验机器人数字 ID；生产必须显式配置 |
 | `EXPECTED_BOT_USERNAME` | 空 | 启动时核验用户名（可不带 `@`）；生产必须显式配置 |
 | `UPDATE_CONCURRENCY_LIMIT` | `32` | aiogram 同时处理的更新上限，避免无限创建任务 |
-| `AI_ENABLED` | `false` | 启用 GPT-5.6 Luna AI 审核；启用前必须完成网关探测 |
+| `AI_ENABLED` | `false` | 启用 GPT-6 Astra AI 审核；启用前必须完成网关探测 |
 | `OPENAI_BASE_URL` | 空 | 兼容网关基础地址，支持 `/v1/responses` |
 | `OPENAI_API_KEY` | 空 | 兼容网关密钥，仅保存于服务器 `0600` 环境文件 |
-| `AI_MODEL` | `gpt-5.6-luna` | 固定低成本审核模型，不接受家族别名或自动降级 |
-| `AI_REASONING_EFFORT` | `high` | 兼容及能力探测基准；固定为 `high` |
+| `AI_MODEL` | `gpt-6-astra` | 固定审核模型，不接受家族别名或自动降级 |
+| `AI_REASONING_EFFORT` | `low` | 所有审核固定为模型支持的最低档 `low` |
 | `AI_NORMAL_REASONING_EFFORT` | 继承上项 | 普通纯文字首轮强度；生产固定为 `low` |
-| `AI_SUSPICIOUS_REASONING_EFFORT` | 继承上项 | 可疑、刷屏和媒体消息强度；生产固定为 `high` |
-| `AI_NORMAL_ACCEPT_CONFIDENCE` | `0.90` | 普通 `low` 非广告直接放行的最低置信度；其他结果升级 `high` |
+| `AI_SUSPICIOUS_REASONING_EFFORT` | 继承上项 | 旧配置兼容字段；生产固定为 `low` |
+| `AI_NORMAL_ACCEPT_CONFIDENCE` | `0.90` | 保留以便回滚；单次审核模式不使用此二次复核阈值 |
 | `AI_SERVICE_TIER` | `default` | 固定为当前兼容网关实际支持并回显的服务层 |
 | `AI_AD_THRESHOLD` | `0.92` | 删除并警告的最低广告置信度 |
 | `AI_LEARN_THRESHOLD` | `0.97` | 自动启用学习特征的最低置信度 |
-| `AI_TIMEOUT_SECONDS` | `12` | 单条消息自适应审核总预算，包含排队、重试及 `low` 到 `high` 复核 |
+| `AI_TIMEOUT_SECONDS` | `12` | 单条消息审核总预算，包含排队和连接/限流/服务端错误的最多一次重试 |
 | `AI_FAILURE_DELETE` | `true` | AI 故障时删除原消息，但不警告、不学习 |
 | `AI_IMAGE_MAX_BYTES` | `5242880` | 单个媒体预览的硬上限；生产固定为 `1572864`（1.5 MiB） |
 | `AI_IMAGE_TARGET_LONG_EDGE` | `1280` | 优先选择长边达到该值的最小 Telegram 图片预览 |
@@ -103,11 +103,11 @@ ALLOWED_CHAT_IDS=-1001234567890,-1009876543210
 | `TELEGRAM_API_HASH` | 空 | MTProto 管理会话使用的 Telegram API Hash；仅存于 VM 受保护环境文件 |
 | `TELEGRAM_SESSION_PATH` | `/var/lib/nexa-guardian/mtproto/admin` | 已交互登录的唯一管理员用户会话路径 |
 
-兼容网关必须同时支持 Responses API、严格 JSON Schema、图片输入、`reasoning.effort=low/high` 和可核验的服务层。当前生产网关会把 `priority` 请求降为 `default`，因此程序明确固定并校验 `service_tier=default`，不会把降级伪装成 Priority。快速响应由连接复用、相同内容 singleflight、普通文字 `low`、12 秒端到端总超时、10 分钟缓存和已学习特征本地直拦实现；成功结果会立即返回，不会固定等待满 12 秒。程序只接受响应中明确返回 `status=completed`、`model=gpt-5.6-luna`、本次请求对应的推理强度及 `service_tier=default` 的结果，缺失或不匹配均按审核服务故障处理。请求设置 `store=false`，只发送待判断文本或图片，不发送用户名、用户 ID、群名和聊天历史。普通文件和无预览贴纸不送入 AI。
+兼容网关必须同时支持 Responses API、严格 JSON Schema、图片输入、`reasoning.effort=low` 和可核验的服务层。程序固定使用 `service_tier=default`。快速响应由单次 `low` 审核、连接复用、相同内容 singleflight、12 秒总超时、10 分钟缓存和已学习特征本地直拦实现。程序只接受响应中明确返回 `status=completed`、`model=gpt-6-astra`、本次请求对应的推理强度及 `service_tier=default` 的结果，缺失、不完整或不匹配均按审核服务故障处理。请求设置 `store=false`，只发送待判断文本或图片，不发送用户名、用户 ID、群名和聊天历史。普通文件和无预览贴纸不送入 AI。
 
-生产发布额外要求显式配置并由发布探针校验：`EXPECTED_BOT_ID`、`EXPECTED_BOT_USERNAME`、`UPDATE_CONCURRENCY_LIMIT=32`、`AI_NORMAL_REASONING_EFFORT=low`、`AI_SUSPICIOUS_REASONING_EFFORT=high`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、`AI_TIMEOUT_SECONDS=12`、`AI_IMAGE_MAX_BYTES=1572864`、`AI_IMAGE_TARGET_LONG_EDGE=1280`、`AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2` 和 `AI_MEDIA_CONCURRENCY=4`。身份不匹配时服务会在启动轮询前退出。
+生产发布额外要求显式配置并由发布探针校验：`EXPECTED_BOT_ID`、`EXPECTED_BOT_USERNAME`、`UPDATE_CONCURRENCY_LIMIT=32`、`AI_NORMAL_REASONING_EFFORT=low`、`AI_SUSPICIOUS_REASONING_EFFORT=low`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、`AI_TIMEOUT_SECONDS=12`、`AI_IMAGE_MAX_BYTES=1572864`、`AI_IMAGE_TARGET_LONG_EDGE=1280`、`AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2` 和 `AI_MEDIA_CONCURRENCY=4`。身份不匹配时服务会在启动轮询前退出。
 
-模型及服务层字段依据 [OpenAI GPT-5.6 Luna 模型说明](https://developers.openai.com/api/docs/models/gpt-5.6-luna) 和 [Responses API 参考](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)。
+模型及服务层字段依据 [OpenAI GPT-6 Astra 模型说明](https://developers.openai.com/api/docs/models/gpt-6-astra) 和 [Responses API 参考](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)。`low` 是最低思考档，不代表模型单价最低；实际费用按兼容网关计费。
 
 ## 3. 当前生产部署
 
@@ -117,7 +117,7 @@ VM `SERVER-IP` 使用原生 systemd，不依赖 Docker：
 |---|---|
 | 服务 | `nexa-guardian.service` |
 | 当前版本 | `/opt/nexa-guardian/current` |
-| 发布目录 | `/opt/nexa-guardian/releases/` |
+| 发布目录 | `/opt/projects/nexa-guardian/runtime/releases/`（旧 `/opt/nexa-guardian` 为兼容链接） |
 | 密钥配置 | `/etc/nexa-guardian/guardian.env`，`root:root 0600` |
 | 数据库 | `/var/lib/nexa-guardian/guardian.db` |
 | 备份 | 每日备份写入 `/var/backups/nexa-guardian/`；发布前手工备份写入仅 root 可访问的 `manual/` |
@@ -224,17 +224,17 @@ BotFather 菜单与 `/help` 共用 `COMMAND_SPECS`，只保留以下五个顶级
 
 1. 执行完整 CI，并在受保护环境文件中显式配置 `EXPECTED_BOT_ID`、
    `EXPECTED_BOT_USERNAME`、`UPDATE_CONCURRENCY_LIMIT=32`、
-   `AI_REASONING_EFFORT=high`、`AI_NORMAL_REASONING_EFFORT=low`、
-   `AI_SUSPICIOUS_REASONING_EFFORT=high`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、
+   `AI_REASONING_EFFORT=low`、`AI_NORMAL_REASONING_EFFORT=low`、
+   `AI_SUSPICIOUS_REASONING_EFFORT=low`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、
    `AI_SERVICE_TIER=default`、`AI_TIMEOUT_SECONDS=12`、`AI_IMAGE_MAX_BYTES=1572864`、
    `AI_IMAGE_TARGET_LONG_EDGE=1280`、`AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2`、
    `AI_MEDIA_CONCURRENCY=4`、`AI_ENABLED=true`、`WARN_LIMIT=3`、
    `NOTICE_TTL_SECONDS=30` 和 `AI_FAILURE_DELETE=true`。
-   首次从 v0.6.4 升级时先保留线上 `AI_MODEL=gpt-5.5`，由发布命令的
-   `--ai-model gpt-5.6-luna` 在备份后原子迁移；后续 v0.6.5 及更新版本要求线上已为
-   `AI_MODEL=gpt-5.6-luna`。
+   首次从 v0.6.5 升级时先保留线上模型和思考配置，由发布命令的
+   `--ai-model gpt-6-astra` 在备份后原子迁移模型及三项思考配置；后续要求线上为
+   `AI_MODEL=gpt-6-astra` 和全量 `low`。
 2. 运行发布脚本；脚本先备份配置、构建候选版本，并用不含群消息的请求验证 Responses API、
-   结构化输出、图片输入、low/high 推理响应契约及上述生产设置；通过后才短暂停服，创建并校验最终一致的 SQLite 备份并原子切换。
+   结构化输出、图片输入、low 推理响应契约及上述生产设置；通过后才短暂停服，创建并校验最终一致的 SQLite 备份并原子切换。
    只有独立检查已经确认网关精确返回 `HTTP 429 model_cooldown` 且操作者明确接受临时冷却时，
    首次迁移才可追加 `--allow-model-cooldown`；其他探针错误仍会中止，正常发布不得使用。
 3. 上线后验证服务、唯一管理员私聊权限、群内临时消息补删队列，并确认私聊回复不入队。
@@ -251,7 +251,7 @@ BotFather 菜单与 `/help` 共用 `COMMAND_SPECS`，只保留以下五个顶级
 ```
 
 探测只发送固定的无害文字和 1×1 测试图片，不读取或发送群消息。除上述经操作者授权的
-精确 `model_cooldown` 例外外，只有网关明确回显 `completed`、`gpt-5.6-luna`、请求对应的
-`low/high` 和 `default`，且全部生产配置契约通过后，才允许切换生产 release。
+精确 `model_cooldown` 例外外，只有网关明确回显 `completed`、`gpt-6-astra`、请求对应的
+`low` 和 `default`，且全部生产配置契约通过后，才允许切换生产 release。
 
 轮询启动时如果发现该 Token 已经配置 webhook，程序会拒绝启动，**不会自动删除现有 webhook**。这是为了避免误用现有客服机器人 Token 时切断原服务。
