@@ -1,3 +1,4 @@
+import shutil
 import stat
 import subprocess
 import sys
@@ -134,6 +135,7 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     candidate_config = script.index('mktemp "${MANUAL_BACKUP_ROOT}/.candidate-env-')
     production_model_update = script.index('log "atomically applying AI_MODEL=')
     assert config_backup < candidate_config < probe < stop < production_model_update < switch
+    assert 'candidate_config_path=""' not in script[probe:production_model_update]
     assert '--env-file "${probe_config_path}"' in script
     assert "probe_arguments+=(--allow-model-cooldown)" in script
     assert "operator-authorized exact 429 model_cooldown" in script
@@ -154,6 +156,27 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     )
     rollback_failure = rollback[rollback.index("failed to restore previous current link") - 1200 :]
     assert "restore_candidate_config_after_failed_rollback" in rollback_failure
+
+
+def test_pre_switch_rollback_noop_succeeds_inside_failed_exit_trap() -> None:
+    script = _release_script()
+    function = script[
+        script.index("restore_previous_release()") : script.index("restore_original_config()")
+    ]
+    bash = shutil.which("bash")
+    assert bash is not None
+    harness = (
+        "set -Eeuo pipefail\nCURRENT_LINK=/unused\nswitched=0\nrelease_stable=0\n"
+        + function
+        + "\ncleanup() { set +e; if restore_previous_release; then "
+        + "printf 'safe-to-restore-config-and-restart'; else printf 'recovery-skipped'; fi; }\n"
+        + "trap cleanup EXIT\nexit 1\n"
+    )
+    result = subprocess.run(  # noqa: S603 - repository-owned function and fixed harness
+        [bash], input=harness, text=True, capture_output=True, check=False
+    )
+    assert result.returncode == 1
+    assert result.stdout == "safe-to-restore-config-and-restart"
 
 
 def test_release_cooldown_exception_arguments_fail_closed(tmp_path: Path) -> None:
