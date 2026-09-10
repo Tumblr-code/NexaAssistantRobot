@@ -289,7 +289,8 @@ restore_previous_release() {
   local current_after_rollback=""
 
   if (( switched == 0 || release_stable == 1 )); then
-    return
+    # In a Bash EXIT trap, bare return can inherit the original failure status.
+    return 0
   fi
 
   printf '[release] deployment failed after switching current; rolling back\n' >&2
@@ -986,11 +987,8 @@ fi
 "${final_release}/.venv/bin/nexa-guardian-probe" \
   "${probe_arguments[@]}" \
   || die "gateway capability probe failed; production was not switched"
-if [[ -n "${candidate_config_path}" ]]; then
-  rm -f -- "${candidate_config_path}" || die "failed to remove candidate configuration copy"
-  candidate_config_path=""
-  probe_config_path="${CONFIG_PATH}"
-fi
+# Keep the probed configuration until the final equality check; EXIT cleanup
+# removes this protected copy after success or rollback.
 chown -hR "root:${SERVICE_GROUP}" -- "${final_release}"
 chmod -R u=rwX,g=rX,o= -- "${final_release}"
 
