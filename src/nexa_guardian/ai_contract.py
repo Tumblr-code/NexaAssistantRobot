@@ -1,11 +1,12 @@
-AI_MODEL = "gpt-5.6-luna"
-AI_REASONING_EFFORT = "high"
-AI_REASONING_EFFORTS = frozenset({"low", AI_REASONING_EFFORT})
+AI_MODEL = "gpt-6-astra"
+AI_REASONING_EFFORT = "low"
+AI_REASONING_EFFORTS = frozenset({"low", "high"})
+AI_MAX_OUTPUT_TOKENS = 512
 AI_SERVICE_TIER = "default"
 AI_TIMEOUT_SECONDS = 12.0
 
 # Preserve historical model rows in cumulative AI statistics after model migrations.
-AI_GATEWAY_MODELS = frozenset({"gpt-5.5", "gpt-5.6", "gpt-5.6-sol", AI_MODEL})
+AI_GATEWAY_MODELS = frozenset({"gpt-5.5", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-luna", AI_MODEL})
 
 NEXA_OFFICIAL_PROPERTIES = (
     ("Nexa Store", "https://nexastore.cn", "nexastore.cn"),

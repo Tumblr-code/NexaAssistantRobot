@@ -1520,7 +1520,7 @@ async def test_video_prefers_sized_cover_over_legacy_thumbnail(
     bot.download.assert_awaited_once_with(target_cover, destination=ANY)  # type: ignore[attr-defined]
 
 
-async def test_cover_only_video_is_reviewed_with_high_reasoning(
+async def test_cover_only_video_is_reviewed_once_with_low_reasoning(
     tmp_path: Path, storage: Storage
 ) -> None:
     bot = FakeBot()
@@ -1538,7 +1538,7 @@ async def test_cover_only_video_is_reviewed_with_high_reasoning(
                 signatures=(),
                 cached=False,
                 latency_ms=10,
-                reasoning_effort="high",
+                reasoning_effort="low",
             )
         )
     )
@@ -1577,7 +1577,8 @@ async def test_cover_only_video_is_reviewed_with_high_reasoning(
     assert reviewer.review.await_args.kwargs["image_data_url"] == (
         "data:image/jpeg;base64,Y292ZXI="
     )
-    assert reviewer.review.await_args.kwargs["reasoning_effort"] == "high"
+    assert reviewer.review.await_count == 1
+    assert reviewer.review.await_args.kwargs["reasoning_effort"] == "low"
     controller._processing_notice.assert_not_awaited()
 
 
@@ -2031,7 +2032,7 @@ async def test_normal_text_uses_low_reasoning_without_a_visible_notice(
             tmp_path,
             ai_enabled=True,
             ai_normal_reasoning_effort="low",
-            ai_suspicious_reasoning_effort="high",
+            ai_suspicious_reasoning_effort="low",
         ),  # type: ignore[arg-type]
         storage,
         ai_reviewer=reviewer,  # type: ignore[arg-type]
@@ -2046,59 +2047,57 @@ async def test_normal_text_uses_low_reasoning_without_a_visible_notice(
     assert bot.deleted == []
 
 
-async def test_uncertain_low_reasoning_result_is_confirmed_with_high_reasoning(
-    tmp_path: Path, storage: Storage
+@pytest.mark.parametrize(
+    ("is_ad", "confidence", "expected_deleted"),
+    ((False, 0.70, False), (True, 0.70, False), (True, 0.99, True)),
+)
+async def test_low_reasoning_decision_never_triggers_a_second_review(
+    tmp_path: Path,
+    storage: Storage,
+    is_ad: bool,
+    confidence: float,
+    expected_deleted: bool,
 ) -> None:
     reviewer = SimpleNamespace(
         review=AsyncMock(
-            side_effect=(
-                AIReviewResult(
-                    True,
-                    0.70,
-                    "promotion",
-                    (),
-                    False,
-                    15,
-                    reasoning_effort="low",
-                ),
-                AIReviewResult(
-                    False,
-                    0.99,
-                    "normal",
-                    (),
-                    False,
-                    25,
-                    reasoning_effort="high",
-                ),
+            return_value=AIReviewResult(
+                is_ad,
+                confidence,
+                "promotion" if is_ad else "normal",
+                (),
+                False,
+                15,
+                reasoning_effort="low",
+                attempt_count=1,
             )
         )
     )
+    bot = FakeBot()
     controller = ModerationController(
-        FakeBot(),
+        bot,
         settings(
             tmp_path,
             ai_enabled=True,
             ai_normal_reasoning_effort="low",
-            ai_suspicious_reasoning_effort="high",
+            ai_suspicious_reasoning_effort="low",
         ),  # type: ignore[arg-type]
         storage,
         ai_reviewer=reviewer,  # type: ignore[arg-type]
     )
 
+    controller._notice = AsyncMock()
     await controller.moderate_message(group_message(42, "帮我看看价格"))
 
-    assert [call.kwargs["reasoning_effort"] for call in reviewer.review.await_args_list] == [
-        "low",
-        "high",
-    ]
-    deadlines = [call.kwargs["deadline"] for call in reviewer.review.await_args_list]
-    assert deadlines[0] == deadlines[1]
+    assert reviewer.review.await_count == 1
+    assert reviewer.review.await_args.kwargs["reasoning_effort"] == "low"
+    assert bool(bot.deleted) is expected_deleted
     decision = (await recent_ai_decisions(storage, -100, limit=1))[0]
-    assert decision.review_path == "low_to_high"
-    assert decision.latency_ms == 40
+    assert decision.review_path == "gateway"
+    assert decision.latency_ms == 15
+    assert decision.attempt_count == 1
 
 
-async def test_suspicious_text_starts_directly_with_high_reasoning(
+async def test_suspicious_text_uses_low_reasoning_and_a_visible_notice(
     tmp_path: Path, storage: Storage
 ) -> None:
     reviewer = SimpleNamespace(
@@ -2110,7 +2109,7 @@ async def test_suspicious_text_starts_directly_with_high_reasoning(
                 (),
                 False,
                 20,
-                reasoning_effort="high",
+                reasoning_effort="low",
             )
         )
     )
@@ -2120,7 +2119,7 @@ async def test_suspicious_text_starts_directly_with_high_reasoning(
             tmp_path,
             ai_enabled=True,
             ai_normal_reasoning_effort="low",
-            ai_suspicious_reasoning_effort="high",
+            ai_suspicious_reasoning_effort="low",
         ),  # type: ignore[arg-type]
         storage,
         ai_reviewer=reviewer,  # type: ignore[arg-type]
@@ -2130,7 +2129,7 @@ async def test_suspicious_text_starts_directly_with_high_reasoning(
     await controller.moderate_message(group_message(42, "https://external.example"))
 
     assert reviewer.review.await_count == 1
-    assert reviewer.review.await_args.kwargs["reasoning_effort"] == "high"
+    assert reviewer.review.await_args.kwargs["reasoning_effort"] == "low"
     controller._processing_notice.assert_awaited_once()
 
 

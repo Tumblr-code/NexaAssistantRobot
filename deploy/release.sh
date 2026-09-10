@@ -8,7 +8,7 @@ readonly BACKUP_SERVICE_NAME="nexa-guardian-backup.service"
 readonly BACKUP_TIMER_NAME="nexa-guardian-backup.timer"
 readonly SERVICE_USER="nexa-guardian"
 readonly SERVICE_GROUP="nexa-guardian"
-readonly APP_ROOT="/opt/nexa-guardian"
+readonly APP_ROOT="/opt/projects/nexa-guardian/runtime"
 readonly RELEASES_ROOT="${APP_ROOT}/releases"
 readonly CURRENT_LINK="${APP_ROOT}/current"
 readonly CONFIG_PATH="/etc/nexa-guardian/guardian.env"
@@ -19,7 +19,7 @@ readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
 readonly PYTHON_BIN="/usr/bin/python3"
 readonly CODE_SCHEMA_VERSION="8"
-readonly CODE_AI_MODEL="gpt-5.6-luna"
+readonly CODE_AI_MODEL="gpt-6-astra"
 
 artifact_mode=""
 artifact_path=""
@@ -54,17 +54,17 @@ usage() {
 Usage:
   sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-*.whl \
     --git-sha <full-git-sha> --schema-version <integer> \
-    [--ai-model gpt-5.6-luna] [--allow-model-cooldown]
+    [--ai-model gpt-6-astra] [--allow-model-cooldown]
 
   sudo deploy/release.sh --source /absolute/path/to/repository \
     [--git-sha <full-git-sha>] --schema-version <integer> \
-    [--ai-model gpt-5.6-luna] [--allow-model-cooldown]
+    [--ai-model gpt-6-astra] [--allow-model-cooldown]
 
-The script always deploys to /opt/nexa-guardian, backs up the protected
+The script always deploys to /opt/projects/nexa-guardian/runtime, backs up the protected
 configuration, builds and probes the candidate, then stops the service for a
 final consistent database backup before atomically switching current. It keeps
 current plus the two newest older releases after a health check.
-Use --ai-model only for the first transactional migration from the prior model.
+Use --ai-model for the transactional model and low-reasoning migration.
 Use --allow-model-cooldown only for an operator-approved exact 429 model_cooldown.
 EOF
 }
@@ -93,23 +93,28 @@ process_id = sys.argv[3]
 staging_path = config_path.parent / f".{config_path.name}.ai-model.{process_id}"
 original = config_path.read_bytes()
 lines = original.splitlines(keepends=True)
-matches = [index for index, line in enumerate(lines) if line.startswith(b"AI_MODEL=")]
-if len(matches) != 1:
-    raise RuntimeError("configuration must contain exactly one literal AI_MODEL= line")
-
-index = matches[0]
-line = lines[index]
-newline = b"\r\n" if line.endswith(b"\r\n") else b"\n" if line.endswith(b"\n") else b""
-current_model = line[len(b"AI_MODEL=") : len(line) - len(newline) if newline else None]
-target = target_model.encode("ascii")
-if current_model == target:
+targets = {
+    b"AI_MODEL": target_model.encode("ascii"),
+    b"AI_REASONING_EFFORT": b"low",
+    b"AI_NORMAL_REASONING_EFFORT": b"low",
+    b"AI_SUSPICIOUS_REASONING_EFFORT": b"low",
+}
+for key, target in targets.items():
+    prefix = key + b"="
+    matches = [index for index, line in enumerate(lines) if line.startswith(prefix)]
+    if len(matches) != 1:
+        raise RuntimeError(f"configuration must contain exactly one literal {key.decode()}= line")
+    index = matches[0]
+    line = lines[index]
+    newline = b"\r\n" if line.endswith(b"\r\n") else b"\n" if line.endswith(b"\n") else b""
+    current = line[len(prefix) : len(line) - len(newline) if newline else None]
+    if not current or any(character in current for character in b" \t#'\""):
+        raise RuntimeError(f"{key.decode()} must be an unquoted value on its own line")
+    lines[index] = prefix + target + newline
+updated = b"".join(lines)
+if updated == original:
     print("unchanged")
     raise SystemExit(0)
-if not current_model or any(character in current_model for character in b" \t#'\""):
-    raise RuntimeError("AI_MODEL must be an unquoted value on its own line")
-
-lines[index] = b"AI_MODEL=" + target + newline
-updated = b"".join(lines)
 metadata = config_path.stat()
 if staging_path.exists() or staging_path.is_symlink():
     raise RuntimeError(f"configuration staging path already exists: {staging_path}")
@@ -934,7 +939,7 @@ log "creating isolated virtual environment"
 "${final_release}/.venv/bin/python" -m pip install \
   --disable-pip-version-check --no-cache-dir "${copied_wheel}"
 "${final_release}/.venv/bin/python" -c 'import nexa_guardian'
-log "probing ${CODE_AI_MODEL} adaptive-reasoning capabilities and production settings"
+log "probing ${CODE_AI_MODEL} low-reasoning capabilities and production settings"
 probe_arguments=(--env-file "${probe_config_path}" --require-production-settings)
 if (( allow_model_cooldown == 1 )); then
   probe_arguments+=(--allow-model-cooldown)

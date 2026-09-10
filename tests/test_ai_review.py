@@ -141,7 +141,7 @@ async def test_responses_payload_is_strict_private_and_multimodal() -> None:
     assert payload["store"] is False
     assert payload["reasoning"] == {"effort": AI_REASONING_EFFORT}
     assert payload["service_tier"] == AI_SERVICE_TIER
-    assert payload["max_output_tokens"] == 1000
+    assert payload["max_output_tokens"] == 512
     assert payload["safety_identifier"] != "telegram-user-12345"
     assert str(payload["safety_identifier"]).startswith("nexa_")
     text_format = payload["text"]
@@ -226,7 +226,7 @@ async def test_per_review_reasoning_effort_is_sent_and_validated(
     assert payload["reasoning"] == {"effort": reasoning_effort}
     assert payload["service_tier"] == AI_SERVICE_TIER
     assert payload["store"] is False
-    assert payload["max_output_tokens"] == 1000
+    assert payload["max_output_tokens"] == 512
     assert result.reasoning_effort == reasoning_effort
     assert result.actual_service_tier == AI_SERVICE_TIER
     assert result.service_tier == AI_SERVICE_TIER
@@ -851,7 +851,7 @@ async def test_response_contract_is_enforced_and_unsafe_signatures_are_filtered(
     (
         ("status", "incomplete"),
         ("model", "gpt-5.6"),
-        ("reasoning", {"effort": "low"}),
+        ("reasoning", {"effort": "high"}),
         ("service_tier", "priority"),
         ("service_tier", None),
     ),

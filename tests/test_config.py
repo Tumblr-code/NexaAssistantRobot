@@ -12,8 +12,10 @@ from nexa_guardian.ai_contract import (
 from nexa_guardian.config import Settings
 
 
-def test_release_ai_model_is_fixed_to_gpt_5_6_luna() -> None:
-    assert AI_MODEL == "gpt-5.6-luna"
+def test_release_ai_model_is_fixed_to_gpt_6_astra() -> None:
+    assert AI_MODEL == "gpt-6-astra"
+    assert AI_REASONING_EFFORT == "low"
+    assert "gpt-5.6-luna" in AI_GATEWAY_MODELS
     assert "gpt-5.5" in AI_GATEWAY_MODELS
 
 
@@ -81,7 +83,7 @@ def test_adaptive_reasoning_and_runtime_limits(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("EXPECTED_BOT_ID", "8476280054")
     monkeypatch.setenv("EXPECTED_BOT_USERNAME", "@NexaAdminRobot")
     monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "low")
-    monkeypatch.setenv("AI_SUSPICIOUS_REASONING_EFFORT", "high")
+    monkeypatch.setenv("AI_SUSPICIOUS_REASONING_EFFORT", "low")
     monkeypatch.setenv("AI_NORMAL_ACCEPT_CONFIDENCE", "0.9")
     monkeypatch.setenv("UPDATE_CONCURRENCY_LIMIT", "32")
     monkeypatch.setenv("AI_IMAGE_MAX_BYTES", "1572864")
@@ -94,7 +96,7 @@ def test_adaptive_reasoning_and_runtime_limits(monkeypatch: pytest.MonkeyPatch) 
     assert settings.expected_bot_id == 8476280054
     assert settings.expected_bot_username == "NexaAdminRobot"
     assert settings.ai_normal_reasoning_effort == "low"
-    assert settings.ai_suspicious_reasoning_effort == "high"
+    assert settings.ai_suspicious_reasoning_effort == "low"
     assert settings.ai_normal_accept_confidence == 0.9
     assert settings.update_concurrency_limit == 32
     assert settings.ai_image_max_bytes == 1572864
@@ -117,8 +119,9 @@ def test_adaptive_reasoning_must_be_configured_as_a_pair(
     ("setting", "value", "message"),
     (
         ("EXPECTED_BOT_ID", "0", "正整数"),
-        ("AI_NORMAL_REASONING_EFFORT", "medium", "只能是 low 或 high"),
-        ("AI_SUSPICIOUS_REASONING_EFFORT", "low", "必须是 high"),
+        ("AI_NORMAL_REASONING_EFFORT", "medium", "必须固定为 low"),
+        ("AI_NORMAL_REASONING_EFFORT", "high", "必须固定为 low"),
+        ("AI_SUSPICIOUS_REASONING_EFFORT", "high", "必须固定为 low"),
     ),
 )
 def test_runtime_safety_configuration_is_validated(
@@ -130,7 +133,7 @@ def test_runtime_safety_configuration_is_validated(
     _base_env(monkeypatch)
     if setting.startswith("AI_") and "REASONING" in setting:
         monkeypatch.setenv("AI_NORMAL_REASONING_EFFORT", "low")
-        monkeypatch.setenv("AI_SUSPICIOUS_REASONING_EFFORT", "high")
+        monkeypatch.setenv("AI_SUSPICIOUS_REASONING_EFFORT", "low")
     monkeypatch.setenv(setting, value)
 
     with pytest.raises(ValueError, match=message):
@@ -167,7 +170,7 @@ def test_learning_threshold_cannot_be_lower_than_action_threshold(
     ("setting", "value"),
     (
         ("AI_MODEL", "gpt-5.6"),
-        ("AI_REASONING_EFFORT", "low"),
+        ("AI_REASONING_EFFORT", "high"),
         ("AI_SERVICE_TIER", "priority"),
     ),
 )

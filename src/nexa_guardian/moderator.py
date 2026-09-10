@@ -9,7 +9,7 @@ import time
 import weakref
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, TypedDict
 
 from aiogram import Bot, Router
@@ -63,12 +63,12 @@ TRUST_CACHE_SECONDS = 60
 TRUST_CACHE_MAX = 4096
 BOT_PROFILE_NAME = "Nexa 群管助手"
 BOT_PROFILE_SHORT_DESCRIPTION = (
-    "Nexa 官方群管理审核员：GPT-5.6 Luna 智能识别广告与刷屏，自动删除并警告；"
+    "Nexa 官方群管理审核员：GPT-6 Astra 智能识别广告与刷屏，自动删除并警告；"
     "第 3 次直接封禁，并支持安全透明的群抽奖。"
 )
 BOT_PROFILE_DESCRIPTION = """Nexa Guardian 是 @NexaStoreGroup 的官方群管理与安全审核员。
 
-• GPT-5.6 Luna 审核文字、图片及视频封面
+• GPT-6 Astra 审核文字、图片及视频封面
 • 自动清理广告、诈骗、恶意推广与刷屏；第 3 次警告直接封禁
 • 普通聊天静默处理；仅可疑消息显示审核状态
 • 持续学习高置信广告特征，提升后续拦截效率
@@ -957,9 +957,6 @@ class ModerationController:
 
         review_started = time.monotonic()
         review_deadline = review_started + self.settings.ai_timeout_seconds
-        use_high_reasoning = (
-            suspicion.is_suspicious or flood_violation is not None or has_media_preview
-        )
         try:
             safety_target = str(target_id or "unknown")
             risk_signals = set(suspicion.reasons)
@@ -976,13 +973,12 @@ class ModerationController:
                 )
             )
             result = await asyncio.wait_for(
-                self._adaptive_review(
+                self._review_message(
                     text=text,
                     image_data_url=image_data_url,
                     safety_identifier=f"{message.chat.id}:{safety_target}",
                     risk_signals=normalized_risk_signals,
                     linked_hosts=linked_hosts,
-                    use_high_reasoning=use_high_reasoning,
                     deadline=review_deadline,
                 ),
                 timeout=max(0.0, review_deadline - time.monotonic()),
@@ -995,11 +991,7 @@ class ModerationController:
                 processing=processing,
                 error_type=type(exc).__name__,
                 media_latency_ms=media_latency_ms,
-                reasoning_effort=(
-                    self.settings.ai_suspicious_reasoning_effort
-                    if use_high_reasoning
-                    else self.settings.ai_normal_reasoning_effort
-                ),
+                reasoning_effort=self.settings.ai_reasoning_effort,
                 total_latency_ms=(
                     media_latency_ms + max(0, int((time.monotonic() - review_started) * 1000))
                 ),
@@ -1119,7 +1111,7 @@ class ModerationController:
             self._ai_failure_streak += 1
             return self._ai_failure_streak == 3
 
-    async def _adaptive_review(
+    async def _review_message(
         self,
         *,
         text: str,
@@ -1127,54 +1119,19 @@ class ModerationController:
         safety_identifier: str,
         risk_signals: tuple[str, ...],
         linked_hosts: tuple[str, ...],
-        use_high_reasoning: bool,
         deadline: float,
     ):
         if self.ai_reviewer is None:
             raise RuntimeError("AI reviewer is unavailable")
-        initial_effort = (
-            self.settings.ai_suspicious_reasoning_effort
-            if use_high_reasoning
-            else self.settings.ai_normal_reasoning_effort
-        )
-        result = await self.ai_reviewer.review(
+        return await self.ai_reviewer.review(
             text=text,
             image_data_url=image_data_url,
             safety_identifier=safety_identifier,
             risk_signals=risk_signals,
             linked_hosts=linked_hosts,
-            reasoning_effort=initial_effort,
+            reasoning_effort=self.settings.ai_reasoning_effort,
             deadline=deadline,
         )
-        if initial_effort != "low" or (
-            not result.is_ad and result.confidence >= self.settings.ai_normal_accept_confidence
-        ):
-            return result
-
-        confirmed = await self.ai_reviewer.review(
-            text=text,
-            image_data_url=image_data_url,
-            safety_identifier=safety_identifier,
-            risk_signals=risk_signals,
-            linked_hosts=linked_hosts,
-            reasoning_effort=self.settings.ai_suspicious_reasoning_effort,
-            deadline=deadline,
-        )
-        updates: dict[str, object] = {
-            "latency_ms": result.latency_ms + confirmed.latency_ms,
-        }
-        for field_name in (
-            "queue_latency_ms",
-            "request_latency_ms",
-            "attempt_count",
-        ):
-            if hasattr(result, field_name) and hasattr(confirmed, field_name):
-                updates[field_name] = int(getattr(result, field_name)) + int(
-                    getattr(confirmed, field_name)
-                )
-        if hasattr(confirmed, "review_path"):
-            updates["review_path"] = "low_to_high"
-        return replace(confirmed, **updates)
 
     async def _persist_ai_learning(
         self,
