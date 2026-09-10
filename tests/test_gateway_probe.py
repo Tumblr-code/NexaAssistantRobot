@@ -22,15 +22,15 @@ from nexa_guardian.gateway_probe import (
 
 def production_env(**overrides: str) -> str:
     values = {
-        "OPENAI_BASE_URL": "https://protected.example/v1",
+        "OPENAI_BASE_URL": "https://api.deepseek.com",
         "OPENAI_API_KEY": "protected-placeholder",
         "EXPECTED_BOT_ID": "123456789",
         "EXPECTED_BOT_USERNAME": "ExampleGuardBot",
         "UPDATE_CONCURRENCY_LIMIT": "32",
         "AI_MODEL": AI_MODEL,
         "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
-        "AI_NORMAL_REASONING_EFFORT": "low",
-        "AI_SUSPICIOUS_REASONING_EFFORT": "low",
+        "AI_NORMAL_REASONING_EFFORT": "none",
+        "AI_SUSPICIOUS_REASONING_EFFORT": "none",
         "AI_SERVICE_TIER": AI_SERVICE_TIER,
         "AI_ENABLED": "true",
         "AI_FAILURE_DELETE": "true",
@@ -54,7 +54,7 @@ def production_env(**overrides: str) -> str:
     return "".join(f"{name}={value}\n" for name, value in values.items())
 
 
-@pytest.mark.parametrize("reasoning_effort", ("low", "high"))
+@pytest.mark.parametrize("reasoning_effort", ("none", "low", "high"))
 async def test_gateway_probe_uses_fixed_model_structured_output_and_image(
     reasoning_effort: str,
 ) -> None:
@@ -134,7 +134,7 @@ def test_probe_cli_uses_exact_protected_env_file(
 ) -> None:
     env_file = tmp_path / "guardian.env"
     env_file.write_text(
-        "OPENAI_BASE_URL=https://protected.example/v1\n"
+        "OPENAI_BASE_URL=https://api.deepseek.com\n"
         "OPENAI_API_KEY=protected-placeholder\n"
         f"AI_MODEL={AI_MODEL}\n"
         f"AI_REASONING_EFFORT={AI_REASONING_EFFORT}\n"
@@ -145,7 +145,7 @@ def test_probe_cli_uses_exact_protected_env_file(
     monkeypatch.setenv("OPENAI_API_KEY", "ambient-placeholder")
 
     async def fake_probe_gateway(**kwargs: object) -> AIReviewResult:
-        assert kwargs["base_url"] == "https://protected.example/v1"
+        assert kwargs["base_url"] == "https://api.deepseek.com"
         assert kwargs["api_key"] == "protected-placeholder"
         assert kwargs["model"] == AI_MODEL
         assert kwargs["reasoning_effort"] == AI_REASONING_EFFORT
@@ -164,7 +164,7 @@ def test_probe_cli_requires_live_production_settings(
 ) -> None:
     env_file = tmp_path / "guardian.env"
     env_file.write_text(
-        "OPENAI_BASE_URL=https://protected.example/v1\n"
+        "OPENAI_BASE_URL=https://api.deepseek.com\n"
         "OPENAI_API_KEY=protected-placeholder\n"
         f"AI_MODEL={AI_MODEL}\n"
         f"AI_REASONING_EFFORT={AI_REASONING_EFFORT}\n"
@@ -204,7 +204,7 @@ def test_probe_cli_accepts_explicit_required_production_contract(
     monkeypatch.setattr(gateway_probe, "probe_gateway", fake_probe_gateway)
 
     assert gateway_probe.main(["--env-file", str(env_file), "--require-production-settings"]) == 0
-    assert efforts == ["low"]
+    assert efforts == ["none"]
 
 
 @pytest.mark.parametrize(

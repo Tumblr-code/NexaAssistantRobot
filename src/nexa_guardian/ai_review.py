@@ -14,6 +14,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from nexa_guardian.ai_contract import (
+    AI_BASE_URL,
     AI_MAX_OUTPUT_TOKENS,
     AI_MODEL,
     AI_REASONING_EFFORT,
@@ -596,7 +597,7 @@ class AIReviewer:
         if model != AI_MODEL:
             raise ValueError(f"model must be exactly {AI_MODEL}")
         if reasoning_effort not in AI_REASONING_EFFORTS:
-            raise ValueError("reasoning_effort must be low or high")
+            raise ValueError("reasoning_effort must be none, low or high")
         if service_tier != AI_SERVICE_TIER:
             raise ValueError(f"service_tier must be exactly {AI_SERVICE_TIER}")
         if timeout <= 0 or concurrency <= 0 or cache_ttl < 0 or cache_size < 0:
@@ -645,7 +646,7 @@ class AIReviewer:
             raise ValueError("safety_identifier is required")
         selected_effort = self.reasoning_effort if reasoning_effort is None else reasoning_effort
         if selected_effort not in AI_REASONING_EFFORTS:
-            raise ValueError("reasoning_effort must be low or high")
+            raise ValueError("reasoning_effort must be none, low or high")
 
         normalized_risk_signals = _normalize_risk_signals(risk_signals)
         normalized_linked_hosts = _normalize_linked_hosts(linked_hosts)
@@ -930,6 +931,8 @@ class AIReviewer:
 
 def _responses_endpoint(base_url: str) -> str:
     normalized = base_url.strip().rstrip("/")
+    if normalized == AI_BASE_URL:
+        return f"{normalized}/responses"
     if normalized.endswith("/responses"):
         return normalized
     if normalized.endswith("/v1"):
@@ -968,7 +971,8 @@ def _build_payload(
         "model": model,
         "input": [
             {
-                "role": "developer",
+                # DeepSeek maps developer to user; policy must remain system-level.
+                "role": "system",
                 "content": [
                     {"type": "input_text", "text": REVIEW_INSTRUCTIONS},
                     {

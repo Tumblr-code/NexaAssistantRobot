@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from nexa_guardian.ai_contract import (
+    AI_BASE_URL,
     AI_MODEL,
     AI_REASONING_EFFORT,
     AI_SERVICE_TIER,
@@ -165,6 +166,8 @@ class Settings:
             raise ValueError("AI_ENABLED=true 时必须配置 OPENAI_BASE_URL")
         if ai_enabled and not openai_api_key:
             raise ValueError("AI_ENABLED=true 时必须配置 OPENAI_API_KEY")
+        if ai_enabled and openai_base_url != AI_BASE_URL:
+            raise ValueError(f"OPENAI_BASE_URL 必须固定为 {AI_BASE_URL}")
         if ai_model != AI_MODEL:
             raise ValueError(f"AI_MODEL 必须固定为 {AI_MODEL}")
         if ai_reasoning_effort != AI_REASONING_EFFORT:
