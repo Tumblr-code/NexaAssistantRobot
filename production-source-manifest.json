@@ -1,0 +1,187 @@
+{
+  "observed_date": "2026-10-03",
+  "scope": "disk source/package hashes, not process-memory or configuration equality",
+  "components": {
+    "guardian": {
+      "runtime_root": "/opt/projects/nexa-guardian/runtime/releases/20260910T234253Z-604ed20b3f5c/.venv/lib/python3.12/site-packages",
+      "compared_main": "604ed20b3f5c201b497a04b9a840e55160a663b8",
+      "files": [
+        {
+          "runtime_path": "nexa_guardian/member_cleanup_service.py",
+          "runtime_sha256": "e65f5d07e780e3a28560c7445081b01dcff460c443e69b870fed79f9bc48a9e1",
+          "main_repo_path": "src/nexa_guardian/member_cleanup_service.py",
+          "main_sha256": "e65f5d07e780e3a28560c7445081b01dcff460c443e69b870fed79f9bc48a9e1",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/ai_review.py",
+          "runtime_sha256": "668b5bfdd8b9ed8b82acbc02e72d90208d8b3e645c2849647ad3232a70b3e32a",
+          "main_repo_path": "src/nexa_guardian/ai_review.py",
+          "main_sha256": "668b5bfdd8b9ed8b82acbc02e72d90208d8b3e645c2849647ad3232a70b3e32a",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/gateway_probe.py",
+          "runtime_sha256": "0ed35103a428d8129cefcf8ddcf368934a6eec0e3aafb626b2731216bc5ed60c",
+          "main_repo_path": "src/nexa_guardian/gateway_probe.py",
+          "main_sha256": "0ed35103a428d8129cefcf8ddcf368934a6eec0e3aafb626b2731216bc5ed60c",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/member_activity.py",
+          "runtime_sha256": "cb9a5fc9441db753d416fa0a4addd8a553aa1ea5d5fbc04d8f7f769bdcf18647",
+          "main_repo_path": "src/nexa_guardian/member_activity.py",
+          "main_sha256": "cb9a5fc9441db753d416fa0a4addd8a553aa1ea5d5fbc04d8f7f769bdcf18647",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/status_service.py",
+          "runtime_sha256": "7ea65c77b5c96cca7851997e29ad50cc118972beec585deb40b1f00999727046",
+          "main_repo_path": "src/nexa_guardian/status_service.py",
+          "main_sha256": "7ea65c77b5c96cca7851997e29ad50cc118972beec585deb40b1f00999727046",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/detection.py",
+          "runtime_sha256": "b73a121c2dd86b2584a28163e172243e833e64a2244dd75a017e62c8e18aa29f",
+          "main_repo_path": "src/nexa_guardian/detection.py",
+          "main_sha256": "b73a121c2dd86b2584a28163e172243e833e64a2244dd75a017e62c8e18aa29f",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/ephemeral.py",
+          "runtime_sha256": "a35a243e69ea461354e0640c921287e5205f164488c2f545b25b88c3f5e1c8e9",
+          "main_repo_path": "src/nexa_guardian/ephemeral.py",
+          "main_sha256": "a35a243e69ea461354e0640c921287e5205f164488c2f545b25b88c3f5e1c8e9",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/ai_contract.py",
+          "runtime_sha256": "d6a92e89df944b7199c1eb1b6771b6c0ae71944ea19493152d5ebeaeaa6281ab",
+          "main_repo_path": "src/nexa_guardian/ai_contract.py",
+          "main_sha256": "d6a92e89df944b7199c1eb1b6771b6c0ae71944ea19493152d5ebeaeaa6281ab",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/maintenance.py",
+          "runtime_sha256": "477cfdc0af9a0ce18c68f60c19846090a3502e09271b90ccbd4ea1e890f8b3af",
+          "main_repo_path": "src/nexa_guardian/maintenance.py",
+          "main_sha256": "477cfdc0af9a0ce18c68f60c19846090a3502e09271b90ccbd4ea1e890f8b3af",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/raffle_runtime.py",
+          "runtime_sha256": "d525fea5e7e5a53810d142dbcec0dfa2cb2dac2f2a2538f4f804912e3fccd173",
+          "main_repo_path": "src/nexa_guardian/raffle_runtime.py",
+          "main_sha256": "d525fea5e7e5a53810d142dbcec0dfa2cb2dac2f2a2538f4f804912e3fccd173",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/backup.py",
+          "runtime_sha256": "8c232b84037ebe5231d783313844328bd1413859ffcddb0402697714a9c96cfd",
+          "main_repo_path": "src/nexa_guardian/backup.py",
+          "main_sha256": "8c232b84037ebe5231d783313844328bd1413859ffcddb0402697714a9c96cfd",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/member_cleanup.py",
+          "runtime_sha256": "e1f2c647047ccddcebaa90009f4b7da393f71b0ce5afd89713e0f3d8382df363",
+          "main_repo_path": "src/nexa_guardian/member_cleanup.py",
+          "main_sha256": "e1f2c647047ccddcebaa90009f4b7da393f71b0ce5afd89713e0f3d8382df363",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/__main__.py",
+          "runtime_sha256": "83991b37bf56dfd022f2e5c32d1e1f45d901470b52c977f0f01f191e9493c41b",
+          "main_repo_path": "src/nexa_guardian/__main__.py",
+          "main_sha256": "83991b37bf56dfd022f2e5c32d1e1f45d901470b52c977f0f01f191e9493c41b",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/history_purge.py",
+          "runtime_sha256": "75b7c1e14054af5f1e8e05eb4ec277fc127e0ce4faf44d8f35f5aa8ff99d53c4",
+          "main_repo_path": "src/nexa_guardian/history_purge.py",
+          "main_sha256": "75b7c1e14054af5f1e8e05eb4ec277fc127e0ce4faf44d8f35f5aa8ff99d53c4",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/storage.py",
+          "runtime_sha256": "ae66ef9d381e8610f6bf94efc4546a7f3ebbf7039e91490127425ccf198ece11",
+          "main_repo_path": "src/nexa_guardian/storage.py",
+          "main_sha256": "ae66ef9d381e8610f6bf94efc4546a7f3ebbf7039e91490127425ccf198ece11",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/main.py",
+          "runtime_sha256": "79fcaf867c01f152e62acdc3dcd68a632b8bb21b4e49155397d079cb660f6dd4",
+          "main_repo_path": "src/nexa_guardian/main.py",
+          "main_sha256": "79fcaf867c01f152e62acdc3dcd68a632b8bb21b4e49155397d079cb660f6dd4",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/reporting.py",
+          "runtime_sha256": "deee234420b2b80525e92b6fb274bb1a8081425b8416511e1d2f827b4b6573fc",
+          "main_repo_path": "src/nexa_guardian/reporting.py",
+          "main_sha256": "deee234420b2b80525e92b6fb274bb1a8081425b8416511e1d2f827b4b6573fc",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/moderator.py",
+          "runtime_sha256": "ad6a1a78121e444b1af5a70bc7544c8ffd2e5200ace4283853e16005db8cd00d",
+          "main_repo_path": "src/nexa_guardian/moderator.py",
+          "main_sha256": "ad6a1a78121e444b1af5a70bc7544c8ffd2e5200ace4283853e16005db8cd00d",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/raffle_service.py",
+          "runtime_sha256": "bbd28b478526db60919d6ddee4761a445512f57be20eb06b6da91349b6b8080a",
+          "main_repo_path": "src/nexa_guardian/raffle_service.py",
+          "main_sha256": "bbd28b478526db60919d6ddee4761a445512f57be20eb06b6da91349b6b8080a",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/commands.py",
+          "runtime_sha256": "fb64bf594173ca6b066bfb4de56e2eb9c07091618e9951ad366ec20b25d16f1d",
+          "main_repo_path": "src/nexa_guardian/commands.py",
+          "main_sha256": "fb64bf594173ca6b066bfb4de56e2eb9c07091618e9951ad366ec20b25d16f1d",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/config.py",
+          "runtime_sha256": "7cc90b73dbe642c7082c6b1edcdcd269b7f763d60cdcf47677b2145ff0beb2ee",
+          "main_repo_path": "src/nexa_guardian/config.py",
+          "main_sha256": "7cc90b73dbe642c7082c6b1edcdcd269b7f763d60cdcf47677b2145ff0beb2ee",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/command_ui.py",
+          "runtime_sha256": "f03f3bda58e2c67ba257cebe03374fbe93269c9808556a2b01c8245bd9178c79",
+          "main_repo_path": "src/nexa_guardian/command_ui.py",
+          "main_sha256": "f03f3bda58e2c67ba257cebe03374fbe93269c9808556a2b01c8245bd9178c79",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/admin.py",
+          "runtime_sha256": "7e8b62fbd75c609acfbc8df6b385e2f580897a4e31cbaa16e3a7fcb2da417166",
+          "main_repo_path": "src/nexa_guardian/admin.py",
+          "main_sha256": "7e8b62fbd75c609acfbc8df6b385e2f580897a4e31cbaa16e3a7fcb2da417166",
+          "matches_pre_sync_main": true
+        },
+        {
+          "runtime_path": "nexa_guardian/__init__.py",
+          "runtime_sha256": "3806600a9503b573fd5731c88e6e10674c206c777826cd4179826c2dc2b76dd9",
+          "main_repo_path": "src/nexa_guardian/__init__.py",
+          "main_sha256": "3806600a9503b573fd5731c88e6e10674c206c777826cd4179826c2dc2b76dd9",
+          "matches_pre_sync_main": true
+        }
+      ],
+      "release_verification": {
+        "git_sha": "604ed20b3f5c201b497a04b9a840e55160a663b8",
+        "wheel_sha256": "d4a685f9e0baaa494084da7885b861c375a69392cb6b7666b9b18bf228868207",
+        "recorded_wheel_sha256": "d4a685f9e0baaa494084da7885b861c375a69392cb6b7666b9b18bf228868207",
+        "wheel_python_files": 24,
+        "installed_wheel_mismatches": []
+      }
+    }
+  }
+}
