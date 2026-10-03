@@ -117,7 +117,9 @@ def test_backup_rejects_symlink_target_directory(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("reverse_iteration", (False, True))
 def test_backup_retention_only_removes_expired_standard_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reverse_iteration: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reverse_iteration: bool,
 ) -> None:
     old = tmp_path / "guardian-20260601T000000Z.db"
     current = tmp_path / "guardian-20260820T000000Z.db"
