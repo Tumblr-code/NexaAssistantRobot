@@ -115,7 +115,12 @@ def test_backup_rejects_symlink_target_directory(tmp_path: Path) -> None:
         backup_database(source_path, linked_directory)
 
 
-def test_backup_retention_only_removes_expired_standard_files(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reverse_iteration", (False, True))
+def test_backup_retention_only_removes_expired_standard_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reverse_iteration: bool,
+) -> None:
     old = tmp_path / "guardian-20260601T000000Z.db"
     current = tmp_path / "guardian-20260820T000000Z.db"
     old_session = tmp_path / "telegram-session-20260601T000000Z.session"
@@ -126,13 +131,26 @@ def test_backup_retention_only_removes_expired_standard_files(tmp_path: Path) ->
     for path in (old, current, old_session, current_session, manual, nested):
         path.touch()
 
+    # Filesystem iteration order is unspecified. Exercise both orders without
+    # changing the production implementation or the exact removal assertions.
+    entries = [old, current, old_session, current_session, manual, nested.parent]
+    if reverse_iteration:
+        entries.reverse()
+    original_iterdir = Path.iterdir
+
+    def controlled_iterdir(path: Path):
+        return iter(entries) if path == tmp_path else original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", controlled_iterdir)
+
     removed = prune_backups(
         tmp_path,
         retention_days=30,
         now=datetime(2026, 8, 27, tzinfo=UTC),
     )
 
-    assert removed == (old, old_session)
+    expected = (old_session, old) if reverse_iteration else (old, old_session)
+    assert removed == expected
     assert not old.exists()
     assert not old_session.exists()
     assert current.exists()
