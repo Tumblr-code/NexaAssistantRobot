@@ -63,7 +63,9 @@ jobs:
           --cov-fail-under=75
 
       - name: Build wheel and source distribution
-        run: uv build
+        run: |
+          uv build
+          uv export --frozen --no-dev --no-emit-project --no-hashes --format requirements.txt --output-file dist/requirements-runtime.txt
 
       - name: Package source and deployment templates
         run: python scripts/build_release.py
@@ -72,7 +74,7 @@ jobs:
         run: |
           (cd dist && sha256sum -c SHA256SUMS)
           uv venv "${RUNNER_TEMP}/wheel-smoke"
-          uv pip install --python "${RUNNER_TEMP}/wheel-smoke/bin/python" --no-deps dist/*.whl
+          uv pip install --python "${RUNNER_TEMP}/wheel-smoke/bin/python" --constraint dist/requirements-runtime.txt dist/*.whl
           "${RUNNER_TEMP}/wheel-smoke/bin/python" -I -c 'from importlib.metadata import version; import nexa_guardian; assert version("nexa-guardian") == nexa_guardian.__version__ == "0.6.8"'
 
 
