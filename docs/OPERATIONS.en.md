@@ -4,7 +4,8 @@ English | [简体中文](OPERATIONS.zh-CN.md)
 
 ## Scope and configuration
 
-v0.6.8 changes documentation, version metadata and packaging only; database
+v0.6.8 changes documentation, version metadata, packaging and the audited
+multidict dependency; database
 schema stays **8**. The verified production package is still v0.6.7. Release
 publication is separate from deployment approval. Never put `.env`, session
 files, SQLite/WAL files, backups or real identifiers in a release or CI log.

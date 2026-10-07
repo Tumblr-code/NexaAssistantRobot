@@ -8,7 +8,7 @@ configured DeepSeek Responses endpoint, supports warnings/bans, persistent
 keyword raffles, and private administrator tools. Only explicitly allowlisted
 numeric groups and the configured administrator may use management features.
 
-**v0.6.8 is a documentation and release-packaging update.** Application behavior
+**v0.6.8 updates documentation, release packaging and a security dependency.** Application behavior
 remains that of v0.6.7. On 2026-10-07 a read-only comparison verified that all
 24 installed Python package files of production v0.6.7 match baseline `063a8d7`.
 Publishing this release does not deploy code, restart services, send messages,
@@ -31,6 +31,19 @@ or perform moderation. See [source provenance](PRODUCTION_BASELINE.md).
 commands still execute. Starting the bot or probing the external gateway is
 not an offline test. AI failure behavior is separately controlled by
 `AI_FAILURE_DELETE`; inspect it before enabling a real group.
+
+## Command reference
+
+The current Telegram menu remains Chinese. These exact descriptions are shared
+with the bot command contract; English meanings are provided alongside them.
+
+| Command | Telegram description | English meaning |
+| --- | --- | --- |
+| `/help` | 查看极简使用说明 | Show concise help |
+| `/status` | 查看运行状态与管理统计 | Show runtime and moderation statistics |
+| `/del` | 删除消息、群历史或成员 | Delete messages/history or manage member cleanup |
+| `/ban` | 回复消息或填写用户 ID 封禁 | Ban a replied-to user or numeric user ID |
+| `/lottery` | 创建或管理关键词抽奖 | Create/manage a keyword raffle |
 
 ## Install and verify the release
 
