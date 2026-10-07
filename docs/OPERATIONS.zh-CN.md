@@ -67,3 +67,5 @@ v0.6.8 仅整理文档、版本信息和发布包；数据库仍为 **Schema 8**
 | outbox 持续重试 | 只读查看待发/失败聚合，不能用真实重发做测试 |
 
 可只读使用 `systemctl status nexa-guardian.service` 和范围明确的 journal。共享前脱敏 Token、Session、原始用户消息和身份。更完整的命令与配置说明见 `README.zh-CN.md`。
+
+本发布同时把 `multidict` 固定到 `6.9.1`，修复审计发现的 [GHSA-54p9-h82j-f925](https://github.com/advisories/GHSA-54p9-h82j-f925)。锁文件与 wheel 依赖要求同步，不改变业务规则；生产尚未更新此依赖。
