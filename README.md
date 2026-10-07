@@ -1,5 +1,11 @@
 # Nexa Guardian
 
+简体中文 | [English](README.en.md)
+
+> v0.6.8 是文档、发布资产与安全依赖更新版本，保留 v0.6.7 业务行为。2026-10-07 只读核验确认生产安装包仍为 0.6.7，24 个包文件与基线 `063a8d7` 相同；本次 GitHub 发布不部署、不重启服务。
+
+核心运维：[中文](docs/OPERATIONS.zh-CN.md) / [English](docs/OPERATIONS.en.md)；[贡献](CONTRIBUTING.md)；[安全](SECURITY.md)。
+
 一个独立、自托管的 Telegram 群管理机器人，使用 DeepSeek-V4.1-Flash 官方接口识别广告，并提供删除、警告、封禁和管理员私聊管理。它不会改动现有客服机器人，也不会自动接管未明确列入白名单的群。
 
 Nexa Guardian 的身份是 Nexa 官方群管理审核员。固定的一方站点为：
@@ -256,3 +262,7 @@ BotFather 菜单与 `/help` 共用 `COMMAND_SPECS`，只保留以下五个顶级
 `none` 和兼容字段 `default`，且全部生产配置契约通过后，才允许切换生产 release。
 
 轮询启动时如果发现该 Token 已经配置 webhook，程序会拒绝启动，**不会自动删除现有 webhook**。这是为了避免误用现有客服机器人 Token 时切断原服务。
+
+本发布同时把 `multidict` 固定到 `6.9.1`，修复审计发现的 [GHSA-54p9-h82j-f925](https://github.com/advisories/GHSA-54p9-h82j-f925)。锁文件与 wheel 依赖要求同步，不改变业务规则；生产尚未更新此依赖。
+
+首次在空 Ubuntu 主机安装请按[中文 bootstrap](docs/BOOTSTRAP.zh-CN.md)，已有主机升级沿用受限发布工具。GitHub 资产还包括 `requirements-runtime.txt`，安装 wheel 时加 `-c requirements-runtime.txt` 固定完整依赖闭包；离线验证不启动应用。
