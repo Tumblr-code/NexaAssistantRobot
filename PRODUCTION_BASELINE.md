@@ -21,3 +21,7 @@ been deployed as part of this GitHub release.
 实际运行目录仍为上述 release；读取真实 venv 确认为 0.6.7，24 个安装包文件与
 基线 `063a8d7` 逐字节相同，无增减文件。本次未修改生产服务、配置或数据；
 v0.6.8 是版本信息、文档及打包更新，不宣称已部署。
+
+This release also pins `multidict==6.9.1` in the lock and wheel requirements
+to address [GHSA-54p9-h82j-f925](https://github.com/advisories/GHSA-54p9-h82j-f925).
+No business rules change; the production dependency has not been updated.

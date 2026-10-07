@@ -262,3 +262,5 @@ BotFather 菜单与 `/help` 共用 `COMMAND_SPECS`，只保留以下五个顶级
 `none` 和兼容字段 `default`，且全部生产配置契约通过后，才允许切换生产 release。
 
 轮询启动时如果发现该 Token 已经配置 webhook，程序会拒绝启动，**不会自动删除现有 webhook**。这是为了避免误用现有客服机器人 Token 时切断原服务。
+
+本发布同时把 `multidict` 固定到 `6.9.1`，修复审计发现的 [GHSA-54p9-h82j-f925](https://github.com/advisories/GHSA-54p9-h82j-f925)。锁文件与 wheel 依赖要求同步，不改变业务规则；生产尚未更新此依赖。

@@ -85,3 +85,7 @@ asset is bound to the immutable Git commit in `release-metadata.json`.
 
 [Contributing / 贡献](CONTRIBUTING.md) · [Security / 安全](SECURITY.md) ·
 [MIT license](LICENSE)
+
+This release also pins `multidict==6.9.1` in the lock and wheel requirements
+to address [GHSA-54p9-h82j-f925](https://github.com/advisories/GHSA-54p9-h82j-f925).
+No business rules change; the production dependency has not been updated.

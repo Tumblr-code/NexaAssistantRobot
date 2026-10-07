@@ -106,3 +106,7 @@ then explicitly authorize startup. Do not replay manual commands or notification
 Use read-only `systemctl status nexa-guardian.service` and scoped journal reads;
 redact tokens, sessions, raw user messages and identities before sharing evidence.
 The detailed Chinese command/config reference remains in `README.zh-CN.md`.
+
+This release also pins `multidict==6.9.1` in the lock and wheel requirements
+to address [GHSA-54p9-h82j-f925](https://github.com/advisories/GHSA-54p9-h82j-f925).
+No business rules change; the production dependency has not been updated.
