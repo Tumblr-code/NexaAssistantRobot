@@ -34,6 +34,7 @@ def main() -> None:
     expected = [
         dist / f"nexa_guardian-{version}-py3-none-any.whl",
         dist / f"nexa_guardian-{version}.tar.gz",
+        dist / "requirements-runtime.txt",
     ]
     if not all(path.is_file() for path in expected):
         raise SystemExit("Run uv build on this commit first")

@@ -66,6 +66,8 @@ v0.6.8 整理文档、版本信息、发布包及已审计的 multidict 安全�
 | 备份失败 | 检查定时器退出码、空间、权限与副本完整性，不能删主库消错 |
 | outbox 持续重试 | 只读查看待发/失败聚合，不能用真实重发做测试 |
 
-可只读使用 `systemctl status nexa-guardian.service` 和范围明确的 journal。共享前脱敏 Token、Session、原始用户消息和身份。更完整的命令与配置说明见 `README.zh-CN.md`。
+可只读使用 `systemctl status nexa-guardian.service` 和范围明确的 journal。共享前脱敏 Token、Session、原始用户消息和身份。更完整的命令与配置说明见 `README.md`。
 
 本发布同时把 `multidict` 固定到 `6.9.1`，修复审计发现的 [GHSA-54p9-h82j-f925](https://github.com/advisories/GHSA-54p9-h82j-f925)。锁文件与 wheel 依赖要求同步，不改变业务规则；生产尚未更新此依赖。
+
+空 Ubuntu 主机首次安装见 [bootstrap 指南](BOOTSTRAP.zh-CN.md)。`release.sh` 是升级工具，要求已有账号、运行中的主服务/定时器、数据库、受保护配置和已认证 MTProto 会话，不能初始化空主机。安装 wheel 加 `-c requirements-runtime.txt` 使用已审计完整依赖闭包。
