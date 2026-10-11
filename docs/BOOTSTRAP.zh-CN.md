@@ -2,17 +2,17 @@
 
 [English](BOOTSTRAP.en.md) | 简体中文
 
-本指南仅适用于**另行授权的全新 Ubuntu 24.04 systemd 主机**，不是本次发布实际执行的脚本。它会写系统配置，最后阶段连接 Telegram/模型供应商并启动真实管理，禁止在现有 VM 照搬。`deploy/release.sh` 是升级工具，要求已有运行中服务、账号、数据库、配置和真实 MTProto 会话，不能初始化空主机。Docker 是另一个可选安装方式。
+本指南用于在一台**全新的 Ubuntu 24.04（systemd）主机**上首次安装。它会写入系统配置，最后阶段会连接 Telegram 和模型服务商并开始真实的群管理，所以不要在已经装过本项目的主机上照搬。`deploy/release.sh` 是升级工具，要求主机上已有运行中的服务、账号、数据库、配置和已登录的 MTProto 会话，不能用来初始化空主机。Docker 是另一种安装方式，见[首页](../README.md#用-docker-运行)。
 
 ## 先准备，不启动机器人
 
-通过已认证的私有 GitHub 连接把 v0.6.8 全部资产下载到 `/root/nexa-guardian-v0.6.8`，独立核对 tag 与完整提交。以下命令的空机检查失败时立即停止，改用已有主机升级/恢复流程。保持同一 root Bash 会话，后续会使用 `artifact_dir` 与 `release_dir`。安装需要包索引，以下步骤不启动轮询。
+从仓库的 Releases 把 v0.7.0 的全部附件下载到 `/root/nexa-guardian-v0.7.0`。没有发行版时，在本地按[首页「开发」一节](../README.md#开发)执行 `uv build` 和 `python scripts/build_release.py`，把 `dist/` 里的文件传到该目录。以下命令的空机检查失败时立即停止，改用升级或恢复流程。保持同一个 root Bash 会话，以便 `artifact_dir` 和 `release_dir` 一直有效。这些命令需要访问软件源，但不会启动机器人。
 
 ```bash
-# Run as root only on a fresh, separately authorized Ubuntu host.
+# Run as root, only on a fresh Ubuntu host.
 set -euo pipefail
 umask 0077
-artifact_dir=/root/nexa-guardian-v0.6.8
+artifact_dir=/root/nexa-guardian-v0.7.0
 cd "$artifact_dir"
 sha256sum -c SHA256SUMS
 test ! -e /opt/nexa-guardian && test ! -L /opt/nexa-guardian
@@ -38,23 +38,23 @@ release_dir="/opt/projects/nexa-guardian/runtime/releases/$release_id"
 install -d -o root -g nexa-guardian -m 0750 "$release_dir"
 python3 -m venv "$release_dir/.venv"
 "$release_dir/.venv/bin/python" -m pip install \
-  -c requirements-runtime.txt ./nexa_guardian-0.6.8-py3-none-any.whl
+  -c requirements-runtime.txt ./nexa_guardian-0.7.0-py3-none-any.whl
 "$release_dir/.venv/bin/python" -m pip check
 install -o root -g nexa-guardian -m 0640 release-metadata.json SHA256SUMS \
-  requirements-runtime.txt nexa_guardian-0.6.8-py3-none-any.whl "$release_dir/"
+  requirements-runtime.txt nexa_guardian-0.7.0-py3-none-any.whl "$release_dir/"
 chown -R root:nexa-guardian "$release_dir"
 chmod -R u=rwX,g=rX,o= "$release_dir"
-tar -xzf nexa-guardian-0.6.8-deployment.tar.gz
-install -o root -g root -m 0600 nexa-guardian-0.6.8/.env.example \
+tar -xzf nexa-guardian-0.7.0-deployment.tar.gz
+install -o root -g root -m 0600 nexa-guardian-0.7.0/.env.example \
   /etc/nexa-guardian/guardian.env
 nano /etc/nexa-guardian/guardian.env
 ```
 
-在私有编辑器填写真实 Token、预期机器人 ID/用户名、唯一管理员和数字群白名单。`DATABASE_PATH` 设置为 `/var/lib/nexa-guardian/guardian.db`；AI 按运维指南填写官方地址/密钥和完整 `none` 参数。MTProto API ID/hash 成对设置，路径使用下文值。凭据不得出现在命令参数、shell 历史和 Git。`DRY_RUN` 不保护手工命令；激活前核实 Token 不被其他部署共用、无 webhook，并审阅群管理权限。
+在编辑器里填写真实 Token、预期的机器人 ID 和用户名、唯一管理员的数字 ID，以及群的数字 ID 白名单。`DATABASE_PATH` 设为 `/var/lib/nexa-guardian/guardian.db`。AI 相关配置按你自己的服务商填写接口地址、密钥和模型，其余参数照模板逐项写明（见[运维指南](OPERATIONS.zh-CN.md)）。MTProto 的 API ID 和 Hash 必须成对配置，会话路径用下文的值。不要把凭据写进命令、Shell 历史或 Git。`DRY_RUN` 不保护手工命令。确认这个机器人没有被其他部署共用、没有配置 webhook，并在启用前检查它在群里的管理员权限。
 
 ## 初始化持久状态并认证管理员
 
-数据库初始化仅在本地执行，存在数据库时拒绝。后续交互命令以管理员本人身份登录 Telegram，须明确授权并输入真实验证码/两步密码，不发送群消息或管理命令。正式备份单元与升级工具要求真实会话，不能造空 Session 绕过门槛。身份不符时停止，不安装并启动服务。
+数据库初始化只在本地进行，已有数据库时会拒绝。接下来的交互命令以管理员本人的身份登录 Telegram，需要输入真实的验证码和两步验证密码，但不会发送群消息或管理命令。备份单元和升级工具都要求这个真实会话存在，不要创建空的占位会话来绕过检查。身份校验失败时停下来，不要继续安装服务单元。
 
 ```bash
 cd /
@@ -90,16 +90,16 @@ chmod 0600 /var/lib/nexa-guardian/guardian.db \
 
 ## 明确激活并验收
 
-只有真实机器人活动与网关探针已获授权才能继续。探针会连接模型供应商，可能消耗额度。安装单元或启动定时器不等于机器人可用；启动后核实稳定状态、真实安装版本/身份、Schema 8 完整性和数据库/会话成对备份成功。只看脱敏日志，发布包验收不需要测试消息、删除、封禁或抽奖。
+到这一步机器人会真正开始工作。网关探针会连接模型服务商，可能消耗额度。装好单元文件或启用定时器并不代表机器人可用：启动后要确认服务状态稳定、安装的版本和机器人身份正确、数据库为 Schema 8 且完整，并且数据库与会话的备份成功。查看日志时注意隐去敏感内容。
 
 ```bash
 cd "$artifact_dir"
 ln -s "$release_dir" /opt/projects/nexa-guardian/runtime/current
 ln -s /opt/projects/nexa-guardian/runtime /opt/nexa-guardian
 install -o root -g root -m 0644 \
-  nexa-guardian-0.6.8/deploy/systemd/nexa-guardian.service \
-  nexa-guardian-0.6.8/deploy/systemd/nexa-guardian-backup.service \
-  nexa-guardian-0.6.8/deploy/systemd/nexa-guardian-backup.timer /etc/systemd/system/
+  nexa-guardian-0.7.0/deploy/systemd/nexa-guardian.service \
+  nexa-guardian-0.7.0/deploy/systemd/nexa-guardian-backup.service \
+  nexa-guardian-0.7.0/deploy/systemd/nexa-guardian-backup.timer /etc/systemd/system/
 "$release_dir/.venv/bin/nexa-guardian-probe" \
   --env-file /etc/nexa-guardian/guardian.env --require-production-settings
 systemctl daemon-reload
@@ -113,4 +113,4 @@ systemctl show nexa-guardian-backup.service --property=Result,ExecMainStatus
   'from importlib.metadata import version; print(version("nexa-guardian"), version("multidict"))'
 ```
 
-激活失败时停止新服务，保留配置、数据和日志诊断，不循环重启、不删状态。空主机没有旧生产部署可回滚；后续升级走 `deploy/release.sh` 原有备份/回退门槛。保留 wheel、元数据和受保护初始备份作为首次安装记录。本指南按现有源码/单元核对，未在生产执行。
+激活失败时停止新服务，保留配置、数据和日志用于排查，不要循环重启，也不要删除状态。之后的升级使用 `deploy/release.sh`，它自带备份和回退检查，用法见 [deploy/RELEASE.md](../deploy/RELEASE.md)。请保留 wheel、元数据和首次备份，作为首次安装的记录。

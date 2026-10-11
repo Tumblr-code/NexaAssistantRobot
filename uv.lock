@@ -1077,7 +1077,7 @@ wheels = [
 
 [[package]]
 name = "nexa-guardian"
-version = "0.6.8"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiogram" },

@@ -13,14 +13,12 @@ from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User, Video
 from aiohttp import ClientPayloadError
 
 import nexa_guardian.moderator as moderator_module
+from nexa_guardian import branding
 from nexa_guardian.ai_review import AIReviewResult, AIReviewTimeout
 from nexa_guardian.config import Settings
 from nexa_guardian.detection import Violation
 from nexa_guardian.moderator import (
     AUTO_BAN_MEMORY_MAX,
-    BOT_PROFILE_DESCRIPTION,
-    BOT_PROFILE_NAME,
-    BOT_PROFILE_SHORT_DESCRIPTION,
     ModerationController,
     select_photo_preview,
 )
@@ -421,13 +419,15 @@ async def test_set_commands_syncs_default_and_chinese_profile(
         "ban",
         "lottery",
     }
-    assert bot.set_my_name.await_args_list[0].args == (BOT_PROFILE_NAME,)
+    assert bot.set_my_name.await_args_list[0].args == (branding.bot_profile_name(),)
     assert bot.set_my_name.await_args_list[1].kwargs["language_code"] == "zh"
-    assert bot.set_my_short_description.await_args_list[0].args == (BOT_PROFILE_SHORT_DESCRIPTION,)
-    assert bot.set_my_description.await_args_list[0].args == (BOT_PROFILE_DESCRIPTION,)
-    assert len(BOT_PROFILE_NAME) <= 64
-    assert len(BOT_PROFILE_SHORT_DESCRIPTION) <= 120
-    assert len(BOT_PROFILE_DESCRIPTION) <= 512
+    assert bot.set_my_short_description.await_args_list[0].args == (
+        branding.bot_profile_short_description(),
+    )
+    assert bot.set_my_description.await_args_list[0].args == (branding.bot_profile_description(),)
+    assert len(branding.bot_profile_name()) <= 64
+    assert len(branding.bot_profile_short_description()) <= 120
+    assert len(branding.bot_profile_description()) <= 512
 
 
 async def test_set_commands_does_not_write_matching_profile(
@@ -442,12 +442,12 @@ async def test_set_commands_does_not_write_matching_profile(
     ]
     bot = SimpleNamespace(
         get_my_commands=AsyncMock(return_value=commands),
-        get_my_name=AsyncMock(return_value=SimpleNamespace(name=BOT_PROFILE_NAME)),
+        get_my_name=AsyncMock(return_value=SimpleNamespace(name=branding.bot_profile_name())),
         get_my_short_description=AsyncMock(
-            return_value=SimpleNamespace(short_description=BOT_PROFILE_SHORT_DESCRIPTION)
+            return_value=SimpleNamespace(short_description=branding.bot_profile_short_description())
         ),
         get_my_description=AsyncMock(
-            return_value=SimpleNamespace(description=BOT_PROFILE_DESCRIPTION)
+            return_value=SimpleNamespace(description=branding.bot_profile_description())
         ),
         set_my_commands=AsyncMock(),
         set_my_name=AsyncMock(),
@@ -563,7 +563,7 @@ async def test_raffle_keyword_join_is_exact_deletes_source_and_confirms(
     matched = await controller.raffle_service.keyword_filter(exact)
     assert isinstance(matched, dict)
     assert not await controller.raffle_service.keyword_filter(
-        group_message(42, "Nexa 参加", message_id=6)
+        group_message(42, "Demo 参加", message_id=6)
     )
     await controller.raffle_service.join(exact, matched["raffle"])
     await controller.raffle_service.flush_card_updates()

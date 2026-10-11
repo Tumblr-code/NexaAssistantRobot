@@ -301,7 +301,7 @@ async def test_member_activity_middleware_notes_before_raffle_keyword_delete() -
     event = Message(
         message_id=501,
         date=now,
-        chat=Chat(id=GROUP_ID, type=ChatType.SUPERGROUP, title="ExampleStore"),
+        chat=Chat(id=GROUP_ID, type=ChatType.SUPERGROUP, title="Example"),
         from_user=User(id=MEMBER_ID, is_bot=False, first_name="Member"),
         text="参与",
     )

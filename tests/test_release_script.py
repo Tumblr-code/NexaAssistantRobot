@@ -42,10 +42,11 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     script = _release_script()
 
     assert 'readonly CODE_SCHEMA_VERSION="8"' in script
-    assert 'readonly CODE_AI_MODEL="deepseek-flash"' in script
+    assert "readonly AI_MODEL_PATTERN=" in script
+    assert "deepseek" not in script.casefold()
     assert 'readonly APP_ROOT="/opt/projects/nexa-guardian/runtime"' in script
     assert "--allow-model-cooldown requires --ai-model" in script
-    probe = script.index("probing ${CODE_AI_MODEL} non-thinking capabilities")
+    probe = script.index("probing the configured AI gateway and production settings")
     pause_timer = script.index("pausing ${BACKUP_TIMER_NAME}")
     backup_inactive = script.index("database backup service did not become idle")
     stop = script.index("for a final consistent database backup")
@@ -193,7 +194,7 @@ def test_release_cooldown_exception_arguments_fail_closed(tmp_path: Path) -> Non
     wrong_model = _run_release_arguments(
         *base,
         "--ai-model",
-        "gpt-5.5",
+        "not a model!",
         "--allow-model-cooldown",
     )
     duplicate = _run_release_arguments(
@@ -205,9 +206,9 @@ def test_release_cooldown_exception_arguments_fail_closed(tmp_path: Path) -> Non
     )
 
     assert missing_model.returncode != 0
-    assert "requires --ai-model deepseek-flash" in missing_model.stderr
+    assert "requires --ai-model" in missing_model.stderr
     assert wrong_model.returncode != 0
-    assert "only supports AI model deepseek-flash" in wrong_model.stderr
+    assert "not a valid model identifier" in wrong_model.stderr
     assert duplicate.returncode != 0
     assert "may only be provided once" in duplicate.stderr
 
@@ -249,9 +250,7 @@ def test_release_ai_model_update_is_atomic_and_preserves_other_config(tmp_path: 
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "changed"
-    assert config.read_bytes() == original.replace(b"gpt-5.6-luna", b"deepseek-flash").replace(
-        b"=high\n", b"=none\n"
-    ).replace(b"=low\n", b"=none\n")
+    assert config.read_bytes() == original.replace(b"gpt-5.6-luna", b"deepseek-flash")
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
     assert list(tmp_path.glob(".guardian.env.ai-model.*")) == []
 
@@ -262,10 +261,7 @@ def test_release_ai_model_update_rejects_missing_or_duplicate_config(tmp_path: P
     invalid_configs = (
         b"OTHER=value\n",
         b"AI_MODEL=gpt-5.6-sol\nAI_MODEL=gpt-5.6\n",
-        b"AI_MODEL=gpt-5.6-luna\nAI_REASONING_EFFORT=high\n",
-        b"AI_MODEL=gpt-5.6-luna\nAI_REASONING_EFFORT=high\n"
-        b"AI_NORMAL_REASONING_EFFORT=low\nAI_SUSPICIOUS_REASONING_EFFORT=high\n"
-        b"AI_SUSPICIOUS_REASONING_EFFORT=low\n",
+        b"AI_MODEL=gpt-5.6-luna\nAI_REASONING_EFFORT=high\nAI_MODEL=gpt-5.6-luna\n",
     )
     for index, original in enumerate(invalid_configs):
         config = tmp_path / f"guardian-{index}.env"
@@ -363,7 +359,7 @@ def test_release_credentials_are_atomic_and_rollback_restores_old_provider(tmp_p
     assert b"OPENAI_API_KEY=new-placeholder\n" in updated
     assert b"OPENAI_BASE_URL=https://api.deepseek.com\n" in updated
     assert b"BOT_TOKEN=unchanged\n" in updated
-    assert b"=high\n" not in updated and b"=low\n" not in updated
+    assert b"AI_REASONING_EFFORT=high\n" in updated
     assert "placeholder" not in result.stdout + result.stderr
     restored = _run_embedded(rollback, str(backup), str(config), "600", "106")
     assert restored.returncode == 0, restored.stderr

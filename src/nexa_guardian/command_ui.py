@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import html
 from dataclasses import dataclass
 
 from aiogram.types import BotCommand
+
+from nexa_guardian import branding
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,10 +62,12 @@ def bot_commands() -> list[BotCommand]:
 
 
 def help_text() -> str:
+    brand = branding.current()
     lines = [
-        "<b>Nexa Guardian</b>",
+        f"<b>{html.escape(brand.name)}</b>",
         "",
-        "广告由 DeepSeek-V4.1-Flash 自动审核；累计 3 次警告自动封禁。",
+        f"广告由 {html.escape(brand.reviewer_label)} 自动审核；"
+        f"累计 {brand.warn_limit} 次警告自动封禁。",
         "",
     ]
     for spec in COMMAND_SPECS:

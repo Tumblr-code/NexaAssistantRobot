@@ -42,7 +42,7 @@ def test_allowed_domain_and_subdomain_are_kept() -> None:
         blocked_words=set(),
     )
     child = detector().detect(
-        DetectionInput(text="https://pass.example.com/a"),
+        DetectionInput(text="https://shop.example.org/a"),
         allowed_domains=allowed,
         blocked_words=set(),
     )
@@ -130,7 +130,7 @@ def test_fullwidth_link_is_normalized_before_detection() -> None:
 
 
 def test_domain_helpers() -> None:
-    assert normalize_domain("HTTPS://pass.example.com/path") == "pass.example.com"
+    assert normalize_domain("HTTPS://Shop.Example.ORG/path") == "shop.example.org"
     assert domain_from_url("www.Example.COM/path,") == "www.example.com"
     assert is_allowed_domain("a.example.com", {"example.com"})
     assert not is_allowed_domain("badexample.com", {"example.com"})

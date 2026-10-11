@@ -1,115 +1,104 @@
 # Operations guide
 
-English | [简体中文](OPERATIONS.zh-CN.md)
+English | [简体中文](OPERATIONS.zh-CN.md) · [Home](../README.en.md)
 
-## Scope and configuration
+For a first installation see the [first-install guide](BOOTSTRAP.en.md). This guide covers what comes after: configuration, upgrades, rollback, backup, recovery and troubleshooting. The database is at **schema 8**.
 
-v0.6.8 changes documentation, version metadata, packaging and the audited
-multidict dependency; database
-schema stays **8**. The verified production package is still v0.6.7. Release
-publication is separate from deployment approval. Never put `.env`, session
-files, SQLite/WAL files, backups or real identifiers in a release or CI log.
+## Where things live
 
-Use `.env.example` as the complete variable inventory. Its values are examples,
-not a deployable production configuration. Key groups are:
+After following the first-install guide:
 
-| Settings | Required operator decision |
+| What | Where |
 | --- | --- |
-| `BOT_TOKEN`, `EXPECTED_BOT_ID`, `EXPECTED_BOT_USERNAME` | Exact bot identity; mismatch prevents polling |
-| `ALLOWED_CHAT_IDS`, `AUTHORIZED_ADMIN_IDS` | Numeric groups and exactly one private administrator |
-| `DATABASE_PATH`, `LOG_LEVEL`, `LOG_CHAT_ID` | Persistent database, safe log level, optional log destination |
-| `DRY_RUN`, `AI_FAILURE_DELETE`, `WARN_LIMIT` | Automatic observation/failure/moderation policy; manual commands still execute |
-| `AI_ENABLED`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `AI_MODEL` | Optional official DeepSeek integration; credentials stay in a 0600 file |
-| `AI_REASONING_EFFORT`, normal/suspicious variants | `none`; no automatic model fallback |
-| `AI_TIMEOUT_SECONDS`, `UPDATE_CONCURRENCY_LIMIT` | Production contract: 12 seconds / 32 updates |
-| `AI_IMAGE_MAX_BYTES`, target edge, timeout, concurrency | Production: 1572864 / 1280 / 2 / 4 |
-| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_PATH` | Optional authenticated administrator session; never copy into source |
-
-The remaining threshold/cache/flood settings retain their checked-in defaults.
-Production release probes also validate identity and the full existing AI
-contract; do not weaken them to make a release pass. Gateway probes contact an
-external API and may consume quota; keep them out of offline package tests.
-
-## Installation and deployment
-
-Verify `SHA256SUMS` and the commit in `release-metadata.json`. Install the wheel
-in a separate Python 3.10+ virtual environment and verify its distribution
-version without importing `main` or starting polling. Dependencies are pinned
-in `pyproject.toml` and `uv.lock`; CI uses `uv sync --frozen --extra dev`.
-
-For a separately authorized production deployment, use the unchanged guarded
-`deploy/release.sh --wheel /absolute/path/to/wheel --git-sha FULL_SHA
---schema-version 8`. Its probes, protected configuration backup, final stopped
-writer backup, atomic current switch and health checks are required. This
-command is a real deployment, not a dry run. Do not manually repoint `current`.
-Review its optional model-migration flags only when that migration is intended.
-
-| Resource | Canonical location |
-| --- | --- |
-| Releases/current | `/opt/projects/nexa-guardian/runtime/` |
+| Releases and the `current` link | `/opt/projects/nexa-guardian/runtime/` |
 | Compatibility link | `/opt/nexa-guardian/current` |
-| Environment | `/etc/nexa-guardian/guardian.env`, root-owned 0600 |
+| Configuration and secrets | `/etc/nexa-guardian/guardian.env`, owned by root, 0600 |
 | Database | `/var/lib/nexa-guardian/guardian.db` |
-| MTProto session | `/var/lib/nexa-guardian/mtproto/admin.session` |
+| Administrator MTProto session | `/var/lib/nexa-guardian/mtproto/admin.session` |
 | Backups | `/var/backups/nexa-guardian/`; manual copies in `manual/` |
 
-The `deploy/systemd/` templates run as `nexa-guardian` with filesystem
-protection. Existing paths/configuration/data remain external to releases.
-Optional Docker uses `compose.yaml`, a persistent `guardian-data` volume and a
-non-root image; never remove that volume during an application upgrade.
+The units in `deploy/systemd/` run as a non-root user with filesystem protection; configuration and data stay outside the program directory. The Docker variant uses `compose.yaml`, a non-root image and the persistent volume `guardian-data`.
 
-## Upgrade, rollback and recovery
+## Configuration
 
-Before changing a running installation, record current package/source identity,
-service state, database schema, protected configuration and session permissions.
-Keep a tested old wheel and independent backups. Follow `deploy/RELEASE.md`
-and the guarded script, then read back the installed package version, source
-identity, service state and database integrity. A GitHub check or successful
-process start alone is not production acceptance.
+`.env.example` is the complete list. Restart the service after editing `/etc/nexa-guardian/guardian.env`.
 
-The script owns rollback during its transaction and refuses unsafe schema
-reversal. For post-release problems first stop new moderation work through an
-approved service stop, preserve current state and determine whether any new
-writes occurred. Do not overwrite a newer database with an old snapshot just
-to run old code. Prefer a forward code fix; any separately approved restore
-requires a compatible schema and evidence that retained state is reconciled.
+| Settings | Notes |
+| --- | --- |
+| `BOT_TOKEN`, `EXPECTED_BOT_ID`, `EXPECTED_BOT_USERNAME` | Pin the bot identity; a mismatch refuses to start |
+| `ALLOWED_CHAT_IDS`, `AUTHORIZED_ADMIN_IDS` | Group allowlist and administrators; private-chat management needs exactly one administrator |
+| `DRY_RUN`, `AI_FAILURE_DELETE`, `WARN_LIMIT` | Observation mode, behaviour when the model fails, penalty limit |
+| `AI_ENABLED`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `AI_MODEL` | The model service of your choice; keep the key only in the 0600 configuration file |
+| `AI_API_STYLE`, `AI_STRUCTURED_OUTPUT`, `AI_STRICT_RESPONSE` | API style, structured-output mode, whether the response must echo the request |
+| `AI_REASONING_EFFORT`, `AI_SERVICE_TIER` | Optional request parameters; empty omits them |
+| `BRAND_NAME`, `COMMUNITY_NAME`, `OFFICIAL_SITES`, `AI_MODEL_LABEL` | The bot's identity and your official sites |
+| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_PATH` | Optional administrator session for `/del all` and `/del members` |
 
-Create an online consistent backup using the installed interpreter:
+After changing the model or provider, probe before restarting the service:
+
+```sh
+/opt/nexa-guardian/current/.venv/bin/nexa-guardian-probe --env-file /etc/nexa-guardian/guardian.env
+```
+
+The probe sends one fixed harmless sentence and a 1×1 test image, never a group message; it makes a real model call and may consume quota. With `--require-production-settings` it also requires the bot identity, model, thresholds, timeouts and concurrency to be written out and well-formed in the file, and `AI_ENABLED=true`, `AI_FAILURE_DELETE=true`, `DRY_RUN=false`. The upgrade tool runs the probe in this form.
+
+## Upgrade
+
+1. Get the new wheel and `SHA256SUMS`, verify them, and place the wheel at an absolute path on the server.
+2. Run the upgrade tool:
+
+```sh
+sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-X.Y.Z-py3-none-any.whl \
+  --git-sha <full commit id> --schema-version 8
+```
+
+It backs up the configuration, installs the candidate in its own directory and probes the model; only when all of that passes does it stop the service briefly, take a final database backup, switch `current` atomically and run a health check. Any failure stops and restores. Do not edit `current` by hand. See [deploy/RELEASE.md](../deploy/RELEASE.md) (Chinese) for the options and details.
+
+To change the model during an upgrade add `--ai-model <model id>`; to change the provider as well add `--ai-credentials-file`, pointing at a 0600 file with exactly two lines, `OPENAI_BASE_URL` and `OPENAI_API_KEY`.
+
+With Docker: `git pull`, then `docker compose up -d --build`. Never delete the data volume.
+
+A started process is not a finished upgrade. Verify in the group afterwards: `/status`, an ordinary message left alone, a suspicious message showing the review notice.
+
+## Rollback
+
+Failures during an upgrade are rolled back by the tool. If a problem appears after the upgrade completed:
+
+- Pause AI review with `/status ai pause`, or set `DRY_RUN=true`, to stop new automatic actions.
+- Take a backup of the current database and check whether new data has been written since the upgrade.
+- Prefer fixing forward. Do not overwrite the current database with an old one just to run old code; if a restore is really needed, follow Recovery below.
+
+## Backup
 
 ```sh
 /opt/nexa-guardian/current/.venv/bin/python -m nexa_guardian.backup /protected/backup-directory
 ```
 
-The helper uses SQLite Online Backup and verifies `quick_check` and
-`foreign_key_check`. The existing backup timer runs at 03:30 Asia/Shanghai and
-retains standard automatic backups for 30 days; `manual/` is excluded. Preserve
-the private MTProto session and environment separately; a database backup does
-not replace them. Do not copy a live database file without its transaction state.
+The tool uses SQLite Online Backup and verifies `quick_check` and `foreign_key_check`; it is safe while the service runs. The bundled timer runs once a day, standard-named automatic backups are kept for 30 days, and `manual/` is never pruned. With Docker:
 
-Rehearse recovery in an isolated directory: check the backup hash and integrity,
-open it using the matching schema version, and check expected aggregate counts.
-Never start a bot against a production session during rehearsal. Before an
-approved actual restore, stop writers, archive the current database and WAL/SHM,
-restore the consistent copy with the original ownership/permissions, validate it,
-then explicitly authorize startup. Do not replay manual commands or notifications.
+```sh
+docker compose exec guardian python -m nexa_guardian.backup /data/backups
+docker compose cp guardian:/data/backups ./backups
+```
+
+A database backup does not contain the configuration file or the administrator session; protect those separately. Do not simply copy the live database file, which may give an inconsistent copy. Backups hold moderation records and credentials; never upload them anywhere public.
+
+## Recovery
+
+Rehearse in an isolated directory first: check the checksum, integrity, schema version and the expected aggregate counts, and do not start the bot with a real session during the rehearsal.
+
+For a real recovery: stop the service, set aside the current database together with its WAL and SHM files, put the consistent copy in place with the original owner and permissions, verify it, and only then start the service.
 
 ## Troubleshooting
 
-| Symptom | Safe checks and boundary |
+| Symptom | Check |
 | --- | --- |
-| Startup identity rejection | Compare configured expected ID/username privately; do not print the token |
-| No group moderation | Confirm numeric allowlist and bot admin permissions; `DRY_RUN` is automatic-only |
-| AI timeout/429/format rejection | Inspect safe status/latency/code logs and configured contract; do not silently change model or thresholds |
-| MTProto command unavailable | Check session path/owner and paired API settings; interactive login requires separate authorization |
-| Backup failure | Check timer exit status, disk/permissions and backup integrity; never delete the live database to clear errors |
-| Repeated outbox attempts | Inspect aggregate pending/failed counts; do not resend real messages as a test |
+| Identity check fails at start-up | `EXPECTED_BOT_ID` and `EXPECTED_BOT_USERNAME` must match this token |
+| Start-up reports a configured webhook | Another service uses this token through a webhook; the program will not delete it for you |
+| The target group is not moderated | `ALLOWED_CHAT_IDS` and the bot's administrator rights; `DRY_RUN` only affects automatic actions |
+| AI timeouts, 429 or malformed responses | `/status ai` for latency and error types; the probe to confirm the model and API style; adjust `AI_API_STYLE` or `AI_STRUCTURED_OUTPUT` if needed |
+| A response is rejected as an unexpected model | The provider returns a different model name than requested; keep `AI_STRICT_RESPONSE=false` unless you need the check |
+| `/del all` or `/del members` unavailable | Session path and ownership; `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` configured as a pair |
+| Backup fails | The timer's exit status, free space and directory permissions; never delete the main database to clear an error |
 
-Use read-only `systemctl status nexa-guardian.service` and scoped journal reads;
-redact tokens, sessions, raw user messages and identities before sharing evidence.
-The detailed Chinese command/config reference remains in `README.md`.
-
-This release also pins `multidict==6.9.1` in the lock and wheel requirements
-to address [GHSA-54p9-h82j-f925](https://github.com/advisories/GHSA-54p9-h82j-f925).
-No business rules change; the production dependency has not been updated.
-
-For a fresh Ubuntu host use [the bootstrap guide](BOOTSTRAP.en.md). `release.sh` is an upgrade tool: it requires an existing service account, active service/timer, database, protected environment and authenticated MTProto session. It cannot bootstrap an empty host. Install wheels with `-c requirements-runtime.txt` for the audited dependency closure.
+Logs: `systemctl status nexa-guardian.service` and `journalctl -u nexa-guardian.service`. Redact tokens, sessions, user messages and identities before sharing logs.

@@ -54,8 +54,6 @@ def main() -> None:
                 "source_commit": commit,
                 "database_schema": 8,
                 "deployment_performed": False,
-                "production_source_baseline": "063a8d7",
-                "production_package_version": "0.6.7",
             },
             indent=2,
         )

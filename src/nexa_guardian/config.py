@@ -1,18 +1,42 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
 from nexa_guardian.ai_contract import (
-    AI_BASE_URL,
+    AI_API_STYLE,
+    AI_API_STYLES,
     AI_MODEL,
     AI_REASONING_EFFORT,
+    AI_REASONING_EFFORTS,
     AI_SERVICE_TIER,
+    AI_STRUCTURED_OUTPUT,
+    AI_STRUCTURED_OUTPUTS,
     AI_TIMEOUT_SECONDS,
 )
+from nexa_guardian.branding import (
+    DEFAULT_BRAND_NAME,
+    Branding,
+    parse_official_sites,
+)
+from nexa_guardian.branding import validate as validate_branding
+
+_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+_TIER_RE = re.compile(r"[a-z0-9_-]{0,32}")
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_gateway_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").casefold()
+    if not host or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return False
+    return parsed.scheme == "https" or (parsed.scheme == "http" and host in _LOCAL_HOSTS)
 
 
 def _csv(value: str | None) -> tuple[str, ...]:
@@ -125,6 +149,11 @@ class Settings:
     telegram_api_id: int | None = None
     telegram_api_hash: str = ""
     telegram_session_path: Path = Path("/var/lib/nexa-guardian/mtproto/admin")
+    ai_api_style: str = AI_API_STYLE
+    ai_structured_output: str = AI_STRUCTURED_OUTPUT
+    ai_strict_response: bool = False
+    sync_bot_profile: bool = True
+    branding: Branding = Branding()
 
     @property
     def mtproto_ready(self) -> bool:
@@ -166,23 +195,44 @@ class Settings:
             raise ValueError("AI_ENABLED=true 时必须配置 OPENAI_BASE_URL")
         if ai_enabled and not openai_api_key:
             raise ValueError("AI_ENABLED=true 时必须配置 OPENAI_API_KEY")
-        if ai_enabled and openai_base_url != AI_BASE_URL:
-            raise ValueError(f"OPENAI_BASE_URL 必须固定为 {AI_BASE_URL}")
-        if ai_model != AI_MODEL:
-            raise ValueError(f"AI_MODEL 必须固定为 {AI_MODEL}")
-        if ai_reasoning_effort != AI_REASONING_EFFORT:
-            raise ValueError(f"AI_REASONING_EFFORT 必须固定为 {AI_REASONING_EFFORT}")
-        if ai_normal_reasoning_effort != AI_REASONING_EFFORT:
-            raise ValueError(f"AI_NORMAL_REASONING_EFFORT 必须固定为 {AI_REASONING_EFFORT}")
-        if ai_suspicious_reasoning_effort != AI_REASONING_EFFORT:
-            raise ValueError(f"AI_SUSPICIOUS_REASONING_EFFORT 必须固定为 {AI_REASONING_EFFORT}")
-        if ai_service_tier != AI_SERVICE_TIER:
-            raise ValueError(f"AI_SERVICE_TIER 必须固定为 {AI_SERVICE_TIER}")
+        if ai_enabled and not _is_gateway_url(openai_base_url):
+            raise ValueError("OPENAI_BASE_URL 必须是 https:// 地址（本机地址可用 http://）")
+        if ai_enabled and not os.getenv("AI_MODEL", "").strip():
+            raise ValueError("AI_ENABLED=true 时必须配置 AI_MODEL")
+        if not ai_model or not _MODEL_RE.fullmatch(ai_model):
+            raise ValueError("AI_MODEL 只能包含字母、数字和 . _ : / - 符号")
+        for name, effort in (
+            ("AI_REASONING_EFFORT", ai_reasoning_effort),
+            ("AI_NORMAL_REASONING_EFFORT", ai_normal_reasoning_effort),
+            ("AI_SUSPICIOUS_REASONING_EFFORT", ai_suspicious_reasoning_effort),
+        ):
+            if effort not in AI_REASONING_EFFORTS:
+                raise ValueError(f"{name} 只能是 none、minimal、low、medium、high 或留空")
+        if not _TIER_RE.fullmatch(ai_service_tier):
+            raise ValueError("AI_SERVICE_TIER 只能包含小写字母、数字、下划线和连字符，或留空")
+        ai_api_style = os.getenv("AI_API_STYLE", AI_API_STYLE).strip().casefold()
+        if ai_api_style not in AI_API_STYLES:
+            raise ValueError("AI_API_STYLE 只能是 responses 或 chat_completions")
+        ai_structured_output = (
+            os.getenv("AI_STRUCTURED_OUTPUT", AI_STRUCTURED_OUTPUT).strip().casefold()
+        )
+        if ai_structured_output not in AI_STRUCTURED_OUTPUTS:
+            raise ValueError("AI_STRUCTURED_OUTPUT 只能是 json_schema 或 json_object")
 
         ai_ad_threshold = _float("AI_AD_THRESHOLD", 0.92, minimum=0.0, maximum=1.0)
         ai_learn_threshold = _float("AI_LEARN_THRESHOLD", 0.97, minimum=0.0, maximum=1.0)
         if ai_learn_threshold < ai_ad_threshold:
             raise ValueError("AI_LEARN_THRESHOLD 不能低于 AI_AD_THRESHOLD")
+
+        branding = Branding(
+            name=os.getenv("BRAND_NAME", "").strip() or DEFAULT_BRAND_NAME,
+            community=os.getenv("COMMUNITY_NAME", "").strip(),
+            official_sites=parse_official_sites(os.getenv("OFFICIAL_SITES")),
+            model_label=os.getenv("AI_MODEL_LABEL", "").strip(),
+            warn_limit=warn_limit,
+            profile_name=os.getenv("BOT_PROFILE_NAME", "").strip(),
+        )
+        validate_branding(branding)
 
         telegram_api_id = _optional_positive_integer("TELEGRAM_API_ID")
         telegram_api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
@@ -248,4 +298,9 @@ class Settings:
                     "/var/lib/nexa-guardian/mtproto/admin",
                 )
             ).expanduser(),
+            ai_api_style=ai_api_style,
+            ai_structured_output=ai_structured_output,
+            ai_strict_response=_boolean("AI_STRICT_RESPONSE", False),
+            sync_bot_profile=_boolean("SYNC_BOT_PROFILE", True),
+            branding=branding,
         )
