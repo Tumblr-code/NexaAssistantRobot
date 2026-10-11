@@ -9,11 +9,12 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 from nexa_guardian.ai_contract import (
-    AI_BASE_URL,
+    AI_API_STYLE,
     AI_MODEL,
     AI_REASONING_EFFORT,
     AI_REASONING_EFFORTS,
     AI_SERVICE_TIER,
+    AI_STRUCTURED_OUTPUT,
     AI_TIMEOUT_SECONDS,
 )
 from nexa_guardian.ai_review import (
@@ -38,16 +39,17 @@ async def probe_gateway(
     model: str,
     reasoning_effort: str = AI_REASONING_EFFORT,
     service_tier: str = AI_SERVICE_TIER,
+    api_style: str = AI_API_STYLE,
+    structured_output: str = AI_STRUCTURED_OUTPUT,
+    strict_response: bool = False,
     requester: ResponseRequester | None = None,
 ) -> AIReviewResult:
-    """Verify Responses, strict structured output, and image input without group data."""
+    """Verify the configured API style, structured output and image input without group data."""
 
-    if model != AI_MODEL:
-        raise ValueError(f"AI_MODEL must be exactly {AI_MODEL}")
+    if not model.strip():
+        raise ValueError("AI_MODEL must be configured")
     if reasoning_effort not in AI_REASONING_EFFORTS:
-        raise ValueError("AI_REASONING_EFFORT must be none, low or high")
-    if service_tier != AI_SERVICE_TIER:
-        raise ValueError(f"AI_SERVICE_TIER must be exactly {AI_SERVICE_TIER}")
+        raise ValueError("AI_REASONING_EFFORT is not a supported value")
 
     reviewer = AIReviewer(
         base_url=base_url,
@@ -55,6 +57,9 @@ async def probe_gateway(
         model=model,
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
+        api_style=api_style,
+        structured_output=structured_output,
+        strict_response=strict_response,
         requester=requester,
         timeout=GATEWAY_PROBE_TIMEOUT_SECONDS,
         concurrency=1,
@@ -73,7 +78,7 @@ async def probe_gateway(
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=f"Probe the configured {AI_MODEL} gateway")
+    parser = argparse.ArgumentParser(description="Probe the configured AI review gateway")
     parser.add_argument(
         "--env-file",
         type=Path,
@@ -110,58 +115,56 @@ def _validate_production_settings(values: Mapping[str, str | None]) -> None:
         raise ValueError("AI_FAILURE_DELETE must be true for production")
     if _env_value(values, "DRY_RUN", "false").casefold() not in false_values:
         raise ValueError("DRY_RUN must be false for production")
-    fixed_settings = {
-        "OPENAI_BASE_URL": AI_BASE_URL,
-        "AI_MODEL": AI_MODEL,
-        "AI_REASONING_EFFORT": AI_REASONING_EFFORT,
-        "AI_NORMAL_REASONING_EFFORT": AI_REASONING_EFFORT,
-        "AI_SUSPICIOUS_REASONING_EFFORT": AI_REASONING_EFFORT,
-        "AI_SERVICE_TIER": AI_SERVICE_TIER,
-    }
-    for name, expected in fixed_settings.items():
+    # The provider is the operator's choice; production only requires it to be spelled out.
+    for name in ("OPENAI_BASE_URL", "AI_MODEL"):
         if name not in values or not _env_value(values, name):
             raise ValueError(f"{name} must be explicitly configured for production")
-        if _env_value(values, name) != expected:
-            raise ValueError(f"{name} must be {expected} for production")
+    for name in ("AI_REASONING_EFFORT", "AI_SERVICE_TIER"):
+        if name not in values:
+            raise ValueError(f"{name} must be explicitly configured for production")
+    if _env_value(values, "AI_REASONING_EFFORT") not in AI_REASONING_EFFORTS:
+        raise ValueError("AI_REASONING_EFFORT is not a supported value")
 
-    integer_settings = {
-        "UPDATE_CONCURRENCY_LIMIT": (32, "32"),
-        "WARN_LIMIT": (3, "3"),
-        "NOTICE_TTL_SECONDS": (30, "30"),
-        "AI_CONCURRENCY": (8, "8"),
-        "AI_CACHE_TTL_SECONDS": (600, "600"),
-        "AI_CACHE_MAX_ENTRIES": (1000, "1000"),
-        "AI_DECISION_RETENTION_DAYS": (30, "30"),
-        "AI_IMAGE_MAX_BYTES": (1_572_864, "1572864"),
-        "AI_IMAGE_TARGET_LONG_EDGE": (1280, "1280"),
-        "AI_MEDIA_CONCURRENCY": (4, "4"),
-    }
-    for name, (expected, default) in integer_settings.items():
+    # Thresholds and limits are the operator's policy; production requires each one to be
+    # written down and well-formed rather than left to a default.
+    integer_settings = (
+        "UPDATE_CONCURRENCY_LIMIT",
+        "WARN_LIMIT",
+        "NOTICE_TTL_SECONDS",
+        "AI_CONCURRENCY",
+        "AI_CACHE_TTL_SECONDS",
+        "AI_CACHE_MAX_ENTRIES",
+        "AI_DECISION_RETENTION_DAYS",
+        "AI_IMAGE_MAX_BYTES",
+        "AI_IMAGE_TARGET_LONG_EDGE",
+        "AI_MEDIA_CONCURRENCY",
+    )
+    for name in integer_settings:
         if name not in values or not _env_value(values, name):
             raise ValueError(f"{name} must be explicitly configured for production")
         try:
-            actual = int(_env_value(values, name, default))
-        except ValueError as exc:
-            raise ValueError(f"{name} must be {expected} for production") from exc
-        if actual != expected:
-            raise ValueError(f"{name} must be {expected} for production")
+            valid = int(_env_value(values, name)) > 0
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError(f"{name} must be a positive integer for production")
 
-    float_settings = {
-        "AI_AD_THRESHOLD": (0.92, "0.92"),
-        "AI_LEARN_THRESHOLD": (0.97, "0.97"),
-        "AI_TIMEOUT_SECONDS": (AI_TIMEOUT_SECONDS, f"{AI_TIMEOUT_SECONDS:g}"),
-        "AI_NORMAL_ACCEPT_CONFIDENCE": (0.90, "0.90"),
-        "AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS": (2.0, "2"),
-    }
-    for name, (expected, default) in float_settings.items():
+    float_settings = (
+        "AI_AD_THRESHOLD",
+        "AI_LEARN_THRESHOLD",
+        "AI_TIMEOUT_SECONDS",
+        "AI_NORMAL_ACCEPT_CONFIDENCE",
+        "AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS",
+    )
+    for name in float_settings:
         if name not in values or not _env_value(values, name):
             raise ValueError(f"{name} must be explicitly configured for production")
         try:
-            actual = float(_env_value(values, name, default))
-        except ValueError as exc:
-            raise ValueError(f"{name} must be {expected:g} for production") from exc
-        if actual != expected:
-            raise ValueError(f"{name} must be {expected:g} for production")
+            valid = float(_env_value(values, name)) > 0
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError(f"{name} must be a positive number for production")
 
     expected_bot_id = _env_value(values, "EXPECTED_BOT_ID")
     try:
@@ -193,6 +196,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     model = _env_value(values, "AI_MODEL", AI_MODEL)
     reasoning_effort = _env_value(values, "AI_REASONING_EFFORT", AI_REASONING_EFFORT)
     service_tier = _env_value(values, "AI_SERVICE_TIER", AI_SERVICE_TIER)
+    api_style = _env_value(values, "AI_API_STYLE", AI_API_STYLE).casefold()
+    structured_output = _env_value(values, "AI_STRUCTURED_OUTPUT", AI_STRUCTURED_OUTPUT).casefold()
+    strict_response = _env_value(values, "AI_STRICT_RESPONSE", "false").casefold() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
     if not base_url or not api_key:
         print("gateway probe failed: gateway credentials are not configured", file=sys.stderr)
         return 1
@@ -210,6 +221,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         model=model,
                         reasoning_effort=effort,
                         service_tier=service_tier,
+                        api_style=api_style,
+                        structured_output=structured_output,
+                        strict_response=strict_response,
                     )
                     for effort in efforts
                 ]
@@ -233,7 +247,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"gateway probe failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
-        f"gateway probe ok: model={AI_MODEL} "
+        f"gateway probe ok: model={model} api_style={api_style} "
         f"reasoning={','.join(result.reasoning_effort for result in results)} "
         f"service_tier={','.join(result.actual_service_tier for result in results)} "
         "structured_output=true image_input=true "

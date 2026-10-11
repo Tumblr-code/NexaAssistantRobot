@@ -12,14 +12,15 @@ from typing import Literal
 
 import aiosqlite
 
-from nexa_guardian.ai_contract import AI_GATEWAY_MODELS
+from nexa_guardian.ai_contract import LOCAL_REVIEW_MODELS
 
 SCHEMA_VERSION = 8
 UTC = timezone.utc
 RAFFLE_ZERO_WIDTH_TRANSLATION = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None)
-AI_GATEWAY_MODEL_PARAMETERS = tuple(sorted(AI_GATEWAY_MODELS))
+# A gateway call is any decision whose model is not one of the local, no-request paths.
+AI_GATEWAY_MODEL_PARAMETERS = tuple(sorted(LOCAL_REVIEW_MODELS))
 AI_GATEWAY_MODEL_PLACEHOLDERS = ", ".join("?" for _ in AI_GATEWAY_MODEL_PARAMETERS)
-AI_GATEWAY_MODEL_PREDICATE = f"model IN ({AI_GATEWAY_MODEL_PLACEHOLDERS})"
+AI_GATEWAY_MODEL_PREDICATE = f"model NOT IN ({AI_GATEWAY_MODEL_PLACEHOLDERS})"
 
 AI_LEARNING_EVIDENCE_TYPES = (
     "text",
@@ -878,9 +879,10 @@ class Storage:
         )
         normalized_service_tier = _metadata_token("service_tier", service_tier, allow_empty=True)
         normalized_review_path = _metadata_token("review_path", review_path, allow_empty=False)
-        gateway_call = int(model in AI_GATEWAY_MODELS and not cached)
-        gateway_cache = int(model in AI_GATEWAY_MODELS and cached)
-        gateway_failure = int(model in AI_GATEWAY_MODELS and bool(error_type))
+        is_gateway = model not in LOCAL_REVIEW_MODELS
+        gateway_call = int(is_gateway and not cached)
+        gateway_cache = int(is_gateway and cached)
+        gateway_failure = int(is_gateway and bool(error_type))
         latency_sample = int(gateway_call == 1 and not error_type)
         safe_latency_ms = max(0, latency_ms)
         safe_media_latency_ms = _nonnegative_int("media_latency_ms", media_latency_ms)
@@ -1106,9 +1108,8 @@ class Storage:
         parameters: list[int | str] = [chat_id, since]
         gateway_filter = ""
         if gateway_only:
-            placeholders = ",".join("?" for _ in AI_GATEWAY_MODELS)
-            gateway_filter = f" AND model IN ({placeholders}) AND cached = 0"
-            parameters.extend(AI_GATEWAY_MODELS)
+            gateway_filter = f" AND {AI_GATEWAY_MODEL_PREDICATE} AND cached = 0"
+            parameters.extend(AI_GATEWAY_MODEL_PARAMETERS)
         cursor = await self.db.execute(
             f"""
             WITH ranked AS (

@@ -19,7 +19,7 @@ readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
 readonly PYTHON_BIN="/usr/bin/python3"
 readonly CODE_SCHEMA_VERSION="8"
-readonly CODE_AI_MODEL="deepseek-flash"
+readonly AI_MODEL_PATTERN='^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
 
 artifact_mode=""
 artifact_path=""
@@ -55,17 +55,17 @@ usage() {
 Usage:
   sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-*.whl \
     --git-sha <full-git-sha> --schema-version <integer> \
-    [--ai-model deepseek-flash] [--ai-credentials-file /protected/credentials.env]
+    [--ai-model <model-id>] [--ai-credentials-file /protected/credentials.env]
 
   sudo deploy/release.sh --source /absolute/path/to/repository \
     [--git-sha <full-git-sha>] --schema-version <integer> \
-    [--ai-model deepseek-flash] [--ai-credentials-file /protected/credentials.env]
+    [--ai-model <model-id>] [--ai-credentials-file /protected/credentials.env]
 
 The script always deploys to /opt/projects/nexa-guardian/runtime, backs up the protected
 configuration, builds and probes the candidate, then stops the service for a
 final consistent database backup before atomically switching current. It keeps
 current plus the two newest older releases after a health check.
-Use --ai-model for the transactional model and non-thinking migration.
+Use --ai-model to switch AI_MODEL transactionally as part of the release.
 Use --ai-credentials-file for an owner-only file containing OPENAI_BASE_URL and OPENAI_API_KEY.
 Use --allow-model-cooldown only for an operator-approved exact 429 model_cooldown.
 EOF
@@ -98,9 +98,6 @@ original = config_path.read_bytes()
 lines = original.splitlines(keepends=True)
 targets = {
     b"AI_MODEL": target_model.encode("ascii"),
-    b"AI_REASONING_EFFORT": b"none",
-    b"AI_NORMAL_REASONING_EFFORT": b"none",
-    b"AI_SUSPICIOUS_REASONING_EFFORT": b"none",
 }
 credentials_path = sys.argv[4] if len(sys.argv) > 4 else ""
 if credentials_path:
@@ -119,9 +116,10 @@ if credentials_path:
                 raise RuntimeError("credential file must contain exactly two literal AI settings")
             credentials[key] = value
         if (set(credentials) != {b"OPENAI_BASE_URL", b"OPENAI_API_KEY"}
-                or credentials[b"OPENAI_BASE_URL"] != b"https://api.deepseek.com"
+                or not credentials[b"OPENAI_BASE_URL"].startswith(b"https://")
+                or len(credentials[b"OPENAI_BASE_URL"]) > 512
                 or len(credentials[b"OPENAI_API_KEY"]) > 512):
-            raise RuntimeError("invalid official DeepSeek credentials configuration")
+            raise RuntimeError("invalid AI credentials configuration")
         targets.update(credentials)
 for key, target in targets.items():
     prefix = key + b"="
@@ -707,13 +705,13 @@ done
 [[ "${schema_version}" =~ ^[0-9]+$ ]] || die "schema version must be a non-negative integer"
 [[ "${schema_version}" == "${CODE_SCHEMA_VERSION}" ]] \
   || die "this release script requires schema version ${CODE_SCHEMA_VERSION}"
-[[ -z "${requested_ai_model}" || "${requested_ai_model}" == "${CODE_AI_MODEL}" ]] \
-  || die "this release script only supports AI model ${CODE_AI_MODEL}"
-(( allow_model_cooldown == 0 )) || [[ "${requested_ai_model}" == "${CODE_AI_MODEL}" ]] \
-  || die "--allow-model-cooldown requires --ai-model ${CODE_AI_MODEL}"
+[[ -z "${requested_ai_model}" || "${requested_ai_model}" =~ ${AI_MODEL_PATTERN} ]] \
+  || die "--ai-model is not a valid model identifier"
+(( allow_model_cooldown == 0 )) || [[ -n "${requested_ai_model}" ]] \
+  || die "--allow-model-cooldown requires --ai-model"
 if [[ -n "${ai_credentials_file}" ]]; then
-  [[ "${requested_ai_model}" == "${CODE_AI_MODEL}" ]] \
-    || die "--ai-credentials-file requires --ai-model ${CODE_AI_MODEL}"
+  [[ -n "${requested_ai_model}" ]] \
+    || die "--ai-credentials-file requires --ai-model"
   [[ "${ai_credentials_file}" = /* && -f "${ai_credentials_file}" && ! -L "${ai_credentials_file}" ]] \
     || die "AI credentials must be a regular absolute non-symlink file"
   [[ "$(readlink -f -- "${ai_credentials_file}")" == "${ai_credentials_file}" ]] \
@@ -737,7 +735,7 @@ getent passwd "${SERVICE_USER}" >/dev/null || die "service user does not exist: 
 getent group "${SERVICE_GROUP}" >/dev/null || die "service group does not exist: ${SERVICE_GROUP}"
 
 exec 9>"${LOCK_PATH}"
-flock -n 9 || die "another Nexa Guardian release is already running"
+flock -n 9 || die "another release is already running"
 
 if [[ "${artifact_mode}" == "wheel" ]]; then
   [[ -f "${artifact_path}" && "${artifact_path}" == *.whl ]] \
@@ -978,7 +976,7 @@ log "creating isolated virtual environment"
 "${final_release}/.venv/bin/python" -m pip install \
   --disable-pip-version-check --no-cache-dir "${copied_wheel}"
 "${final_release}/.venv/bin/python" -c 'import nexa_guardian'
-log "probing ${CODE_AI_MODEL} non-thinking capabilities and production settings"
+log "probing the configured AI gateway and production settings"
 probe_arguments=(--env-file "${probe_config_path}" --require-production-settings)
 if (( allow_model_cooldown == 1 )); then
   probe_arguments+=(--allow-model-cooldown)

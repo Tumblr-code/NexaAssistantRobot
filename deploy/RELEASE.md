@@ -1,190 +1,54 @@
-# Nexa Guardian 发布说明
+# 升级工具 release.sh
 
-`deploy/release.sh` 仅用于生产 VM，以 root 身份把一个已构建 wheel 或源码目录发布到
-`/opt/projects/nexa-guardian/runtime/releases/`；旧 `/opt/nexa-guardian` 兼容链接保留。脚本不会输出 `/etc/nexa-guardian/guardian.env`
-的内容；仅在显式传入 `--ai-model deepseek-flash` 时原子更新模型及三项思考配置，跨供应商迁移另传 `--ai-credentials-file`，并始终在变更前创建一份
-root 专用备份；脚本不会删除 `manual/` 下的手工和
-发布前备份，根目录的标准每日备份仍会按 30 天策略轮换。
+`deploy/release.sh` 用来把一台**已经装好并在运行**本项目的主机升级到新版本。它以 root 身份运行，不能用来做首次安装（首次安装见 [docs/BOOTSTRAP.zh-CN.md](../docs/BOOTSTRAP.zh-CN.md)）。
 
-## 前置条件
+它把升级做成一个事务：先在不影响线上服务的前提下准备并验证候选版本，全部通过后才短暂停服、备份、切换；任何一步失败都会停下并恢复到升级前的状态。
 
-- `nexa-guardian.service` 已按 `deploy/systemd/` 中的 unit 安装并启用。
-- `/etc/nexa-guardian/guardian.env` 是 `root:root` 所有的普通文件，权限为 `0600` 或更严格的 `0400`，且不是符号链接。
-- `/var/lib/nexa-guardian/guardian.db` 存在且可由 root 读取。
-- `/var/lib/nexa-guardian/mtproto/admin.session` 是已授权的唯一管理员 Telethon SQLite
-  会话，必须是普通非符号链接文件，且权限不得宽于 `0600`。
-- `/var/backups/nexa-guardian/` 由 root 持有，`nexa-guardian` 服务组只用于写入和清理
-  标准命名的每日备份；目录带 sticky bit，`manual/` 保持 `root:root 0700`。发布脚本会
-  校正这些权限，不会移动或删除 `manual/` 下的已有备份。
-- VM 已创建 `nexa-guardian` 用户和组，并安装 `/usr/bin/python3`、Python `venv`、`flock`、
-  `getent`、`mktemp`、`sha256sum` 和 systemd；源码模式还需要 `git`。
-- 使用 `--source` 时，还需安装 Python `build`、`uv` 或可用的 `python3 -m pip`；生产发布优先使用 CI 构建的 wheel。
-- 在运行脚本前，将仓库或 wheel 放到 VM 上的明确绝对路径；不要把 API Key 写入 wheel、源码或命令行。
-- `/etc/nexa-guardian/guardian.env` 必须配置 `OPENAI_BASE_URL=https://api.deepseek.com`、
-  官方 `OPENAI_API_KEY`、`AI_REASONING_EFFORT=none`、
-  `AI_NORMAL_REASONING_EFFORT=none`、`AI_SUSPICIOUS_REASONING_EFFORT=none` 和
-  `AI_SERVICE_TIER=default`；固定单次无思考审核，不自动换模型。`default` 仅为响应兼容校验字段，不代表 DeepSeek 提供服务层选择。
-  首次从旧版本升级时保留线上配置，并传入 `--ai-model deepseek-flash`
-  和 `--ai-credentials-file /etc/nexa-guardian/deepseek.pending.env`。
-  凭据文件必须为非符号链接、root 所有、`0600`，只含 `OPENAI_BASE_URL` 与 `OPENAI_API_KEY` 两行，地址必须为官方 HTTPS 地址。
-  候选副本先迁移、验证，切换时才更新线上配置。后续发布要求已配置
-  `AI_MODEL=deepseek-flash` 和全量 `none`。
-  还必须显式配置正确的 `EXPECTED_BOT_ID`、`EXPECTED_BOT_USERNAME`，以及
-  `UPDATE_CONCURRENCY_LIMIT=32`、`AI_NORMAL_ACCEPT_CONFIDENCE=0.90`、
-  `AI_TIMEOUT_SECONDS=12`、
-  `AI_IMAGE_MAX_BYTES=1572864`、`AI_IMAGE_TARGET_LONG_EDGE=1280`、
-  `AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS=2`、`AI_MEDIA_CONCURRENCY=4`。
-  发布脚本会用候选虚拟环境的 `nexa-guardian-probe --require-production-settings` 验证
-  Responses、严格结构化输出和图片输入，并要求响应明确返回 `status=completed`、
-  `model=deepseek-flash`、本次请求对应的 `reasoning.effort=none`、
-  `service_tier=default`。探针还会拒绝未启用 AI、警告阈值不是 3、消息保留时间不是 30 秒、
-  机器人身份未固定或关闭故障删除的配置，同时核对发布计划固定的阈值、超时、更新/AI/媒体
-  并发、缓存、保留期及图片预览限制。探测只发送固定的无害文本及 1×1 测试图片，
-  不读取群消息，也不会输出密钥或响应正文。
+## 前提
 
-## 发布命令
+- 主机上已有 `nexa-guardian` 用户和组、运行中的 `nexa-guardian.service` 和备份定时器、数据库、`/etc/nexa-guardian/guardian.env`，以及已登录的管理员 MTProto 会话。
+- 已安装 `/usr/bin/python3`、Python `venv`、`flock`。使用 `--source` 时还需要 `uv`、Python `build` 或可用的 `python3 -m pip`；推荐直接用 CI 或本地 `uv build` 产出的 wheel。
+- 把 wheel 或源码放到主机上的一个绝对路径。不要把 API Key 写进 wheel、源码或命令行。
+- 配置文件里要把机器人身份、模型、阈值、超时和并发等逐项写明，并且 `AI_ENABLED=true`、`AI_FAILURE_DELETE=true`、`DRY_RUN=false`；升级工具会用 `nexa-guardian-probe --require-production-settings` 检查。
 
-使用 CI wheel（推荐）：
+## 用法
 
 ```bash
-sudo /path/to/repository/deploy/release.sh \
-  --wheel /root/releases/nexa_guardian-0.6.7-py3-none-any.whl \
-  --git-sha 0123456789abcdef0123456789abcdef01234567 \
-  --schema-version 8 \
-  --ai-model deepseek-flash \
-  --ai-credentials-file /etc/nexa-guardian/deepseek.pending.env
+sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-X.Y.Z-py3-none-any.whl \
+  --git-sha <完整提交号> --schema-version 8
+
+sudo deploy/release.sh --source /absolute/path/to/repository \
+  [--git-sha <完整提交号>] --schema-version 8
 ```
 
-直接从已检出的源码构建：
+可选参数：
 
-```bash
-sudo /path/to/repository/deploy/release.sh \
-  --source /root/NexaAssistantRobot \
-  --schema-version 8
-```
+| 参数 | 作用 |
+| --- | --- |
+| `--ai-model <模型 ID>` | 在本次升级里把配置中的 `AI_MODEL` 换成新值；探测用的是换好后的配置，失败则配置原样恢复 |
+| `--ai-credentials-file <路径>` | 连同服务商一起更换。文件必须归当前用户所有、权限 0600、不是符号链接，且恰好只有 `OPENAI_BASE_URL`（https）和 `OPENAI_API_KEY` 两行。需要同时给出 `--ai-model` |
+| `--allow-model-cooldown` | 仅当探测得到精确的 `HTTP 429 model_cooldown`、并且你确认接受模型暂时冷却时使用；其他任何探测错误仍会中止。需要同时给出 `--ai-model`，且只能出现一次 |
 
-首次从旧模型迁移时传入 `--ai-model deepseek-flash`。脚本先备份原配置，用临时候选副本完成
-构建与探针；旧服务停稳且数据库与会话备份完成后，才在代码切换前一刻原子替换生产
-`AI_MODEL`、三项思考配置及明确提供的官方地址与密钥；同时核对配置未漂移且与已探测候选完全一致。切换后失败时，脚本先停止新服务并校验、恢复数据库，临近切回旧代码时完整恢复原配置（包括旧供应商密钥）。
-配置已经是 `deepseek-flash` 和全量 `none` 的后续发布无需重复传入该选项。成功验证后可删除短期凭据文件，正式密钥仍保留在 `guardian.env`。
+## 它按什么顺序做
 
-只有网关已经由独立只读检查确认精确返回 `HTTP 429` 且错误码为 `model_cooldown`，并由操作者
-明确接受临时冷却时，才可在首次迁移命令末尾追加 `--allow-model-cooldown`。该例外仍会完整
-校验生产配置，只放行这一种错误；认证失败、普通限流、5xx、模型替换和响应契约错误仍会中止。
-正常发布不得使用该选项。
+1. 加锁，确保同一时间只有一个升级在进行；校验参数和 Schema 版本。
+2. 备份受保护的配置文件（root 所有、0600）。需要更换模型时，另建一份短期的候选配置副本，不动线上服务正在读取的配置。
+3. 在新的 release 目录里建独立虚拟环境并安装 wheel。
+4. 用候选版本探测模型：只发送固定的无害文字和 1×1 测试图片，同时检查配置是否完整。探测失败就到此为止，线上服务不受影响。
+5. 暂停备份定时器，停止服务，做两份 SQLite 一致性备份并校验。
+6. 需要更换模型时，在这一刻才原子地更新线上配置里唯一的那一行 `AI_MODEL`（以及凭据）。
+7. 原子切换 `current` 到新版本，启动服务并做健康检查。
+8. 写入本次升级的元数据（提交号、wheel 文件名、探测策略），恢复备份定时器，清理临时文件；保留当前版本和最近的两个旧版本。
 
-当前版本的 `--schema-version` 必须明确传入 `8`，脚本会在启动后核对数据库的
-`PRAGMA user_version=8`。wheel 模式必须显式提供
-完整 Git SHA；源码模式只接受无未提交或未跟踪文件的干净 Git worktree，默认读取 `HEAD`，
-也可通过 `--git-sha` 固定指定且必须与 `HEAD` 完全一致。
+## 失败时会怎样
 
-## 脚本执行顺序
+- 候选构建、探测或停服前的检查失败：线上服务一直在运行，什么都没变。
+- 停服之后、切换之前失败：恢复升级前的配置，重新启动原来的服务。
+- 切换之后健康检查失败：用停服时做的备份恢复数据库，清理对应的 WAL、SHM 和回滚日志，保持原属主和权限并再次做完整性检查，然后把 `current` 指回旧版本、恢复升级前的配置并启动旧服务。
+- 如果回滚的前置条件无法满足，脚本会停下并说明原因，不会带着不确定的状态继续。
 
-1. 获取 `/run/lock/nexa-guardian-release.lock`，拒绝并发发布。
-2. 将配置原子复制到
-   `/var/backups/nexa-guardian/manual/pre-release-<release-id>.env`，校验内容一致并固定为
-   `root:root 0600`；首次模型迁移另建短期 `0600` 候选配置副本供探针使用，不修改仍由
-   旧服务读取的生产配置。日志只显示备份路径和目标模型，不输出配置内容。
-3. 校验或构建 wheel，计算并复核 SHA256，创建服务组只读的独立虚拟环境。
-4. 使用候选版本对兼容网关执行固定无害请求，验证 Responses、严格结构化输出、图片输入、
-   `none` 无思考契约及服务端实际采用 `deepseek-flash`、`default`；同时验证机器人身份、
-   更新并发与媒体预览生产配置。除经批准的精确 `model_cooldown` 例外外，任一能力或响应
-   契约失败即停止，不切换生产。
-5. 写入 `release.json` 并完成候选 release 后，停止服务并确认它不再写库。
-   若数据库需要升级且仍有进行中的旧版抽奖，发布会停止并恢复原服务；同一 schema 的
-   文案或代码补丁会保留活动抽奖并在新进程中继续。
-6. 使用 SQLite 在线备份 API 创建最终一致的主数据库和 MTProto 会话备份：
-   `/var/backups/nexa-guardian/manual/pre-release-<release-id>.db` 与同名 `.session`。
-   两者均运行 `PRAGMA quick_check`、`PRAGMA foreign_key_check`，固定为
-   `root:root 0600` 并记录 SHA256；日志仅显示路径，不读取或输出会话内容。
-7. 首次模型迁移在旧服务已停稳且两份 SQLite 备份完成后，才原子更新生产配置中唯一的
-   `AI_MODEL=`、思考配置及明确提供的官方凭据；随后立即将 `current` 软链接原子切换到
-   `<UTC timestamp>-<short SHA>` release 并启动服务。
-8. 检查 systemd 启用/运行状态、主进程、退出状态、自动重启次数、数据库完整性和 schema 8；再运行一次每日备份并核验同时间戳的主数据库/会话数据库备份对、`0600` 权限及 SQLite 完整性。失败时执行下述数据库与代码回滚。
-9. 验证成功后，仅清理标准命名的旧代码 release，固定保留 `current` 和最近两个旧版本；
-   备份目录、非标准目录及 `current` 指向的 release 不会被清理。
+发布脚本的自动回滚只还原它自己改过的东西：`current` 链接、数据库和（使用 `--ai-model` 时的）配置。它不会改写其他环境变量。
 
-`release.json` 记录完整 Git SHA、UTC 构建时间、wheel SHA256、数据库 schema 版本、
-wheel 文件名和本次网关探针策略，可用于把 VM release 对应回 GitHub 版本与构建产物，
-并区分严格探针与显式允许临时 `model_cooldown` 的发布。
+## 升级之后
 
-v0.6.7 使用 DeepSeek-V4.1-Flash 官方模型 ID `deepseek-flash`，单次 `none` 审核，
-关闭思考、输出最多 512 token。规则使用 `system` 角色以保留指令隔离；支持文字与图片。
-跨供应商地址与密钥和代码一并原子切换及回退，历史模型统计和 schema 8 不变。
-
-v0.6.6 使用 `gpt-6-astra`，全部消息单次 `low` 审核，不再进行低到高的二次复核；
-简洁结构化输出与思考 token 合计上限为 512。历史模型统计继续保留，数据库 schema 为 8。
-发布同时原子迁移模型及三项思考配置，失败时完整恢复；发布根目录适配现有规范化 VM 路径。
-
-v0.6.5 将审核模型迁移为面向成本敏感高并发任务的 `gpt-5.6-luna`，保留普通文字 `low`、
-可疑和媒体 `high` 的自适应审核，以及历史 `gpt-5.5`、`gpt-5.6`、`gpt-5.6-sol` 统计。
-数据库 schema 保持为 8。
-
-v0.6.4 增加显式、单次的 `--allow-model-cooldown` 发布例外，只接受精确的
-`HTTP 429 model_cooldown`，用于操作者已经确认的临时网关冷却；默认发布路径仍要求
-`low/high`、结构化输出与图片探针全部成功。数据库 schema 保持为 8。
-
-v0.6.3 将审核模型固定切换为 `gpt-5.5`，并继续把历史 `gpt-5.6` 与
-`gpt-5.6-sol` 记录纳入累计和分时统计。数据库 schema 保持为 8。首次从 v0.6.2
-上线时应使用发布脚本的 `--ai-model gpt-5.5`，让配置备份、切换和失败恢复与代码发布处于
-同一事务；发布成功后不再需要重复传入该选项。
-
-v0.6.2 将单条消息自适应审核的端到端总预算从 8 秒调整为 12 秒；排队、重试以及
-`low` 升级 `high` 共用同一绝对截止时间，媒体下载仍使用独立的 2 秒上限。成功响应会立即
-返回，不会固定等待满 12 秒。数据库 schema 保持为 8。手工运行 v0.6.1 旧版发布探针或
-要求精确恢复旧发布契约前，必须先把受保护环境文件中的 `AI_TIMEOUT_SECONDS` 恢复为 `8`。
-除显式使用 `--ai-model` 的模型迁移外，发布脚本的自动回滚不改写其他环境变量；v0.6.1 运行时能够读取 12 秒，
-但若要求完整恢复旧发布契约，需使用上线前保留的 8 秒配置备份人工恢复后再运行旧版探针。
-
-## 失败回滚
-
-新版本切换后如果启动或健康检查失败，脚本会先停止新服务，并且只在上线前数据库备份已经
-完成校验、SHA256 与创建时一致、文件仍位于受保护的 `manual` 目录且原数据库属主和权限
-已经捕获时继续。备份会先
-复制到数据库同目录的临时文件，再次通过 `quick_check` 和 `foreign_key_check` 后原子替换
-生产数据库；随后清除与新数据库对应的 WAL、SHM 和 rollback journal，保留原属主与权限，
-并对恢复后的生产数据库再次执行完整性检查。临近切回旧 `current` 时才恢复上线前配置，
-最后启动旧服务。如果回滚前置条件无法满足，脚本保留与候选代码兼容的 `deepseek-flash` 和全量 `none` 及官方凭据配置，
-不会先写回旧模型而造成当前候选代码与磁盘配置错配。
-
-如果候选构建、网关探测或停服前检查失败，生产服务保持运行；停服后、切换前失败时，脚本
-会重新启动原服务。若有效备份不存在、服务无法确认停止、数据库恢复失败或旧 release 无法
-恢复，脚本不会盲目改写数据库或启动不兼容的代码，并会输出明确的 CRITICAL 错误供人工处理。
-只有无法安全恢复或启动旧版本时，服务才会保持停止状态等待人工处理。
-上线前的数据库、MTProto 会话和配置备份均会保留。自动回滚只替换本次发布可能迁移的
-主数据库；MTProto 会话备份作为人工灾难恢复副本保留，不会在普通代码回滚时覆盖仍有效的
-线上会话。
-
-## 上线后核验
-
-```bash
-systemctl is-active nexa-guardian.service
-systemctl is-enabled nexa-guardian.service
-systemctl show nexa-guardian.service \
-  --property=MainPID,ExecMainStatus,NRestarts
-readlink -f /opt/nexa-guardian/current
-cat /opt/nexa-guardian/current/release.json
-systemctl status nexa-guardian-backup.timer --no-pager
-```
-
-每日备份服务会使用同一时间戳分别生成 `guardian-*.db` 和
-`telegram-session-*.session`，两类 SQLite 备份均通过完整性校验、权限为 `0600`，并共同按
-30 天策略清理。Docker 部署固定使用持久卷内的 `/data/mtproto/admin.session`；systemd 部署
-固定使用 `/var/lib/nexa-guardian/mtproto/admin.session`。
-
-脚本只验证服务和 SQLite 的基础健康状态。Telegram 权限、管理员私聊、Nexa Guardian 官方
-群管理审核员身份、三个一方站点的精确域名行为、DeepSeek-V4.1-Flash/none/default 响应契约、
-群内与日志群 30 秒消息清理、授权管理员私聊永久保留、日志 outbox 重试及真实群组审核行为
-仍需按照发布验收清单逐项检查。
-
-启动时会按 `deploy/telegram-profile.md` 同步默认和 `zh` 的机器人名称、简短介绍、详细说明
-与命令菜单。上线后应通过 Telegram API 回读两套资料，确认成员筛选、群内 30 秒清理及唯一
-管理员私聊永久保留的说明均已生效；头像不由服务自动覆盖。
-
-当前版本的 `/del members` 使用已授权的 MTProto 用户会话分页读取目标群成员，并只扫描一次最近
-30 天群历史。已注销、精确离线超过 30 天、`LastMonth` 或入群满 30 天且无发言，任一命中即
-进入候选；`LastMonth` 受隐私设置影响，会在预览中单独标识；官方没有独立的 `LongAgo` 类型，
-`UserStatusEmpty` 不作为离线依据。历史未跨过 30 天边界时不使用“无发言”条件。上线验收只在唯一管理员私聊中运行 `/del members` 查看预览，
-不得发送确认命令。实际清理需要限制成员权限和 10 分钟确认码，且执行前再次排除管理员、机器人、
-可信用户、已离群成员和预览后新增活动者。若解除封禁失败，批次立即停止，并由 5 分钟临时封禁
-兜底。`/del all` 与成员扫描共用一个 MTProto 会话锁，不会并发打开 session 文件。
+脚本成功只说明服务启动且通过了健康检查。请再在群里验证：`/status`、管理员私聊权限、正常聊天不被打扰、可疑消息出现审核提示、广告被删除并警告。验证 `/del members` 时只看预览，不要发送确认码。

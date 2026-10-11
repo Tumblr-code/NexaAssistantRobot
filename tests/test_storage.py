@@ -244,7 +244,7 @@ def test_raffle_keyword_normalization_is_exact_and_rejects_unsafe_values() -> No
     assert normalize_raffle_keyword("  ＮＥＸＡ\u200b  ") == "nexa"
     assert normalize_raffle_keyword("参与") == "参与"
     with pytest.raises(ValueError, match="不能包含空格"):
-        normalize_raffle_keyword("Nexa 参与")
+        normalize_raffle_keyword("Demo 参与")
     with pytest.raises(ValueError, match="命令、账号或链接"):
         normalize_raffle_keyword("@Nexa")
 

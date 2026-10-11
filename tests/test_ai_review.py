@@ -2,23 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 
 import aiohttp
 import pytest
 
+from nexa_guardian import branding
 from nexa_guardian.ai_contract import (
     AI_MODEL,
     AI_REASONING_EFFORT,
     AI_SERVICE_TIER,
     AI_TIMEOUT_SECONDS,
-    NEXA_OFFICIAL_PROPERTIES,
 )
 from nexa_guardian.ai_review import (
     AI_DECISION_SCHEMA,
     AI_REVIEW_CATEGORIES,
     AI_RISK_SIGNALS,
-    REVIEW_INSTRUCTIONS,
     AIReviewConnectionError,
     AIReviewer,
     AIReviewHTTPError,
@@ -33,6 +32,22 @@ from nexa_guardian.ai_review import (
     suspicious_precheck,
     validate_signature,
 )
+
+EXAMPLE_SITES = branding.parse_official_sites(
+    "Example Store|https://store.example.com, Example Pass|https://pass.example.com"
+)
+EXAMPLE_BRANDING = branding.Branding(
+    name="Example Guardian", community="Example", official_sites=EXAMPLE_SITES
+)
+REVIEW_INSTRUCTIONS = branding.review_instructions(EXAMPLE_BRANDING)
+OFFICIAL_PROPERTIES = tuple((site.label, site.url, site.host) for site in EXAMPLE_SITES)
+
+
+@pytest.fixture(autouse=True)
+def example_branding() -> Iterator[None]:
+    branding.configure(EXAMPLE_BRANDING)
+    yield
+    branding.configure(branding.Branding())
 
 
 class FakeRequester:
@@ -111,6 +126,7 @@ def reviewer(requester: object | None = None, **overrides: object) -> AIReviewer
         "api_key": credentials,
         "model": AI_MODEL,
         "requester": requester,
+        "strict_response": True,
     }
     values.update(overrides)
     return AIReviewer(**values)  # type: ignore[arg-type]
@@ -252,11 +268,11 @@ async def test_per_review_reasoning_effort_rejects_unsupported_value_and_mismatc
     requester = FakeRequester(response(is_ad=False, reasoning_effort="high"))
     service = reviewer(requester)
 
-    with pytest.raises(ValueError, match="low or high"):
+    with pytest.raises(ValueError, match="supported value"):
         await service.review(
             text="ordinary message",
             safety_identifier="opaque",
-            reasoning_effort="medium",
+            reasoning_effort="ultra",
         )
     assert requester.calls == []
 
@@ -1035,7 +1051,7 @@ def test_suspicious_precheck_allows_whitelisted_links_and_subdomains() -> None:
         allowed_domains=allowed,
     )
     child = suspicious_precheck(
-        "客服 https://pass.example.com/help",
+        "客服 https://shop.example.org/help",
         allowed_domains=allowed,
     )
     hidden = suspicious_precheck(
@@ -1054,10 +1070,11 @@ def test_suspicious_precheck_allows_whitelisted_links_and_subdomains() -> None:
     assert "link" in lookalike.reasons
 
 
-def test_nexa_guardian_identity_and_official_properties_are_in_review_contract() -> None:
-    assert "Nexa Guardian" in REVIEW_INSTRUCTIONS
+def test_configured_identity_and_official_properties_are_in_review_contract() -> None:
+    assert "Example Guardian" in REVIEW_INSTRUCTIONS
+    assert "the Example community" in REVIEW_INSTRUCTIONS
     assert "group-management review engine" in REVIEW_INSTRUCTIONS
-    for name, url, _ in NEXA_OFFICIAL_PROPERTIES:
+    for name, url, _ in OFFICIAL_PROPERTIES:
         assert name in REVIEW_INSTRUCTIONS
         assert url in REVIEW_INSTRUCTIONS
 
@@ -1068,8 +1085,8 @@ def test_review_contract_requests_only_safe_text_derived_learning_signatures() -
     assert "never invent one" in REVIEW_INSTRUCTIONS
 
 
-@pytest.mark.parametrize(("name", "url", "host"), NEXA_OFFICIAL_PROPERTIES)
-def test_exact_nexa_official_domains_are_first_party_but_spoofed_suffixes_are_not(
+@pytest.mark.parametrize(("name", "url", "host"), OFFICIAL_PROPERTIES)
+def test_exact_official_domains_are_first_party_but_spoofed_suffixes_are_not(
     name: str, url: str, host: str
 ) -> None:
     official = suspicious_precheck(f"{name} 官方入口 {url}/help")
@@ -1256,3 +1273,139 @@ async def test_aiohttp_timeout_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> No
             payload={},
             timeout=8,
         )
+
+
+def test_default_identity_declares_no_first_party_sites() -> None:
+    instructions = branding.review_instructions(branding.Branding())
+
+    assert "You are Guardian" in instructions
+    assert "this Telegram community" in instructions
+    assert "no first-party websites" in instructions
+    assert "is_ad (boolean)" in instructions
+
+
+def test_unconfigured_deployment_treats_every_link_as_external() -> None:
+    branding.configure(branding.Branding())
+
+    assert "link" in suspicious_precheck("https://store.example.com/help").reasons
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    (
+        ("https://gateway.example", "https://gateway.example/v1/chat/completions"),
+        ("https://gateway.example/v1/", "https://gateway.example/v1/chat/completions"),
+        (
+            "https://gateway.example/api/chat/completions",
+            "https://gateway.example/api/chat/completions",
+        ),
+        ("https://api.deepseek.com", "https://api.deepseek.com/chat/completions"),
+    ),
+)
+def test_chat_completions_endpoint_is_derived_from_the_base_url(
+    base_url: str, expected: str
+) -> None:
+    service = reviewer(FakeRequester(), base_url=base_url, api_style="chat_completions")
+
+    assert service.endpoint == expected
+
+
+async def test_chat_completions_style_sends_messages_and_reads_the_first_choice() -> None:
+    decision = {"is_ad": True, "confidence": 0.97, "category": "promotion", "signatures": []}
+    requester = FakeRequester(
+        HTTPResponse(
+            200,
+            {
+                "model": "provider-renamed-model",
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": json.dumps(decision)}}
+                ],
+            },
+        )
+    )
+    service = reviewer(
+        requester,
+        model="any-vendor/model:1",
+        api_style="chat_completions",
+        reasoning_effort="",
+        service_tier="",
+        strict_response=False,
+    )
+
+    result = await service.review(
+        text="加我领取", image_data_url="data:image/png;base64,AAAA", safety_identifier="opaque"
+    )
+
+    payload = requester.calls[0]["payload"]
+    assert requester.calls[0]["url"] == "https://gateway.example/openai/v1/chat/completions"
+    assert payload["model"] == "any-vendor/model:1"
+    assert payload["messages"][0]["role"] == "system"
+    assert payload["messages"][0]["content"].startswith(REVIEW_INSTRUCTIONS)
+    assert payload["messages"][1]["content"][0] == {"type": "text", "text": "加我领取"}
+    assert payload["messages"][1]["content"][1]["type"] == "image_url"
+    assert payload["response_format"]["type"] == "json_schema"
+    assert payload["response_format"]["json_schema"]["schema"] == AI_DECISION_SCHEMA
+    assert "reasoning_effort" not in payload
+    assert "service_tier" not in payload
+    assert result.is_ad and result.confidence == 0.97
+    assert result.actual_service_tier == ""
+
+
+async def test_chat_completions_rejects_truncated_or_missing_choices() -> None:
+    truncated = FakeRequester(
+        HTTPResponse(200, {"choices": [{"finish_reason": "length", "message": {"content": "{"}}]})
+    )
+    empty = FakeRequester(HTTPResponse(200, {"choices": []}))
+
+    for requester in (truncated, empty):
+        with pytest.raises(AIReviewResponseError):
+            await reviewer(requester, api_style="chat_completions", strict_response=False).review(
+                text="message", safety_identifier="opaque"
+            )
+
+
+async def test_json_object_mode_and_omitted_optional_fields_in_responses_style() -> None:
+    requester = FakeRequester(response(is_ad=False))
+    service = reviewer(
+        requester,
+        structured_output="json_object",
+        reasoning_effort="",
+        service_tier="",
+        strict_response=False,
+    )
+
+    await service.review(text="正常聊天", safety_identifier="opaque")
+
+    payload = requester.calls[0]["payload"]
+    assert payload["text"]["format"] == {"type": "json_object"}
+    assert "reasoning" not in payload
+    assert "service_tier" not in payload
+
+
+async def test_lenient_contract_accepts_gateways_that_do_not_echo_the_request() -> None:
+    decision = {"is_ad": False, "confidence": 0.02, "category": "normal", "signatures": []}
+    body = {"model": "renamed-by-gateway", "output_text": json.dumps(decision)}
+
+    result = await reviewer(FakeRequester(HTTPResponse(200, body)), strict_response=False).review(
+        text="normal message", safety_identifier="opaque"
+    )
+
+    assert not result.is_ad
+    assert result.actual_service_tier == AI_SERVICE_TIER
+
+
+async def test_lenient_contract_still_rejects_an_unfinished_response() -> None:
+    body = contract_body(output_text="{}")
+    body["status"] = "incomplete"
+
+    with pytest.raises(AIReviewResponseError):
+        await reviewer(FakeRequester(HTTPResponse(200, body)), strict_response=False).review(
+            text="normal message", safety_identifier="opaque"
+        )
+
+
+def test_reviewer_rejects_unknown_api_style_and_output_mode() -> None:
+    with pytest.raises(ValueError, match="api_style"):
+        reviewer(FakeRequester(), api_style="completions")
+    with pytest.raises(ValueError, match="structured_output"):
+        reviewer(FakeRequester(), structured_output="xml")

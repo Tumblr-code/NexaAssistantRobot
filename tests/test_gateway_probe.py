@@ -109,12 +109,12 @@ async def test_gateway_probe_uses_fixed_model_structured_output_and_image(
 @pytest.mark.parametrize(
     ("overrides", "message"),
     (
-        ({"model": "gpt-5.6"}, "AI_MODEL"),
-        ({"reasoning_effort": "medium"}, "AI_REASONING_EFFORT"),
-        ({"service_tier": "priority"}, "AI_SERVICE_TIER"),
+        ({"model": " "}, "AI_MODEL"),
+        ({"reasoning_effort": "ultra"}, "AI_REASONING_EFFORT"),
+        ({"api_style": "completions"}, "api_style"),
     ),
 )
-async def test_gateway_probe_rejects_contract_substitution(
+async def test_gateway_probe_rejects_invalid_contract_values(
     overrides: dict[str, str], message: str
 ) -> None:
     values: dict[str, object] = {
@@ -327,33 +327,31 @@ def test_probe_cli_does_not_accept_credentials_from_ambient_environment(
 @pytest.mark.parametrize(
     ("setting", "value"),
     (
-        ("AI_MODEL", "gpt-5.6"),
-        ("AI_REASONING_EFFORT", "high"),
-        ("AI_NORMAL_REASONING_EFFORT", "high"),
-        ("AI_SUSPICIOUS_REASONING_EFFORT", "high"),
-        ("AI_SERVICE_TIER", "priority"),
+        ("AI_MODEL", ""),
+        ("OPENAI_BASE_URL", ""),
+        ("AI_REASONING_EFFORT", "ultra"),
         ("EXPECTED_BOT_ID", "0"),
         ("EXPECTED_BOT_USERNAME", ""),
-        ("UPDATE_CONCURRENCY_LIMIT", "31"),
+        ("UPDATE_CONCURRENCY_LIMIT", "many"),
         ("DRY_RUN", "true"),
         ("AI_FAILURE_DELETE", "false"),
-        ("WARN_LIMIT", "4"),
-        ("NOTICE_TTL_SECONDS", "29"),
-        ("AI_AD_THRESHOLD", "0.93"),
-        ("AI_LEARN_THRESHOLD", "0.98"),
-        ("AI_TIMEOUT_SECONDS", "8"),
-        ("AI_CONCURRENCY", "7"),
-        ("AI_CACHE_TTL_SECONDS", "601"),
-        ("AI_CACHE_MAX_ENTRIES", "999"),
-        ("AI_DECISION_RETENTION_DAYS", "31"),
-        ("AI_IMAGE_MAX_BYTES", "5242880"),
-        ("AI_IMAGE_TARGET_LONG_EDGE", "1024"),
-        ("AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "3"),
-        ("AI_MEDIA_CONCURRENCY", "3"),
-        ("AI_NORMAL_ACCEPT_CONFIDENCE", "0.91"),
+        ("WARN_LIMIT", "0"),
+        ("NOTICE_TTL_SECONDS", "soon"),
+        ("AI_AD_THRESHOLD", "high"),
+        ("AI_LEARN_THRESHOLD", ""),
+        ("AI_TIMEOUT_SECONDS", "-1"),
+        ("AI_CONCURRENCY", "0"),
+        ("AI_CACHE_TTL_SECONDS", ""),
+        ("AI_CACHE_MAX_ENTRIES", "x"),
+        ("AI_DECISION_RETENTION_DAYS", "0"),
+        ("AI_IMAGE_MAX_BYTES", "big"),
+        ("AI_IMAGE_TARGET_LONG_EDGE", ""),
+        ("AI_IMAGE_DOWNLOAD_TIMEOUT_SECONDS", "0"),
+        ("AI_MEDIA_CONCURRENCY", "-2"),
+        ("AI_NORMAL_ACCEPT_CONFIDENCE", "sure"),
     ),
 )
-def test_probe_cli_rejects_non_release_policy(
+def test_probe_cli_rejects_missing_or_malformed_production_settings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     setting: str,

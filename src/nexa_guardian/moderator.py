@@ -19,6 +19,7 @@ from aiogram.filters import Command
 from aiogram.types import ChatMemberUpdated, Message, PhotoSize, User
 from aiohttp import ClientError as AiohttpClientError
 
+from nexa_guardian import branding
 from nexa_guardian.admin import AdminRights, AdminService
 from nexa_guardian.ai_review import (
     AIReviewer,
@@ -61,29 +62,6 @@ RAFFLE_CARD_DEBOUNCE_SECONDS = 2
 MODERATION_POLICY_CACHE_SECONDS = 5
 TRUST_CACHE_SECONDS = 60
 TRUST_CACHE_MAX = 4096
-BOT_PROFILE_NAME = "Nexa 群管助手"
-BOT_PROFILE_SHORT_DESCRIPTION = (
-    "Nexa 官方群管理审核员：DeepSeek-V4.1-Flash 智能识别广告与刷屏，自动删除并警告；"
-    "第 3 次直接封禁，并支持安全透明的群抽奖。"
-)
-BOT_PROFILE_DESCRIPTION = """Nexa Guardian 是 @ExampleGroup 的官方群管理与安全审核员。
-
-• DeepSeek-V4.1-Flash 审核文字、图片及视频封面
-• 自动清理广告、诈骗、恶意推广与刷屏；第 3 次警告直接封禁
-• 普通聊天静默处理；仅可疑消息显示审核状态
-• 持续学习高置信广告特征，提升后续拦截效率
-• 极简管理入口：状态、删除、封禁与群抽奖
-• 私聊支持状态汇总、群历史清理及长期不活跃成员安全预览
-• 抽奖支持关键词报名、自动置顶、定时开奖、取消及重抽
-• 群内机器人回复约 30 秒后清理；管理员私聊回复永久保留
-• 不保存群消息原文、图片或模型推理
-
-发送 /help 查看管理命令。
-
-官方服务：
-Example Store 商城：https://example.org
-Example · Pass：https://pass.example.com
-Example · Gift：https://gift.example.com"""
 AI_LEARNING_EVIDENCE = (
     "link",
     "mention",
@@ -197,6 +175,7 @@ class ModerationController:
             duplicate_window_seconds=settings.duplicate_window_seconds,
             duplicate_max_messages=settings.duplicate_max_messages,
         )
+        branding.configure(settings.branding)
         self.ai_reviewer = ai_reviewer
         if self.ai_reviewer is None and settings.ai_enabled:
             self.ai_reviewer = AIReviewer(
@@ -205,6 +184,9 @@ class ModerationController:
                 model=settings.ai_model,
                 reasoning_effort=settings.ai_reasoning_effort,
                 service_tier=settings.ai_service_tier,
+                api_style=settings.ai_api_style,
+                structured_output=settings.ai_structured_output,
+                strict_response=settings.ai_strict_response,
                 timeout=settings.ai_timeout_seconds,
                 concurrency=settings.ai_concurrency,
                 cache_ttl=settings.ai_cache_ttl_seconds,
@@ -358,36 +340,41 @@ class ModerationController:
                     commands, language_code=code
                 ),
             )
+            if not self.settings.sync_bot_profile:
+                continue
+            profile_name = branding.bot_profile_name()
+            short_description = branding.bot_profile_short_description()
+            description = branding.bot_profile_description()
             await self._sync_bot_value(
                 label="name",
                 language_code=language_code,
-                expected=BOT_PROFILE_NAME,
+                expected=profile_name,
                 read=lambda code=language_code: self.bot.get_my_name(language_code=code),
                 current_value=lambda item: item.name,
-                write=lambda code=language_code: self.bot.set_my_name(
-                    BOT_PROFILE_NAME, language_code=code
+                write=lambda code=language_code, value=profile_name: self.bot.set_my_name(
+                    value, language_code=code
                 ),
             )
             await self._sync_bot_value(
                 label="short_description",
                 language_code=language_code,
-                expected=BOT_PROFILE_SHORT_DESCRIPTION,
+                expected=short_description,
                 read=lambda code=language_code: self.bot.get_my_short_description(
                     language_code=code
                 ),
                 current_value=lambda item: item.short_description,
-                write=lambda code=language_code: self.bot.set_my_short_description(
-                    BOT_PROFILE_SHORT_DESCRIPTION, language_code=code
+                write=lambda code=language_code, value=short_description: (
+                    self.bot.set_my_short_description(value, language_code=code)
                 ),
             )
             await self._sync_bot_value(
                 label="description",
                 language_code=language_code,
-                expected=BOT_PROFILE_DESCRIPTION,
+                expected=description,
                 read=lambda code=language_code: self.bot.get_my_description(language_code=code),
                 current_value=lambda item: item.description,
-                write=lambda code=language_code: self.bot.set_my_description(
-                    BOT_PROFILE_DESCRIPTION, language_code=code
+                write=lambda code=language_code, value=description: self.bot.set_my_description(
+                    value, language_code=code
                 ),
             )
 

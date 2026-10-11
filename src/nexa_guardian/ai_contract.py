@@ -1,19 +1,22 @@
+"""Defaults and allowed values for the AI review gateway.
+
+Nothing here pins a provider: the base URL, model, API style and the optional request
+fields are all taken from the environment. The constants are the reference defaults.
+"""
+
 AI_MODEL = "deepseek-flash"
 AI_BASE_URL = "https://api.deepseek.com"
 AI_REASONING_EFFORT = "none"
-AI_REASONING_EFFORTS = frozenset({"none", "low", "high"})
+# An empty value omits the field for providers that reject it.
+AI_REASONING_EFFORTS = frozenset({"", "none", "minimal", "low", "medium", "high"})
 AI_MAX_OUTPUT_TOKENS = 512
 AI_SERVICE_TIER = "default"
 AI_TIMEOUT_SECONDS = 12.0
 
-# Preserve historical model rows in cumulative AI statistics after model migrations.
-AI_GATEWAY_MODELS = frozenset(
-    {"gpt-5.5", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-6-astra", AI_MODEL}
-)
+AI_API_STYLE = "responses"
+AI_API_STYLES = frozenset({"responses", "chat_completions"})
+AI_STRUCTURED_OUTPUT = "json_schema"
+AI_STRUCTURED_OUTPUTS = frozenset({"json_schema", "json_object"})
 
-NEXA_OFFICIAL_PROPERTIES = (
-    ("Example Store", "https://example.org", "example.org"),
-    ("Example Pass", "https://pass.example.com", "pass.example.com"),
-    ("Example Gift", "https://gift.example.com", "gift.example.com"),
-)
-NEXA_OFFICIAL_DOMAINS = frozenset(host for _, _, host in NEXA_OFFICIAL_PROPERTIES)
+# Decisions made without calling the gateway; every other model name is a gateway call.
+LOCAL_REVIEW_MODELS = frozenset({"local-signature", "local-media"})
