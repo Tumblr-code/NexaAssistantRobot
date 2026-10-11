@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Nexa Guardian SQLite state backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Asia/Shanghai
+Persistent=true
+Unit=nexa-guardian-backup.service
+
+[Install]
+WantedBy=timers.target

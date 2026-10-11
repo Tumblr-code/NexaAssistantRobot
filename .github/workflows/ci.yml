@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.12"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.3"
+          enable-cache: true
+
+      - name: Verify lock file
+        run: uv lock --check
+
+      - name: Install locked project and quality tools
+        run: uv sync --frozen --extra dev
+
+      - name: Lint
+        run: uv run --no-sync ruff check .
+
+      - name: Check formatting
+        run: uv run --no-sync ruff format --check .
+
+      - name: Type check production source
+        run: uv run --no-sync pyright src
+
+      - name: Test with coverage
+        run: >-
+          uv run --no-sync pytest
+          --cov=src/nexa_guardian
+          --cov-report=term-missing
+          --cov-fail-under=75
+
+      - name: Build wheel and source distribution
+        run: |
+          uv build
+          uv export --frozen --no-dev --no-emit-project --no-hashes --format requirements.txt --output-file dist/requirements-runtime.txt
+
+      - name: Package source and deployment templates
+        run: python scripts/build_release.py
+
+      - name: Verify checksums and isolated wheel installation
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          uv venv "${RUNNER_TEMP}/wheel-smoke"
+          uv pip install --python "${RUNNER_TEMP}/wheel-smoke/bin/python" --constraint dist/requirements-runtime.txt dist/*.whl
+          "${RUNNER_TEMP}/wheel-smoke/bin/python" -I -c 'from importlib.metadata import version; import nexa_guardian; assert version("nexa-guardian") == nexa_guardian.__version__ == "0.8.0"'
+
+
+      - name: Audit installed dependencies
+        run: |
+          uv export --quiet \
+            --frozen \
+            --no-dev \
+            --no-emit-project \
+            --format requirements.txt \
+            --output-file "${RUNNER_TEMP}/requirements-audit.txt"
+          uv run --no-sync pip-audit \
+            --disable-pip \
+            --requirement "${RUNNER_TEMP}/requirements-audit.txt"
+
+      - name: Upload verified release assets
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexa-guardian-release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
