@@ -47,7 +47,6 @@ from nexa_guardian.member_cleanup_service import (
     MemberActivityMiddleware,
     MemberCleanupService,
 )
-from nexa_guardian.raffle_service import RaffleService
 from nexa_guardian.reporting import ActionReporter
 from nexa_guardian.status_service import StatusService
 from nexa_guardian.storage import Storage
@@ -57,8 +56,6 @@ GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 AUTO_BAN_MEMORY_SECONDS = 60 * 60
 AUTO_BAN_MEMORY_MAX = 10_000
 AI_CANDIDATE_PROMOTION_HITS = 3
-RAFFLE_WORKER_INTERVAL_SECONDS = 2
-RAFFLE_CARD_DEBOUNCE_SECONDS = 2
 MODERATION_POLICY_CACHE_SECONDS = 5
 TRUST_CACHE_SECONDS = 60
 TRUST_CACHE_MAX = 4096
@@ -203,14 +200,6 @@ class ModerationController:
         self._policy_locks: dict[int, asyncio.Lock] = {}
         self._policy_versions: dict[int, int] = {}
         self._trusted_cache: OrderedDict[tuple[int, int], tuple[float, bool]] = OrderedDict()
-        self.raffle_service = RaffleService(
-            bot,
-            settings,
-            storage,
-            self.admins,
-            worker_interval_seconds=RAFFLE_WORKER_INTERVAL_SECONDS,
-            card_debounce_seconds=RAFFLE_CARD_DEBOUNCE_SECONDS,
-        )
         telegram_admin_session = TelegramAdminSession(
             api_id=settings.telegram_api_id,
             api_hash=settings.telegram_api_hash,
@@ -245,7 +234,6 @@ class ModerationController:
             self.reporter,
             finish_processing=self._finish_processing,
             member_lock=self._member_action_lock,
-            active_raffle_participants=self.raffle_service.active_participant_ids,
         )
         self.member_activity_tracker = self.member_cleanup.activity
         self._register_handlers()
@@ -263,14 +251,6 @@ class ModerationController:
             self._ignore_unauthorized_private,
             self._unauthorized_private_message,
         )
-        self.router.message.register(
-            self.raffle_service.delete_pin_service_message,
-            self.raffle_service.pin_service_filter,
-        )
-        self.router.message.register(
-            self.raffle_service.join,
-            self.raffle_service.keyword_filter,
-        )
         # Member-authored command-looking messages are still untrusted content.
         # Register this guard before Telegram command handlers so only verified
         # admins (and other moderation exemptions) can reach the command path.
@@ -283,7 +263,6 @@ class ModerationController:
             "status": self.status,
             "ban": self.ban,
             "del": self.delete_replied,
-            "lottery": self.lottery,
         }
         for spec in COMMAND_SPECS:
             self.router.message.register(command_handlers[spec.name], Command(spec.name))
@@ -410,10 +389,8 @@ class ModerationController:
 
     async def startup(self) -> None:
         await self.reporter.start()
-        await self.raffle_service.startup()
 
     async def shutdown(self) -> None:
-        await self.raffle_service.shutdown()
         await self.reporter.shutdown()
         close_reviewer = getattr(self.ai_reviewer, "close", None)
         if close_reviewer is not None:
@@ -705,16 +682,6 @@ class ModerationController:
             "<code>/status ai del 特征ID</code>"
         )
 
-    async def lottery(self, message: Message) -> None:
-        actor = await self._group_admin(message)
-        if actor is None:
-            return
-        await self.raffle_service.command(
-            message,
-            actor_id=actor[0],
-            chat_id=actor[2],
-        )
-
     async def ban(self, message: Message) -> None:
         actor = await self._group_admin(message, restrict=True)
         if actor is None or (target := await self._safe_target(message, actor[2])) is None:
@@ -747,30 +714,23 @@ class ModerationController:
             return
         chat_id = actor[2]
         if arguments and arguments[0].casefold() == "all":
-            async with self.raffle_service.chat_lock(chat_id):
-                active = await self.raffle_service.ensure_active(chat_id)
-                if active is not None:
-                    await message.answer(
-                        "当前有进行中的抽奖，请先执行 <code>/lottery cancel</code>。"
-                    )
-                    return
-                await message.answer("正在清理群历史，期间群聊保持开放。")
-                try:
-                    result = await asyncio.wait_for(
-                        self.history_purger.purge(chat_id),
-                        timeout=15 * 60,
-                    )
-                except asyncio.TimeoutError:
-                    await message.answer("群历史清理超过 15 分钟，任务已停止。")
-                    return
-                except HistoryPurgeError as exc:
-                    await message.answer(html.escape(str(exc)))
-                    return
-                await self.reporter.record(
-                    chat_id=chat_id,
-                    action="history_purge",
-                    actor_id=actor[0],
+            await message.answer("正在清理群历史，期间群聊保持开放。")
+            try:
+                result = await asyncio.wait_for(
+                    self.history_purger.purge(chat_id),
+                    timeout=15 * 60,
                 )
+            except asyncio.TimeoutError:
+                await message.answer("群历史清理超过 15 分钟，任务已停止。")
+                return
+            except HistoryPurgeError as exc:
+                await message.answer(html.escape(str(exc)))
+                return
+            await self.reporter.record(
+                chat_id=chat_id,
+                action="history_purge",
+                actor_id=actor[0],
+            )
             await message.answer(
                 f"群历史清理完成：删除 {result.deleted}，"
                 f"跳过 {result.skipped}，失败 {result.failed}。"

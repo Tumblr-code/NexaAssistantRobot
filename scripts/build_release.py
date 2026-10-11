@@ -52,7 +52,7 @@ def main() -> None:
                 "project": "nexa-guardian",
                 "version": version,
                 "source_commit": commit,
-                "database_schema": 8,
+                "database_schema": 9,
                 "deployment_performed": False,
             },
             indent=2,

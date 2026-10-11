@@ -116,7 +116,7 @@ def bot_profile_short_description(branding: Branding | None = None) -> str:
     brand = current() if branding is None else branding
     return (
         f"{brand.name} 群管理审核员：{brand.reviewer_label} 智能识别广告与刷屏，自动删除并警告；"
-        f"第 {brand.warn_limit} 次直接封禁，并支持安全透明的群抽奖。"
+        f"第 {brand.warn_limit} 次直接封禁。"
     )
 
 
@@ -130,9 +130,8 @@ def bot_profile_description(branding: Branding | None = None) -> str:
         f"• 自动清理广告、诈骗、恶意推广与刷屏；第 {brand.warn_limit} 次警告直接封禁",
         "• 普通聊天静默处理；仅可疑消息显示审核状态",
         "• 持续学习高置信广告特征，提升后续拦截效率",
-        "• 极简管理入口：状态、删除、封禁与群抽奖",
+        "• 极简管理入口：状态、删除与封禁",
         "• 私聊支持状态汇总、群历史清理及长期不活跃成员安全预览",
-        "• 抽奖支持关键词报名、自动置顶、定时开奖、取消及重抽",
         "• 群内机器人回复约 30 秒后清理；管理员私聊回复永久保留",
         "• 不保存群消息原文、图片或模型推理",
         "",

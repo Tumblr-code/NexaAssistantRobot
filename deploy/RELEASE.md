@@ -15,10 +15,10 @@
 
 ```bash
 sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-X.Y.Z-py3-none-any.whl \
-  --git-sha <完整提交号> --schema-version 8
+  --git-sha <完整提交号> --schema-version 9
 
 sudo deploy/release.sh --source /absolute/path/to/repository \
-  [--git-sha <完整提交号>] --schema-version 8
+  [--git-sha <完整提交号>] --schema-version 9
 ```
 
 可选参数：

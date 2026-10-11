@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import html
 import logging
 import secrets
@@ -46,7 +45,6 @@ GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 
 FinishProcessing = Callable[[Message, Message | None, str], Awaitable[None]]
 MemberLock = Callable[[int, int], asyncio.Lock]
-ActiveRaffleParticipants = Callable[[int], Awaitable[frozenset[int]]]
 
 
 class MemberActivityMiddleware(BaseMiddleware):
@@ -124,7 +122,6 @@ class MemberCleanupService:
         *,
         finish_processing: FinishProcessing,
         member_lock: MemberLock,
-        active_raffle_participants: ActiveRaffleParticipants | None = None,
     ) -> None:
         self.bot = bot
         self.settings = settings
@@ -133,9 +130,6 @@ class MemberCleanupService:
         self.reporter = reporter
         self.finish_processing = finish_processing
         self.member_lock = member_lock
-        self.active_raffle_participants = (
-            active_raffle_participants or self._load_active_raffle_participants
-        )
         self.activity = MemberActivityTracker(default_ttl_seconds=CONFIRM_TTL_SECONDS)
         self._plans: dict[int, PendingMemberCleanup] = {}
 
@@ -206,17 +200,9 @@ class MemberCleanupService:
             )
             return
 
-        trusted_task = asyncio.create_task(self.storage.trusted_user_ids(chat_id))
-        raffle_task = asyncio.ensure_future(self.active_raffle_participants(chat_id))
         try:
-            trusted_ids = await trusted_task
-            protected_raffle_ids = await raffle_task
+            trusted_ids = await self.storage.trusted_user_ids(chat_id)
         except Exception:
-            for task in (trusted_task, raffle_task):
-                if not task.done():
-                    task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
             self.activity.finish(activity_session)
             logger.exception("成员清理保护名单读取失败 chat_id=%s", chat_id)
             await self.finish_processing(
@@ -229,9 +215,7 @@ class MemberCleanupService:
         eligible = [
             candidate
             for candidate in result.candidates
-            if candidate.user_id not in trusted_ids
-            and candidate.user_id not in protected_raffle_ids
-            and candidate.user_id not in active_during_scan
+            if candidate.user_id not in trusted_ids and candidate.user_id not in active_during_scan
         ]
         if not eligible:
             self.activity.finish(activity_session)
@@ -347,17 +331,9 @@ class MemberCleanupService:
             )
             return
 
-        trusted_task = asyncio.create_task(self.storage.trusted_user_ids(plan.chat_id))
-        raffle_task = asyncio.ensure_future(self.active_raffle_participants(plan.chat_id))
         try:
-            trusted_ids = await trusted_task
-            protected_raffle_ids = await raffle_task
+            trusted_ids = await self.storage.trusted_user_ids(plan.chat_id)
         except Exception:
-            for task in (trusted_task, raffle_task):
-                if not task.done():
-                    task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
             logger.exception("成员清理复核保护名单读取失败 chat_id=%s", plan.chat_id)
             await self.finish_processing(
                 message,
@@ -413,7 +389,6 @@ class MemberCleanupService:
                     or state.bot
                     or user_id in self.settings.authorized_admin_ids
                     or user_id in trusted_ids
-                    or user_id in protected_raffle_ids
                     or member.status in admin_statuses | absent_statuses
                     or getattr(getattr(member, "user", None), "is_bot", False)
                     or not self.candidate_still_matches(
@@ -509,12 +484,6 @@ class MemberCleanupService:
             )
             + "本次候选依据为 Telegram 账号状态或最近 30 天群内发言。",
         )
-
-    async def _load_active_raffle_participants(self, chat_id: int) -> frozenset[int]:
-        raffle = await self.storage.active_raffle(chat_id)
-        if raffle is None:
-            return frozenset()
-        return frozenset(await self.storage.raffle_entry_ids(raffle.id))
 
     @staticmethod
     def reason_text(candidate: MemberCandidate) -> str:

@@ -1,6 +1,6 @@
 import asyncio
 import inspect
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -8,14 +8,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aiogram.enums import ChatMemberStatus, ChatType
-from aiogram.types import Chat, Message, User
 
 from nexa_guardian import moderator as moderator_module
 from nexa_guardian.admin import AdminRights
 from nexa_guardian.config import Settings
 from nexa_guardian.history_purge import HistoryPurgeResult
-from nexa_guardian.member_activity import MemberActivityTracker
-from nexa_guardian.moderator import MemberActivityMiddleware, ModerationController
+from nexa_guardian.moderator import ModerationController
 from nexa_guardian.storage import Storage
 
 UTC = timezone.utc
@@ -201,33 +199,6 @@ async def test_status_ai_pause_and_resume_are_serialized(
     )
 
 
-async def test_del_all_rejects_active_raffle_without_calling_purger(
-    tmp_path: Path,
-    storage: Storage,
-) -> None:
-    instance, _ = controller(tmp_path, storage)
-    raffle = await storage.create_raffle(
-        chat_id=GROUP_ID,
-        creator_id=ADMIN_ID,
-        keyword="参与",
-        prize="测试奖品",
-        winner_count=1,
-        ends_at=(datetime.now(UTC) + timedelta(days=1)).isoformat(),
-    )
-    assert await storage.set_raffle_message(raffle.id, 500)
-    assert await storage.activate_raffle(raffle.id)
-    instance.history_purger.purge = AsyncMock()
-    message = command("/del all")
-
-    await instance.delete_replied(message)  # type: ignore[arg-type]
-
-    assert response_texts(message) == (
-        "当前有进行中的抽奖，请先执行 <code>/lottery cancel</code>。",
-    )
-    instance.history_purger.purge.assert_not_called()
-    assert await moderation_rows(storage) == ()
-
-
 async def test_del_all_success_records_one_history_purge_without_delete(
     tmp_path: Path,
     storage: Storage,
@@ -282,37 +253,3 @@ async def test_del_all_stops_at_fifteen_minute_timeout_without_action(
     )
     assert await moderation_rows(storage) == ()
     assert all("原因" not in text for text in response_texts(message))
-
-
-async def test_member_activity_middleware_notes_before_raffle_keyword_delete() -> None:
-    now = datetime.now(UTC)
-    tracker = MemberActivityTracker()
-    activity = tracker.begin(
-        actor_id=ADMIN_ID,
-        chat_id=GROUP_ID,
-        cutoff=now - timedelta(days=30),
-        created_at=now - timedelta(seconds=1),
-    )
-    middleware = MemberActivityMiddleware(
-        tracker,
-        allowed_chat_ids=frozenset({GROUP_ID}),
-    )
-    delete_message = AsyncMock()
-    event = Message(
-        message_id=501,
-        date=now,
-        chat=Chat(id=GROUP_ID, type=ChatType.SUPERGROUP, title="Example"),
-        from_user=User(id=MEMBER_ID, is_bot=False, first_name="Member"),
-        text="参与",
-    )
-
-    async def raffle_keyword_handler(message: Message, _data: dict[str, Any]) -> str:
-        assert tracker.active_ids(activity) == frozenset({MEMBER_ID})
-        await delete_message(message.chat.id, message.message_id)
-        return "joined"
-
-    result = await middleware(raffle_keyword_handler, event, {})
-
-    assert result == "joined"
-    delete_message.assert_awaited_once_with(GROUP_ID, 501)
-    assert tracker.active_ids(activity) == frozenset({MEMBER_ID})

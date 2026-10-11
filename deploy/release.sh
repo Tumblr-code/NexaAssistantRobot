@@ -18,7 +18,7 @@ readonly BACKUP_ROOT="/var/backups/nexa-guardian"
 readonly MANUAL_BACKUP_ROOT="${BACKUP_ROOT}/manual"
 readonly LOCK_PATH="/run/lock/nexa-guardian-release.lock"
 readonly PYTHON_BIN="/usr/bin/python3"
-readonly CODE_SCHEMA_VERSION="8"
+readonly CODE_SCHEMA_VERSION="9"
 readonly AI_MODEL_PATTERN='^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
 
 artifact_mode=""
@@ -1007,35 +1007,6 @@ service_stopped=1
 systemctl stop "${SERVICE_NAME}" || die "failed to stop service before database backup"
 systemctl is-active --quiet "${SERVICE_NAME}" \
   && die "service is still active after stop"
-
-log "checking raffle migration safety"
-"${PYTHON_BIN}" - "${DATABASE_PATH}" "${schema_version}" <<'PY'
-import sqlite3
-import sys
-from pathlib import Path
-
-database_uri = f"{Path(sys.argv[1]).resolve().as_uri()}?mode=ro"
-target_schema = int(sys.argv[2])
-connection = sqlite3.connect(database_uri, uri=True, timeout=15)
-try:
-    table = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'raffles'"
-    ).fetchone()
-    if table is not None:
-        running = connection.execute(
-            "SELECT COUNT(*) FROM raffles WHERE status = 'running'"
-        ).fetchone()
-        current_schema = connection.execute("PRAGMA user_version").fetchone()
-        if (
-            running is not None
-            and int(running[0]) != 0
-            and current_schema is not None
-            and int(current_schema[0]) < target_schema
-        ):
-            raise RuntimeError("an old-schema raffle is still running; release aborted")
-finally:
-    connection.close()
-PY
 
 log "creating validated database backup at ${backup_path}"
 "${PYTHON_BIN}" - "${DATABASE_PATH}" "${backup_path}" <<'PY'

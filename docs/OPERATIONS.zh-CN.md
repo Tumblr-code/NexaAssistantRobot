@@ -2,7 +2,7 @@
 
 [English](OPERATIONS.en.md) | 简体中文 · [首页](../README.md)
 
-首次安装见[首次安装指南](BOOTSTRAP.zh-CN.md)。这里讲装好之后的事：配置、升级、回退、备份、恢复和排查。数据库结构版本为 **Schema 8**。
+首次安装见[首次安装指南](BOOTSTRAP.zh-CN.md)。这里讲装好之后的事：配置、升级、回退、备份、恢复和排查。数据库结构版本为 **Schema 9**。
 
 ## 文件位置
 
@@ -49,12 +49,14 @@
 
 ```sh
 sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-X.Y.Z-py3-none-any.whl \
-  --git-sha <完整提交号> --schema-version 8
+  --git-sha <完整提交号> --schema-version 9
 ```
 
 它会备份配置、在独立目录里安装候选版本并探测模型，全部通过后才短暂停止服务，做最终的数据库备份并原子切换 `current`，再做健康检查；任何一步失败都会停下并恢复。不要手工修改 `current`。参数和细节见 [deploy/RELEASE.md](../deploy/RELEASE.md)。
 
 升级时顺便换模型，加 `--ai-model <模型 ID>`；连服务商一起换，再加 `--ai-credentials-file`，指向一个只含 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY` 两行的 0600 文件。
+
+**从 0.7.x 升级到 0.8.0：** 这一版把数据库升到 Schema 9。首次启动时会删除旧版本留下的三张数据表及相关标记，其中的数据不再保留，而且无法降回 Schema 8。升级前请确认已有备份；需要回到旧版本时，只能用升级前的数据库备份恢复。
 
 Docker 方式升级：`git pull` 后执行 `docker compose up -d --build`，不要删除数据卷。
 

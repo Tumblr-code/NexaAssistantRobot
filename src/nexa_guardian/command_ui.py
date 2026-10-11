@@ -44,14 +44,6 @@ COMMAND_SPECS = (
         "回复消息或填写用户 ID 封禁",
         ("<code>/ban</code>　回复成员消息后封禁",),
     ),
-    CommandSpec(
-        "lottery",
-        "创建或管理关键词抽奖",
-        (
-            "<code>/lottery 30m 1 参与 奖品</code>　创建关键词抽奖",
-            "<code>/lottery end|cancel|reroll</code>　管理抽奖",
-        ),
-    ),
 )
 
 TOP_LEVEL_COMMANDS = tuple(spec.name for spec in COMMAND_SPECS)

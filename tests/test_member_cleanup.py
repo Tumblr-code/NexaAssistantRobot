@@ -203,23 +203,6 @@ async def add_trusted(storage: Storage, user_id: int) -> None:
     await storage.db.commit()
 
 
-async def create_active_raffle(storage: Storage, *entry_ids: int) -> int:
-    raffle = await storage.create_raffle(
-        chat_id=GROUP_ID,
-        creator_id=ADMIN_ID,
-        keyword="参与",
-        prize="测试奖品",
-        winner_count=1,
-        ends_at=(datetime.now(UTC) + timedelta(days=1)).isoformat(),
-    )
-    assert await storage.set_raffle_message(raffle.id, 500)
-    assert await storage.activate_raffle(raffle.id)
-    for user_id in entry_ids:
-        joined, _count = await storage.join_raffle(raffle.id, user_id)
-        assert joined
-    return raffle.id
-
-
 async def test_del_members_is_private_only_and_requires_restrict_right(
     tmp_path: Path,
     storage: Storage,
@@ -311,51 +294,6 @@ async def test_del_members_limits_plan_and_rejects_expired_confirmation(
     await controller.delete_replied(expired)  # type: ignore[arg-type]
     assert "无效或已过期" in response_text(expired)
     assert bot.banned == []
-
-
-async def test_del_members_confirmation_rechecks_and_kicks_only_safe_targets(
-    tmp_path: Path,
-    storage: Storage,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    bot = MemberCleanupBot()
-    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
-    scanner = FakeScanner(
-        tuple(candidate(user_id, REASON_DELETED) for user_id in (101, 102, 103, 104, 105, 106))
-    )
-    install_scanner(controller, scanner)
-    await add_trusted(storage, 105)
-    raffle_id = await create_active_raffle(storage, 104)
-    trusted_lookup = AsyncMock(wraps=storage.trusted_user_ids)
-    monkeypatch.setattr(storage, "trusted_user_ids", trusted_lookup)
-    preview = command("/del members")
-    await controller.delete_replied(preview)  # type: ignore[arg-type]
-    preview_text = response_text(preview)
-    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview_text)
-    assert code is not None
-    assert "<code>104</code>" not in preview_text
-    assert "<code>105</code>" not in preview_text
-    plan = next(iter(controller.member_cleanup._plans.values()))
-    assert {item.user_id for item in plan.members} == {101, 102, 103, 106}
-
-    scanner.current[103] = MemberState(103, True, False, True, None, None, None)
-    await add_trusted(storage, 102)
-    assert await storage.join_raffle(raffle_id, 101) == (True, 2)
-    confirm = command(f"/del members {code.group(1)} confirm")
-
-    await controller.delete_replied(confirm)  # type: ignore[arg-type]
-
-    assert bot.banned == [(GROUP_ID, 106, False)]
-    assert bot.unbanned == [(GROUP_ID, 106, True)]
-    assert "已移出 1" in response_text(confirm)
-    assert "跳过 3" in response_text(confirm)
-    assert trusted_lookup.await_count == 2
-    rows = await storage.db.execute_fetchall(
-        "SELECT action, actor_id, target_id, reason FROM moderation_log "
-        "WHERE action = 'member_cleanup'"
-    )
-    assert [(row[0], row[1], row[2]) for row in rows] == [("member_cleanup", ADMIN_ID, 106)]
-    assert all(not row[3] for row in rows)
 
 
 async def test_del_members_skips_member_active_after_preview(
@@ -612,3 +550,47 @@ async def test_telegram_retry_after_is_bounded_and_retried_once(
     assert await telegram_call_with_bounded_retry(operation) == "ok"
     sleep.assert_awaited_once_with(1.1)
     assert operation.await_count == 2
+
+
+async def test_del_members_confirmation_rechecks_and_kicks_only_safe_targets(
+    tmp_path: Path,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = MemberCleanupBot()
+    controller = ModerationController(bot, settings(tmp_path), storage)  # type: ignore[arg-type]
+    scanner = FakeScanner(
+        tuple(candidate(user_id, REASON_DELETED) for user_id in (101, 102, 103, 104, 105, 106))
+    )
+    install_scanner(controller, scanner)
+    await add_trusted(storage, 105)
+    trusted_lookup = AsyncMock(wraps=storage.trusted_user_ids)
+    monkeypatch.setattr(storage, "trusted_user_ids", trusted_lookup)
+    preview = command("/del members")
+    await controller.delete_replied(preview)  # type: ignore[arg-type]
+    preview_text = response_text(preview)
+    code = re.search(r"/del members ([A-F0-9]{6}) confirm", preview_text)
+    assert code is not None
+    assert "<code>105</code>" not in preview_text
+    plan = next(iter(controller.member_cleanup._plans.values()))
+    assert {item.user_id for item in plan.members} == {101, 102, 103, 104, 106}
+
+    scanner.current[103] = MemberState(103, True, False, True, None, None, None)
+    await add_trusted(storage, 102)
+    confirm = command(f"/del members {code.group(1)} confirm")
+
+    await controller.delete_replied(confirm)  # type: ignore[arg-type]
+
+    assert sorted(bot.banned) == [(GROUP_ID, user_id, False) for user_id in (101, 104, 106)]
+    assert sorted(bot.unbanned) == [(GROUP_ID, user_id, True) for user_id in (101, 104, 106)]
+    assert "已移出 3" in response_text(confirm)
+    assert "跳过 2" in response_text(confirm)
+    assert trusted_lookup.await_count == 2
+    rows = await storage.db.execute_fetchall(
+        "SELECT action, actor_id, target_id, reason FROM moderation_log "
+        "WHERE action = 'member_cleanup'"
+    )
+    assert sorted((row[0], row[1], row[2]) for row in rows) == [
+        ("member_cleanup", ADMIN_ID, user_id) for user_id in (101, 104, 106)
+    ]
+    assert all(not row[3] for row in rows)

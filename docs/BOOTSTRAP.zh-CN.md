@@ -6,13 +6,13 @@
 
 ## 先准备，不启动机器人
 
-从仓库的 Releases 把 v0.7.0 的全部附件下载到 `/root/nexa-guardian-v0.7.0`。没有发行版时，在本地按[首页「开发」一节](../README.md#开发)执行 `uv build` 和 `python scripts/build_release.py`，把 `dist/` 里的文件传到该目录。以下命令的空机检查失败时立即停止，改用升级或恢复流程。保持同一个 root Bash 会话，以便 `artifact_dir` 和 `release_dir` 一直有效。这些命令需要访问软件源，但不会启动机器人。
+从仓库的 Releases 把 v0.8.0 的全部附件下载到 `/root/nexa-guardian-v0.8.0`。没有发行版时，在本地按[首页「开发」一节](../README.md#开发)执行 `uv build` 和 `python scripts/build_release.py`，把 `dist/` 里的文件传到该目录。以下命令的空机检查失败时立即停止，改用升级或恢复流程。保持同一个 root Bash 会话，以便 `artifact_dir` 和 `release_dir` 一直有效。这些命令需要访问软件源，但不会启动机器人。
 
 ```bash
 # Run as root, only on a fresh Ubuntu host.
 set -euo pipefail
 umask 0077
-artifact_dir=/root/nexa-guardian-v0.7.0
+artifact_dir=/root/nexa-guardian-v0.8.0
 cd "$artifact_dir"
 sha256sum -c SHA256SUMS
 test ! -e /opt/nexa-guardian && test ! -L /opt/nexa-guardian
@@ -38,14 +38,14 @@ release_dir="/opt/projects/nexa-guardian/runtime/releases/$release_id"
 install -d -o root -g nexa-guardian -m 0750 "$release_dir"
 python3 -m venv "$release_dir/.venv"
 "$release_dir/.venv/bin/python" -m pip install \
-  -c requirements-runtime.txt ./nexa_guardian-0.7.0-py3-none-any.whl
+  -c requirements-runtime.txt ./nexa_guardian-0.8.0-py3-none-any.whl
 "$release_dir/.venv/bin/python" -m pip check
 install -o root -g nexa-guardian -m 0640 release-metadata.json SHA256SUMS \
-  requirements-runtime.txt nexa_guardian-0.7.0-py3-none-any.whl "$release_dir/"
+  requirements-runtime.txt nexa_guardian-0.8.0-py3-none-any.whl "$release_dir/"
 chown -R root:nexa-guardian "$release_dir"
 chmod -R u=rwX,g=rX,o= "$release_dir"
-tar -xzf nexa-guardian-0.7.0-deployment.tar.gz
-install -o root -g root -m 0600 nexa-guardian-0.7.0/.env.example \
+tar -xzf nexa-guardian-0.8.0-deployment.tar.gz
+install -o root -g root -m 0600 nexa-guardian-0.8.0/.env.example \
   /etc/nexa-guardian/guardian.env
 nano /etc/nexa-guardian/guardian.env
 ```
@@ -90,16 +90,16 @@ chmod 0600 /var/lib/nexa-guardian/guardian.db \
 
 ## 明确激活并验收
 
-到这一步机器人会真正开始工作。网关探针会连接模型服务商，可能消耗额度。装好单元文件或启用定时器并不代表机器人可用：启动后要确认服务状态稳定、安装的版本和机器人身份正确、数据库为 Schema 8 且完整，并且数据库与会话的备份成功。查看日志时注意隐去敏感内容。
+到这一步机器人会真正开始工作。网关探针会连接模型服务商，可能消耗额度。装好单元文件或启用定时器并不代表机器人可用：启动后要确认服务状态稳定、安装的版本和机器人身份正确、数据库为 Schema 9 且完整，并且数据库与会话的备份成功。查看日志时注意隐去敏感内容。
 
 ```bash
 cd "$artifact_dir"
 ln -s "$release_dir" /opt/projects/nexa-guardian/runtime/current
 ln -s /opt/projects/nexa-guardian/runtime /opt/nexa-guardian
 install -o root -g root -m 0644 \
-  nexa-guardian-0.7.0/deploy/systemd/nexa-guardian.service \
-  nexa-guardian-0.7.0/deploy/systemd/nexa-guardian-backup.service \
-  nexa-guardian-0.7.0/deploy/systemd/nexa-guardian-backup.timer /etc/systemd/system/
+  nexa-guardian-0.8.0/deploy/systemd/nexa-guardian.service \
+  nexa-guardian-0.8.0/deploy/systemd/nexa-guardian-backup.service \
+  nexa-guardian-0.8.0/deploy/systemd/nexa-guardian-backup.timer /etc/systemd/system/
 "$release_dir/.venv/bin/nexa-guardian-probe" \
   --env-file /etc/nexa-guardian/guardian.env --require-production-settings
 systemctl daemon-reload

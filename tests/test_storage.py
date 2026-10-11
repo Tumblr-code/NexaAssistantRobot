@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from nexa_guardian.ai_contract import AI_MODEL
-from nexa_guardian.storage import SCHEMA_VERSION, Storage, normalize_raffle_keyword
+from nexa_guardian.storage import SCHEMA_VERSION, Storage
 
 
 @pytest.fixture
@@ -38,319 +38,6 @@ async def test_warning_stats_ignore_legacy_zero_count_rows(storage: Storage) -> 
     stats = await storage.warning_stats(-100)
 
     assert (stats.users, stats.total) == (0, 0)
-
-
-async def test_raffle_lifecycle_is_persistent_and_idempotent(storage: Storage) -> None:
-    raffle = await storage.create_raffle(
-        chat_id=-100,
-        creator_id=7,
-        keyword="参与",
-        prize="GiftPass 月卡",
-        winner_count=2,
-        ends_at="2099-01-01T00:00:00+00:00",
-    )
-    assert await storage.set_raffle_message(raffle.id, 88)
-    assert await storage.activate_raffle(raffle.id)
-    assert (await storage.active_raffle(-100)).message_id == 88  # type: ignore[union-attr]
-    assert await storage.replace_active_raffle_message(raffle.id, 88, 89)
-    assert not await storage.replace_active_raffle_message(raffle.id, 88, 90)
-    assert (await storage.active_raffle(-100)).message_id == 89  # type: ignore[union-attr]
-
-    assert await storage.join_raffle(raffle.id, 41) == (True, 1)
-    assert await storage.join_raffle(raffle.id, 41) == (False, 1)
-    assert await storage.join_raffle(raffle.id, 42) == (True, 2)
-    assert await storage.raffle_entry_ids(raffle.id) == (41, 42)
-
-    assert await storage.finish_raffle(raffle.id, (42, 41))
-    assert not await storage.finish_raffle(raffle.id, (41,))
-    assert not await storage.replace_active_raffle_message(raffle.id, 89, 90)
-    winners = await storage.raffle_winners(raffle.id)
-    assert [(item.position, item.user_id) for item in winners] == [(1, 42), (2, 41)]
-    assert await storage.active_raffle(-100) is None
-
-
-async def test_raffle_allows_only_one_running_per_chat_and_supports_reroll(
-    storage: Storage,
-) -> None:
-    raffle = await storage.create_raffle(
-        chat_id=-100,
-        creator_id=7,
-        keyword="Nexa",
-        prize="ModelPass",
-        winner_count=1,
-        ends_at="2099-01-01T00:00:00+00:00",
-    )
-    with pytest.raises(ValueError, match="已有进行中的抽奖"):
-        await storage.create_raffle(
-            chat_id=-100,
-            creator_id=7,
-            keyword="第二场",
-            prize="第二场",
-            winner_count=1,
-            ends_at="2099-01-01T00:00:00+00:00",
-        )
-    assert await storage.set_raffle_message(raffle.id, 88)
-    assert await storage.activate_raffle(raffle.id)
-    await storage.join_raffle(raffle.id, 41)
-    assert await storage.finish_raffle(raffle.id, (41,))
-    assert (
-        await storage.add_reroll(
-            raffle.id,
-            (41,),
-            result_delivery_stage="group_and_admin",
-        )
-        == 2
-    )
-    assert (await storage.raffle_winners(raffle.id))[0].round == 2
-    pending = await storage.pending_raffle_results(chat_ids={-100})
-    assert [(item.round_number, item.stage) for item in pending] == [(2, "group_and_admin")]
-
-
-async def test_pending_raffle_results_are_sorted_by_numeric_round(storage: Storage) -> None:
-    raffle = await storage.create_raffle(
-        chat_id=-100,
-        creator_id=7,
-        keyword="参与",
-        prize="GiftPass",
-        winner_count=1,
-        ends_at="2099-01-01T00:00:00+00:00",
-    )
-    assert await storage.set_raffle_message(raffle.id, 88)
-    assert await storage.activate_raffle(raffle.id)
-    assert await storage.finish_raffle(raffle.id, ())
-    await storage.set_runtime_setting(
-        -100,
-        f"raffle_result_pending:{raffle.id}:10",
-        "group_only",
-    )
-    await storage.set_runtime_setting(
-        -100,
-        f"raffle_result_pending:{raffle.id}:2",
-        "group_only",
-    )
-
-    pending = await storage.pending_raffle_results(chat_ids={-100})
-
-    assert [item.round_number for item in pending] == [2, 10]
-
-
-async def test_pending_raffle_result_anchor_state_uses_compare_and_swap(
-    storage: Storage,
-) -> None:
-    raffle = await storage.create_raffle(
-        chat_id=-100,
-        creator_id=7,
-        keyword="参与",
-        prize="GiftPass",
-        winner_count=1,
-        ends_at="2099-01-01T00:00:00+00:00",
-    )
-    assert await storage.set_raffle_message(raffle.id, 88)
-    assert await storage.activate_raffle(raffle.id)
-    assert await storage.finish_raffle(
-        raffle.id,
-        (41,),
-        result_delivery_stage="group_and_admin",
-        result_group_message_id=99,
-        result_admin_message_id=100,
-    )
-    pending = (await storage.pending_raffle_results(chat_ids={-100}))[0]
-    assert pending.group_message_id == 99
-    assert pending.admin_message_id == 100
-    assert pending.marker_value == "group_and_admin"
-
-    admin_pending = await storage.update_pending_raffle_result(
-        pending,
-        stage="admin_only",
-        group_delete_at="2099-01-01T00:00:00+00:00",
-    )
-
-    assert admin_pending is not None and admin_pending.stage == "admin_only"
-    due = await storage.due_ephemeral("2100-01-01T00:00:00+00:00")
-    assert [(item.chat_id, item.message_id) for item in due] == [(-100, 99)]
-    assert await storage.update_pending_raffle_result(pending, stage="group_only") is None
-    assert not await storage.complete_pending_raffle_result(pending)
-    assert await storage.complete_pending_raffle_result(admin_pending)
-    assert await storage.pending_raffle_results(chat_ids={-100}) == ()
-
-
-async def test_pending_raffle_anchor_binding_is_atomic_and_rejects_stale_writers(
-    storage: Storage,
-) -> None:
-    raffle = await storage.create_raffle(
-        chat_id=-100,
-        creator_id=7,
-        keyword="参与",
-        prize="GiftPass",
-        winner_count=1,
-        ends_at="2099-01-01T00:00:00+00:00",
-    )
-    assert await storage.set_raffle_message(raffle.id, 88)
-    assert await storage.activate_raffle(raffle.id)
-    assert await storage.finish_raffle(
-        raffle.id,
-        (41,),
-        result_delivery_stage="group_and_admin",
-        result_group_message_id=99,
-    )
-    pending = (await storage.pending_raffle_results(chat_ids={-100}))[0]
-    assert pending.admin_message_id is None
-    await storage.enqueue_ephemeral(-100, 101, "2099-01-01T00:00:00+00:00")
-    await storage.enqueue_ephemeral(-100, 102, "2099-01-01T00:00:00+00:00")
-
-    rebound = await storage.bind_pending_raffle_result_anchor(
-        pending,
-        target="group",
-        message_id=101,
-    )
-    stale = await storage.bind_pending_raffle_result_anchor(
-        pending,
-        target="group",
-        message_id=102,
-    )
-
-    assert rebound is not None and rebound.group_message_id == 101
-    assert stale is None
-    due = await storage.due_ephemeral("2100-01-01T00:00:00+00:00")
-    assert [(item.chat_id, item.message_id) for item in due] == [(-100, 102)]
-    assert (
-        await storage.bind_pending_raffle_result_anchor(
-            rebound,
-            target="group",
-            message_id=101,
-        )
-        is not None
-    )
-
-    with_admin = await storage.bind_pending_raffle_result_anchor(
-        rebound,
-        target="admin",
-        message_id=200,
-    )
-    assert with_admin is not None and with_admin.admin_message_id == 200
-
-    assert await storage.complete_pending_raffle_result(with_admin)
-    assert (
-        await storage.bind_pending_raffle_result_anchor(
-            with_admin,
-            target="admin",
-            message_id=201,
-        )
-        is None
-    )
-
-
-def test_raffle_keyword_normalization_is_exact_and_rejects_unsafe_values() -> None:
-    assert normalize_raffle_keyword("  ＮＥＸＡ\u200b  ") == "nexa"
-    assert normalize_raffle_keyword("参与") == "参与"
-    with pytest.raises(ValueError, match="不能包含空格"):
-        normalize_raffle_keyword("Demo 参与")
-    with pytest.raises(ValueError, match="命令、账号或链接"):
-        normalize_raffle_keyword("@Nexa")
-
-
-async def test_pending_raffle_is_not_joinable_until_activated(storage: Storage) -> None:
-    raffle = await storage.create_raffle(
-        chat_id=-100,
-        creator_id=7,
-        keyword="参与",
-        prize="GiftPass",
-        winner_count=1,
-        ends_at="2099-01-01T00:00:00+00:00",
-    )
-
-    assert raffle.publication_state == "pending"
-    assert await storage.active_raffle(-100) is None
-    assert await storage.join_raffle(raffle.id, 41) == (False, 0)
-    assert await storage.set_raffle_message(raffle.id, 88)
-    assert await storage.activate_raffle(raffle.id)
-    active = await storage.active_raffle(-100)
-    assert active is not None and active.id == raffle.id
-
-
-async def test_raffle_work_queries_are_scoped_to_allowed_chats(storage: Storage) -> None:
-    for chat_id, message_id in ((-100, 88), (-200, 99)):
-        raffle = await storage.create_raffle(
-            chat_id=chat_id,
-            creator_id=7,
-            keyword=f"join{abs(chat_id)}",
-            prize="GiftPass",
-            winner_count=1,
-            ends_at="2026-08-30T00:00:00+00:00",
-        )
-        assert await storage.set_raffle_message(raffle.id, message_id)
-        assert await storage.activate_raffle(raffle.id)
-
-    due = await storage.due_raffles(
-        "2026-08-31T00:00:00+00:00",
-        chat_ids=frozenset({-100}),
-    )
-
-    assert [raffle.chat_id for raffle in due] == [-100]
-
-
-async def test_schema_v8_migrates_finished_raffles_but_rejects_running_v7(
-    tmp_path: Path,
-) -> None:
-    def create_v7(path: Path, status: str) -> None:
-        connection = sqlite3.connect(path)
-        connection.executescript(
-            """
-            CREATE TABLE raffles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                message_id INTEGER,
-                creator_id INTEGER NOT NULL,
-                prize TEXT NOT NULL,
-                winner_count INTEGER NOT NULL,
-                ends_at TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                finished_at TEXT
-            );
-            CREATE UNIQUE INDEX idx_raffles_one_running_per_chat
-            ON raffles (chat_id) WHERE status = 'running';
-            CREATE INDEX idx_raffles_due ON raffles (status, ends_at, id);
-            PRAGMA user_version=7;
-            """
-        )
-        connection.execute(
-            "INSERT INTO raffles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                1,
-                -100,
-                88,
-                7,
-                "GiftPass",
-                1,
-                "2099-01-01T00:00:00+00:00",
-                status,
-                "2026-08-30T00:00:00+00:00",
-                None if status == "running" else "2026-08-30T01:00:00+00:00",
-            ),
-        )
-        connection.commit()
-        connection.close()
-
-    finished_path = tmp_path / "finished-v7.db"
-    create_v7(finished_path, "finished")
-    migrated = Storage(finished_path)
-    await migrated.open()
-    try:
-        raffle = await migrated.raffle(1)
-        assert raffle is not None
-        assert raffle.keyword is None
-        assert raffle.publication_state == "active"
-        assert (await migrated.db.execute_fetchall("PRAGMA user_version"))[0][0] == 8
-    finally:
-        await migrated.close()
-
-    running_path = tmp_path / "running-v7.db"
-    create_v7(running_path, "running")
-    blocked = Storage(running_path)
-    with pytest.raises(RuntimeError, match="旧版进行中抽奖"):
-        await blocked.open()
-    await blocked.close()
 
 
 async def test_trusted_users_are_scoped_per_chat(storage: Storage) -> None:
@@ -1156,3 +843,50 @@ async def test_schema_v7_clears_retired_history_but_preserves_learning_and_ephem
         ) == (0, 0, 0, 0, 0, 0)
     finally:
         await migrated.close()
+
+
+async def test_schema_v9_drops_the_removed_raffle_tables_and_markers(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(path)
+    try:
+        legacy.executescript(
+            """
+            CREATE TABLE raffles (id INTEGER PRIMARY KEY, chat_id INTEGER, status TEXT);
+            CREATE UNIQUE INDEX idx_raffles_one_running_per_chat
+            ON raffles (chat_id) WHERE status = 'running';
+            CREATE TABLE raffle_entries (raffle_id INTEGER, user_id INTEGER);
+            CREATE TABLE raffle_winners (raffle_id INTEGER, user_id INTEGER);
+            CREATE TABLE runtime_settings (
+                chat_id INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, key)
+            );
+            INSERT INTO raffles VALUES (1, -100, 'running');
+            INSERT INTO raffle_entries VALUES (1, 42);
+            INSERT INTO runtime_settings VALUES (-100, 'raffle_result_pending:1:1', 'x', 't');
+            INSERT INTO runtime_settings VALUES (-100, 'ai_paused', '1', 't');
+            PRAGMA user_version = 8;
+            """
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    store = Storage(path)
+    await store.open()
+    try:
+        tables = {
+            str(row[0])
+            for row in await store.db.execute_fetchall(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+            )
+        }
+        version = await store.db.execute_fetchall("PRAGMA user_version")
+        assert not {name for name in tables if "raffle" in name}
+        assert int(version[0][0]) == SCHEMA_VERSION == 9
+        assert await store.runtime_setting(-100, "ai_paused") == "1"
+        assert await store.runtime_setting(-100, "raffle_result_pending:1:1") is None
+    finally:
+        await store.close()

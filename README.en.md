@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | English · [First install](docs/BOOTSTRAP.en.md) · [Operations](docs/OPERATIONS.en.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
-A self-hosted Telegram group moderation bot. It uses a model of your choice to recognise advertising and flooding, deletes, warns and bans automatically, and adds raffles and private administrator controls.
+A self-hosted Telegram group moderation bot. It uses a model of your choice to recognise advertising and flooding, deletes, warns and bans automatically, and adds private administrator controls.
 
 - **Bring your own model**: any OpenAI-compatible service works; the endpoint, model and API style are configuration.
 - **Bring your own identity**: the bot's name, the community it serves and your own official sites all come from configuration.
@@ -16,14 +16,13 @@ A self-hosted Telegram group moderation bot. It uses a model of your choice to r
 - Advertising above the confidence threshold is deleted and warned; reaching the warning limit bans automatically.
 - Stable phrases from confirmed advertising are learned, so the same advert is later caught without a model call.
 - Only suspicious messages show a "reviewing…" notice, updated in place; the bot's replies in the group are removed after about 30 seconds.
-- Raffles: keyword entry, pinned card, timed or manual draw, cancel, reroll, and recovery after a restart.
 - Administrators can message the bot privately for statistics, pausing AI review, purging group history, and previewing and removing long-inactive members.
 - `DRY_RUN` observation mode, a group allowlist, bot identity verification and an optional log chat.
 
 ## Before you start
 
 1. Send `/newbot` to [@BotFather](https://t.me/BotFather) and keep the token. The token is full control of the bot; keep it only in the server's configuration file.
-2. Add the bot to your group as an administrator with just the rights it needs: **delete messages**, **ban users**, **pin messages**.
+2. Add the bot to your group as an administrator with just the rights it needs: **delete messages** and **ban users**.
 3. Find two numeric IDs: the group's (negative, like `-1001234567890`) and your own user ID.
 4. For AI review, have an OpenAI-compatible model service ready: endpoint, API key and model ID. The bot also runs without AI, filtering by keywords, links and similar rules only.
 
@@ -115,7 +114,7 @@ AI_MODEL_LABEL=GPT
 
 ## Commands
 
-The menu has five entries: `/help`, `/status`, `/del`, `/ban`, `/lottery`.
+The menu has four entries: `/help`, `/status`, `/del`, `/ban`.
 
 ```text
 /status                       status and moderation statistics
@@ -128,15 +127,12 @@ The menu has five entries: `/help`, `/status`, `/del`, `/ban`, `/lottery`.
 /del members                  preview long-inactive members (private chat)
 /del members <code> confirm   remove the previewed members
 /ban                          ban the author of the replied-to message; in private chat give a user ID
-/lottery 30m 1 <keyword> <prize>   create a keyword raffle
-/lottery end|cancel|reroll    draw, cancel or reroll
 ```
 
 - Management commands accept only users in `AUTHORIZED_ADMIN_IDS`, and their actual Telegram rights are checked: an administrator without the ban right cannot ban through the bot. Private-chat management requires exactly one listed user.
 - With "anonymous administrator" enabled Telegram hides the real user ID; turn it off before running a command.
-- Raffles last from 1 minute to 30 days with 1–20 winners; the keyword is 1–32 characters without spaces. One active raffle per group.
 - `/del all` and `/del members` need the administrator's own Telegram user session (MTProto): set `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` and log in once on the server, as described in the [first-install guide](docs/BOOTSTRAP.en.md). Without it both commands refuse to run.
-- `/del members` shows a preview and a confirmation code before removing anyone; an active raffle blocks `/del all`.
+- `/del members` shows a preview and a confirmation code before removing anyone.
 
 ## Common settings
 

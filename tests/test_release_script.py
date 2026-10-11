@@ -41,7 +41,8 @@ def _run_release_arguments(*arguments: str) -> subprocess.CompletedProcess[str]:
 def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     script = _release_script()
 
-    assert 'readonly CODE_SCHEMA_VERSION="8"' in script
+    assert 'readonly CODE_SCHEMA_VERSION="9"' in script
+    assert "raffle" not in script.casefold()
     assert "readonly AI_MODEL_PATTERN=" in script
     assert "deepseek" not in script.casefold()
     assert 'readonly APP_ROOT="/opt/projects/nexa-guardian/runtime"' in script
@@ -50,7 +51,6 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
     pause_timer = script.index("pausing ${BACKUP_TIMER_NAME}")
     backup_inactive = script.index("database backup service did not become idle")
     stop = script.index("for a final consistent database backup")
-    raffle_check = script.index("checking raffle migration safety")
     backup = script.index("creating validated database backup")
     session_backup = script.index("creating validated Telegram session backup")
     switch = script.index("switching current to")
@@ -63,7 +63,6 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
         < pause_timer
         < backup_inactive
         < stop
-        < raffle_check
         < backup
         < session_backup
         < switch
@@ -85,7 +84,6 @@ def test_release_probe_precedes_quiesced_backup_and_switch() -> None:
         'systemctl stop "${BACKUP_TIMER_NAME}"'
     )
     assert "wait_for_backup_service_idle" in pause_block
-    assert "an old-schema raffle is still running; release aborted" in script
     assert 'readonly TELEGRAM_SESSION_PATH="/var/lib/nexa-guardian/mtproto/admin.session"' in script
     assert "Telegram session permissions must not be wider than 0600" in script
     assert "PRAGMA quick_check" in script[session_backup:switch]
@@ -187,7 +185,7 @@ def test_release_cooldown_exception_arguments_fail_closed(tmp_path: Path) -> Non
         "--git-sha",
         "0" * 40,
         "--schema-version",
-        "8",
+        "9",
     )
 
     missing_model = _run_release_arguments(*base, "--allow-model-cooldown")

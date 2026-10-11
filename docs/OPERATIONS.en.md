@@ -2,7 +2,7 @@
 
 English | [简体中文](OPERATIONS.zh-CN.md) · [Home](../README.en.md)
 
-For a first installation see the [first-install guide](BOOTSTRAP.en.md). This guide covers what comes after: configuration, upgrades, rollback, backup, recovery and troubleshooting. The database is at **schema 8**.
+For a first installation see the [first-install guide](BOOTSTRAP.en.md). This guide covers what comes after: configuration, upgrades, rollback, backup, recovery and troubleshooting. The database is at **schema 9**.
 
 ## Where things live
 
@@ -49,12 +49,14 @@ The probe sends one fixed harmless sentence and a 1×1 test image, never a group
 
 ```sh
 sudo deploy/release.sh --wheel /absolute/path/nexa_guardian-X.Y.Z-py3-none-any.whl \
-  --git-sha <full commit id> --schema-version 8
+  --git-sha <full commit id> --schema-version 9
 ```
 
 It backs up the configuration, installs the candidate in its own directory and probes the model; only when all of that passes does it stop the service briefly, take a final database backup, switch `current` atomically and run a health check. Any failure stops and restores. Do not edit `current` by hand. See [deploy/RELEASE.md](../deploy/RELEASE.md) (Chinese) for the options and details.
 
 To change the model during an upgrade add `--ai-model <model id>`; to change the provider as well add `--ai-credentials-file`, pointing at a 0600 file with exactly two lines, `OPENAI_BASE_URL` and `OPENAI_API_KEY`.
+
+**Upgrading from 0.7.x to 0.8.0:** this version moves the database to schema 9. On first start it drops three tables left by an earlier version, together with their markers; that data is not kept and the database cannot go back to schema 8. Make sure you have a backup first: returning to an older version means restoring the database backup taken before the upgrade.
 
 With Docker: `git pull`, then `docker compose up -d --build`. Never delete the data volume.
 

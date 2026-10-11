@@ -11,7 +11,7 @@ from aiogram import Bot
 from aiogram.types import ChatMemberAdministrator, ChatMemberOwner
 
 from nexa_guardian.config import Settings
-from nexa_guardian.storage import AIStats, ChatStats, Raffle, Storage
+from nexa_guardian.storage import AIStats, ChatStats, Storage
 
 DISPLAY_TIMEZONE = ZoneInfo("Asia/Shanghai")
 UTC = timezone.utc
@@ -99,7 +99,6 @@ class StatusService:
         me = await self.bot.get_me()
         member_task = asyncio.create_task(self.bot.get_chat_member(chat_id, me.id))
         paused_task = asyncio.create_task(self.storage.runtime_setting(chat_id, "ai_paused"))
-        raffle_task = asyncio.create_task(self.storage.active_raffle(chat_id))
         today_task = asyncio.create_task(self.storage.chat_stats(chat_id, since=today_cutoff))
         week_task = asyncio.create_task(self.storage.chat_stats(chat_id, since=week_cutoff))
         total_task = asyncio.create_task(self.storage.chat_stats(chat_id))
@@ -112,7 +111,6 @@ class StatusService:
         (
             member,
             paused_value,
-            raffle,
             today,
             week,
             total,
@@ -123,7 +121,6 @@ class StatusService:
         ) = await _gather_or_cancel(
             member_task,
             paused_task,
-            raffle_task,
             today_task,
             week_task,
             total_task,
@@ -139,17 +136,12 @@ class StatusService:
         can_restrict = isinstance(member, ChatMemberOwner) or (
             isinstance(member, ChatMemberAdministrator) and member.can_restrict_members
         )
-        can_pin = isinstance(member, ChatMemberOwner) or (
-            isinstance(member, ChatMemberAdministrator)
-            and bool(getattr(member, "can_pin_messages", False))
-        )
         paused = paused_value == "1"
         actual_ai_state = _ai_state(
             enabled=self.settings.ai_enabled,
             reviewer_ready=reviewer_ready,
             paused=paused,
         )
-        raffle_line = await self._raffle_line(raffle)
         alerts: list[str] = []
         if ai_failure_streak:
             alerts.append(f"AI 连续失败 {ai_failure_streak} 次")
@@ -173,9 +165,8 @@ class StatusService:
             f"{'是' if chat_id in self.settings.allowed_chat_ids else '否'}\n"
             f"模式：{'观察' if self.settings.dry_run else '执行'}｜AI：{actual_ai_state}\n"
             f"权限：管理 {'有' if is_admin else '缺'}｜删除 {'有' if can_delete else '缺'}｜"
-            f"限制 {'有' if can_restrict else '缺'}｜置顶 {'有' if can_pin else '缺'}\n"
-            f"MTProto：{html.escape(mtproto_status)}\n"
-            f"抽奖：{raffle_line}\n\n"
+            f"限制 {'有' if can_restrict else '缺'}\n"
+            f"MTProto：{html.escape(mtproto_status)}\n\n"
             "<b>管理统计（北京时间）</b>\n"
             f"{stats_line('今日', today)}\n"
             f"{stats_line('近 7 天', week)}\n"
@@ -269,15 +260,6 @@ class StatusService:
 
     async def disable_ai_signature(self, chat_id: int, signature_id: int) -> bool:
         return await self.storage.disable_ai_signature(chat_id, str(signature_id))
-
-    async def _raffle_line(self, raffle: Raffle | None) -> str:
-        if raffle is None:
-            return "无进行中抽奖"
-        count = await self.storage.raffle_entry_count(raffle.id)
-        return (
-            f"进行中 #{raffle.id}｜关键词 <code>{html.escape(raffle.keyword or '-')}</code>｜"
-            f"{count} 人｜{action_time(raffle.ends_at)} 开奖"
-        )
 
     async def _mtproto_status(self, chat_id: int) -> str:
         if not self.settings.mtproto_ready:

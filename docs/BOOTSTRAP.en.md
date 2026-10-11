@@ -12,8 +12,8 @@ Docker is an alternative; see the [README](../README.en.md#run-with-docker).
 
 ## Prepare without starting the bot
 
-Download all v0.7.0 assets from the repository's Releases to
-`/root/nexa-guardian-v0.7.0`. If there is no release, run `uv build` and
+Download all v0.8.0 assets from the repository's Releases to
+`/root/nexa-guardian-v0.8.0`. If there is no release, run `uv build` and
 `python scripts/build_release.py` locally as described in the
 [README](../README.en.md#development) and copy the files in `dist/` there. The
 commands below require a fresh target; a failed guard means stop and use the
@@ -25,7 +25,7 @@ access; they do not start the bot.
 # Run as root, only on a fresh Ubuntu host.
 set -euo pipefail
 umask 0077
-artifact_dir=/root/nexa-guardian-v0.7.0
+artifact_dir=/root/nexa-guardian-v0.8.0
 cd "$artifact_dir"
 sha256sum -c SHA256SUMS
 test ! -e /opt/nexa-guardian && test ! -L /opt/nexa-guardian
@@ -51,14 +51,14 @@ release_dir="/opt/projects/nexa-guardian/runtime/releases/$release_id"
 install -d -o root -g nexa-guardian -m 0750 "$release_dir"
 python3 -m venv "$release_dir/.venv"
 "$release_dir/.venv/bin/python" -m pip install \
-  -c requirements-runtime.txt ./nexa_guardian-0.7.0-py3-none-any.whl
+  -c requirements-runtime.txt ./nexa_guardian-0.8.0-py3-none-any.whl
 "$release_dir/.venv/bin/python" -m pip check
 install -o root -g nexa-guardian -m 0640 release-metadata.json SHA256SUMS \
-  requirements-runtime.txt nexa_guardian-0.7.0-py3-none-any.whl "$release_dir/"
+  requirements-runtime.txt nexa_guardian-0.8.0-py3-none-any.whl "$release_dir/"
 chown -R root:nexa-guardian "$release_dir"
 chmod -R u=rwX,g=rX,o= "$release_dir"
-tar -xzf nexa-guardian-0.7.0-deployment.tar.gz
-install -o root -g root -m 0600 nexa-guardian-0.7.0/.env.example \
+tar -xzf nexa-guardian-0.8.0-deployment.tar.gz
+install -o root -g root -m 0600 nexa-guardian-0.8.0/.env.example \
   /etc/nexa-guardian/guardian.env
 nano /etc/nexa-guardian/guardian.env
 ```
@@ -120,7 +120,7 @@ chmod 0600 /var/lib/nexa-guardian/guardian.db \
 From here the bot really starts working. The gateway probe contacts your model
 provider and may consume quota. Installing unit files or enabling the timer does
 not prove the bot works: after startup verify stable service status, the correct
-installed version and bot identity, schema 8 database integrity and a successful
+installed version and bot identity, schema 9 database integrity and a successful
 paired database and session backup. Redact logs before sharing them.
 
 ```bash
@@ -128,9 +128,9 @@ cd "$artifact_dir"
 ln -s "$release_dir" /opt/projects/nexa-guardian/runtime/current
 ln -s /opt/projects/nexa-guardian/runtime /opt/nexa-guardian
 install -o root -g root -m 0644 \
-  nexa-guardian-0.7.0/deploy/systemd/nexa-guardian.service \
-  nexa-guardian-0.7.0/deploy/systemd/nexa-guardian-backup.service \
-  nexa-guardian-0.7.0/deploy/systemd/nexa-guardian-backup.timer /etc/systemd/system/
+  nexa-guardian-0.8.0/deploy/systemd/nexa-guardian.service \
+  nexa-guardian-0.8.0/deploy/systemd/nexa-guardian-backup.service \
+  nexa-guardian-0.8.0/deploy/systemd/nexa-guardian-backup.timer /etc/systemd/system/
 "$release_dir/.venv/bin/nexa-guardian-probe" \
   --env-file /etc/nexa-guardian/guardian.env --require-production-settings
 systemctl daemon-reload
